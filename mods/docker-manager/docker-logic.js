@@ -1083,6 +1083,7 @@ export function buildContainerTree({
           const existing = proj.servicesMap.get(svcName);
           existing.declared = true;
           existing.config = svcConfig;
+          existing.declaredOrder = orderIdx;
         } else {
           // Service present in compose config with 0 containers
           if (isInactiveProfile) {
@@ -1095,6 +1096,7 @@ export function buildContainerTree({
               running: false,
               profiles: svcProfiles,
               config: svcConfig,
+              declaredOrder: orderIdx,
               containers: [],
             });
           } else {
@@ -1107,6 +1109,7 @@ export function buildContainerTree({
               running: false,
               declared: true,
               config: svcConfig,
+              declaredOrder: orderIdx,
               containers: [],
               ports: "",
             });
@@ -1136,12 +1139,8 @@ export function buildContainerTree({
     // Aggregate status
     if (proj.totalCount === 0) {
       proj.status = "not-created";
-    } else if (proj.runningCount === proj.totalCount) {
-      proj.status = "ok";
-    } else if (proj.runningCount > 0) {
-      proj.status = "warning";
     } else {
-      proj.status = "muted";
+      proj.status = aggregateProjectStatus(services);
     }
 
     proj.services = services;
@@ -1228,7 +1227,8 @@ export function resolveDockerContext({
   shared: getShared = () => null,
   currentRoot = null,
 } = {}) {
-  const p = typeof getProps === "function" ? getProps() : getProps || {};
+  const rawP = typeof getProps === "function" ? getProps() : getProps;
+  const p = rawP || {};
   if (p.folder || p.cwd) {
     return {
       root: p.folder || p.cwd,
@@ -1236,8 +1236,9 @@ export function resolveDockerContext({
     };
   }
 
-  const spaceList = typeof getSpaces === "function" ? getSpaces() : getSpaces || [];
-  const activeSpace = spaceList.find((s) => s.active) || spaceList[0];
+  const rawSpaces = typeof getSpaces === "function" ? getSpaces() : getSpaces;
+  const spaceList = Array.isArray(rawSpaces) ? rawSpaces : [];
+  const activeSpace = spaceList.find((s) => s && s.active) || spaceList[0];
   if (activeSpace) {
     const machine = activeSpace.machine ?? null;
     const pinnedMap = typeof getShared === "function" ? getShared("spaces.pinned_locations") : null;
@@ -1253,4 +1254,743 @@ export function resolveDockerContext({
   }
 
   return { root: currentRoot || null, machine: null };
+}
+
+/**
+ * Determines whether a layout node is visible in the current window tree.
+ *
+ * @param {any} root
+ * @param {string | ((node: any) => boolean)} targetOrPredicate
+ * @returns {boolean}
+ */
+export function isLayoutNodeVisible(root, targetOrPredicate) {
+  if (!root) return true;
+  const match =
+    typeof targetOrPredicate === "function"
+      ? targetOrPredicate
+      : (node) => node?.id === targetOrPredicate || node?.content?.mod === targetOrPredicate;
+
+  function findPath(node, path) {
+    if (match(node)) return [...path, node];
+    for (const child of node?.children ?? []) {
+      const res = findPath(child, [...path, node]);
+      if (res) return res;
+    }
+    return null;
+  }
+
+  const path = findPath(root, []);
+  if (!path) return true;
+
+  for (let i = 0; i < path.length; i++) {
+    const node = path[i];
+    if (node.hidden) return false;
+    if (node.type === "stack" && i + 1 < path.length) {
+      const activeId = node.active ?? node.children?.[0]?.id;
+      if (activeId && activeId !== path[i + 1].id) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Parses `docker compose ls --all --format json` output.
+ *
+ * @param {string | any[]} stdout
+ * @returns {Array<{ name: string, status: string, configFiles: string, Name: string, Status: string, ConfigFiles: string, raw: any }>}
+ */
+export function parseComposeLs(stdout) {
+  if (!stdout) return [];
+  if (Array.isArray(stdout)) {
+    return stdout.map((item) => {
+      const name = item.Name || item.name || "";
+      const status = item.Status || item.status || "";
+      const configFiles = item.ConfigFiles || item.configFiles || "";
+      return {
+        name,
+        status,
+        configFiles,
+        Name: name,
+        Status: status,
+        ConfigFiles: configFiles,
+        raw: item,
+      };
+    });
+  }
+  if (typeof stdout !== "string") return [];
+  const text = stdout.trim();
+  if (!text) return [];
+
+  let items = [];
+  if (text.startsWith("[")) {
+    try {
+      items = JSON.parse(text);
+    } catch {
+      items = [];
+    }
+  } else {
+    for (const line of text.split("\n")) {
+      const l = line.trim();
+      if (!l) continue;
+      try {
+        items.push(JSON.parse(l));
+      } catch {}
+    }
+  }
+
+  if (!Array.isArray(items)) {
+    if (typeof items === "object" && items !== null) items = [items];
+    else return [];
+  }
+
+  return items.map((item) => {
+    const name = item.Name || item.name || "";
+    const status = item.Status || item.status || "";
+    const configFiles = item.ConfigFiles || item.configFiles || "";
+    return {
+      name,
+      status,
+      configFiles,
+      Name: name,
+      Status: status,
+      ConfigFiles: configFiles,
+      raw: item,
+    };
+  });
+}
+
+/**
+ * Parses `docker info --format '{{json .}}'` output.
+ *
+ * @param {string | any} stdout
+ * @returns {any}
+ */
+export function parseEngineInfo(stdout) {
+  if (!stdout) return null;
+  let info = null;
+  if (typeof stdout === "object") {
+    info = stdout;
+  } else if (typeof stdout === "string") {
+    const text = stdout.trim();
+    if (!text) return null;
+    try {
+      info = JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+  if (!info || typeof info !== "object") return null;
+
+  return {
+    serverVersion: info.ServerVersion || info.Server?.Version || "",
+    ServerVersion: info.ServerVersion || info.Server?.Version || "",
+    containers: typeof info.Containers === "number" ? info.Containers : 0,
+    containersRunning: typeof info.ContainersRunning === "number" ? info.ContainersRunning : 0,
+    containersPaused: typeof info.ContainersPaused === "number" ? info.ContainersPaused : 0,
+    containersStopped: typeof info.ContainersStopped === "number" ? info.ContainersStopped : 0,
+    images: typeof info.Images === "number" ? info.Images : 0,
+    operatingSystem: info.OperatingSystem || "",
+    architecture: info.Architecture || "",
+    raw: info,
+  };
+}
+
+/**
+ * Determines Docker engine reachable / daemon-down / cli-missing state from probe results.
+ *
+ * @param {{ info?: any, versionProbe?: any }} options
+ * @returns {{ status: "reachable" | "daemon-down" | "cli-missing", version: string | null, reachable: boolean, error: string | null }}
+ */
+export function engineStateFromResults({ info = null, versionProbe = null } = {}) {
+  // 1. Check CLI missing
+  const vErr = versionProbe?.error || (versionProbe?.code === 127 ? "not found" : null);
+  const iErr = info?.error || (info?.code === 127 ? "not found" : null);
+  const vStderr = String(versionProbe?.stderr || "").toLowerCase();
+  const iStderr = String(info?.stderr || "").toLowerCase();
+
+  const isCliMissing =
+    (vErr && /enoent|not found|not recognized|not installed/i.test(String(vErr))) ||
+    (iErr && /enoent|not found|not recognized|not installed/i.test(String(iErr))) ||
+    vStderr.includes("command not found") ||
+    iStderr.includes("command not found") ||
+    versionProbe?.code === 127 ||
+    info?.code === 127 ||
+    (!info && !versionProbe);
+
+  if (isCliMissing) {
+    return {
+      status: "cli-missing",
+      version: null,
+      reachable: false,
+      error: "Docker CLI not found",
+    };
+  }
+
+  // 2. Extract potential version string
+  let version = null;
+  if (typeof versionProbe === "string") {
+    const m = versionProbe.match(/(?:version\s+)?([0-9]+\.[0-9]+(?:\.[0-9]+[a-z0-9.-]*)?)/i);
+    if (m) version = m[1];
+  } else if (versionProbe && typeof versionProbe === "object") {
+    if (versionProbe.Server?.Version) {
+      version = versionProbe.Server.Version;
+    } else if (versionProbe.stdout) {
+      try {
+        const parsed = JSON.parse(versionProbe.stdout);
+        version = parsed.Server?.Version || parsed.Client?.Version || null;
+      } catch {
+        const m = versionProbe.stdout.match(/(?:version\s+)?([0-9]+\.[0-9]+(?:\.[0-9]+[a-z0-9.-]*)?)/i);
+        if (m) version = m[1];
+      }
+    }
+  }
+
+  if (!version && info) {
+    const parsed = typeof info === "string" ? parseEngineInfo(info) : info.stdout ? parseEngineInfo(info.stdout) : info;
+    if (parsed?.serverVersion || parsed?.ServerVersion) {
+      version = parsed.serverVersion || parsed.ServerVersion;
+    }
+  }
+
+  // 3. Check daemon down
+  const isDaemonDown =
+    vStderr.includes("cannot connect to the docker daemon") ||
+    iStderr.includes("cannot connect to the docker daemon") ||
+    vStderr.includes("is the docker daemon running") ||
+    iStderr.includes("is the docker daemon running") ||
+    vStderr.includes("daemon is not running") ||
+    iStderr.includes("daemon is not running") ||
+    vStderr.includes("connection refused") ||
+    iStderr.includes("connection refused") ||
+    (info && info.code !== 0 && !info.serverVersion && !info.ServerVersion) ||
+    (versionProbe && versionProbe.code !== 0 && !versionProbe.Server?.Version);
+
+  if (isDaemonDown && (!info || info.code !== 0) && (!versionProbe || !versionProbe.Server?.Version)) {
+    return {
+      status: "daemon-down",
+      version: null,
+      reachable: false,
+      error: (info?.stderr || versionProbe?.stderr || "Docker daemon is not reachable").trim(),
+    };
+  }
+
+  return {
+    status: "reachable",
+    version: version || "Docker",
+    reachable: true,
+    error: null,
+  };
+}
+
+/**
+ * Parses `docker compose config --format json` output.
+ *
+ * @param {string | any} stdout
+ * @returns {{ name: string, services: Record<string, any>, raw: any }}
+ */
+export function parseComposeConfig(stdout) {
+  if (!stdout) return { name: "", services: {}, raw: null };
+  let data = null;
+  if (typeof stdout === "object") {
+    data = stdout;
+  } else if (typeof stdout === "string") {
+    const text = stdout.trim();
+    if (!text) return { name: "", services: {}, raw: null };
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return { name: "", services: {}, raw: null };
+    }
+  }
+  if (!data || typeof data !== "object") return { name: "", services: {}, raw: null };
+
+  const services = {};
+  for (const [svcName, svcDef] of Object.entries(data.services || {})) {
+    if (!svcDef) continue;
+    services[svcName] = {
+      name: svcName,
+      image: svcDef.image || null,
+      build: svcDef.build || null,
+      ports: Array.isArray(svcDef.ports) ? svcDef.ports : [],
+      profiles: Array.isArray(svcDef.profiles) ? svcDef.profiles : [],
+      volumes: Array.isArray(svcDef.volumes) ? svcDef.volumes : [],
+      networks: svcDef.networks || null,
+      environment: svcDef.environment || {},
+      dependsOn: svcDef.depends_on || svcDef.dependsOn || [],
+      raw: svcDef,
+    };
+  }
+
+  return {
+    name: data.name || "",
+    services,
+    raw: data,
+  };
+}
+
+/**
+ * Groups discovered Compose file paths by directory and pairs base files with overrides (DM-32).
+ *
+ * @param {string[]} paths
+ * @returns {Array<{ dir: string, file: string, files: string[], isOverride: boolean, override?: string | null, variant?: string }>}
+ */
+export function discoverComposeGroups(paths = []) {
+  if (!Array.isArray(paths)) return [];
+
+  const byDir = new Map();
+  for (const p of paths) {
+    if (!p || typeof p !== "string") continue;
+    const slashIdx = p.lastIndexOf("/");
+    const dir = slashIdx === -1 ? "." : p.slice(0, slashIdx);
+    if (!byDir.has(dir)) byDir.set(dir, []);
+    byDir.get(dir).push(p);
+  }
+
+  const result = [];
+
+  for (const [dir, fileList] of byDir.entries()) {
+    const baseFiles = [];
+    const overrideFiles = [];
+    const variantFiles = [];
+
+    for (const filePath of fileList) {
+      const cls = classifyDockerFile(filePath);
+      if (!cls || !cls.isCompose) continue;
+      if (cls.isOverride) {
+        overrideFiles.push(filePath);
+      } else if (cls.variant) {
+        variantFiles.push({ path: filePath, variant: cls.variant });
+      } else {
+        baseFiles.push(filePath);
+      }
+    }
+
+    const pairedOverrides = new Set();
+
+    for (const base of baseFiles) {
+      const baseName = base.slice(base.lastIndexOf("/") + 1).toLowerCase();
+      let matchedOverride = null;
+      for (const ov of overrideFiles) {
+        if (pairedOverrides.has(ov)) continue;
+        const ovName = ov.slice(ov.lastIndexOf("/") + 1).toLowerCase();
+        if (
+          (baseName.startsWith("docker-compose") && ovName.startsWith("docker-compose.override")) ||
+          (baseName.startsWith("compose") && !baseName.startsWith("docker-compose") && ovName.startsWith("compose.override"))
+        ) {
+          matchedOverride = ov;
+          break;
+        }
+      }
+      if (!matchedOverride) {
+        for (const ov of overrideFiles) {
+          if (!pairedOverrides.has(ov)) {
+            matchedOverride = ov;
+            break;
+          }
+        }
+      }
+
+      if (matchedOverride) {
+        pairedOverrides.add(matchedOverride);
+        result.push({
+          dir,
+          file: base,
+          files: [base, matchedOverride],
+          isOverride: false,
+          override: matchedOverride,
+        });
+      } else {
+        result.push({
+          dir,
+          file: base,
+          files: [base],
+          isOverride: false,
+          override: null,
+        });
+      }
+    }
+
+    for (const ov of overrideFiles) {
+      if (!pairedOverrides.has(ov)) {
+        result.push({
+          dir,
+          file: ov,
+          files: [ov],
+          isOverride: true,
+          override: ov,
+        });
+      }
+    }
+
+    for (const v of variantFiles) {
+      result.push({
+        dir,
+        file: v.path,
+        files: [v.path],
+        isOverride: false,
+        variant: v.variant,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Aggregates service statuses into an overall Compose project status (DM-21).
+ *
+ * Rules:
+ * - any unhealthy, restarting, or dead -> "error"
+ * - all running -> "ok"
+ * - mixed -> "warning"
+ * - none -> "muted"
+ *
+ * @param {any[]} services
+ * @returns {"ok" | "warning" | "muted" | "error"}
+ */
+export function aggregateProjectStatus(services = []) {
+  if (!Array.isArray(services) || services.length === 0) return "muted";
+
+  for (const svc of services) {
+    const sStatus = String(svc.status || "").toLowerCase();
+    const sState = String(svc.state || "").toLowerCase();
+    const sHealth = String(svc.health?.status || svc.health || "").toLowerCase();
+
+    if (
+      sHealth === "unhealthy" ||
+      sStatus.includes("unhealthy") ||
+      sState === "restarting" ||
+      sStatus.includes("restarting") ||
+      sState === "dead" ||
+      sStatus.includes("dead")
+    ) {
+      return "error";
+    }
+
+    if (Array.isArray(svc.containers)) {
+      for (const c of svc.containers) {
+        const cStatus = String(c.status || "").toLowerCase();
+        const cState = String(c.state || "").toLowerCase();
+        const cHealth = String(c.health?.status || c.health || "").toLowerCase();
+        if (
+          cHealth === "unhealthy" ||
+          cStatus.includes("unhealthy") ||
+          cState === "restarting" ||
+          cStatus.includes("restarting") ||
+          cState === "dead" ||
+          cStatus.includes("dead")
+        ) {
+          return "error";
+        }
+      }
+    }
+  }
+
+  let runningCount = 0;
+  let partialServiceFound = false;
+
+  for (const svc of services) {
+    if (Array.isArray(svc.containers) && svc.containers.length > 0) {
+      const runningInSvc = svc.containers.filter(
+        (c) =>
+          c.isRunning ||
+          c.running ||
+          String(c.state || "").toLowerCase() === "running" ||
+          String(c.status || "").toLowerCase().startsWith("up")
+      ).length;
+
+      if (runningInSvc === svc.containers.length) {
+        runningCount++;
+      } else if (runningInSvc > 0) {
+        partialServiceFound = true;
+      }
+    } else {
+      const sStatus = String(svc.status || "").toLowerCase();
+      const sState = String(svc.state || "").toLowerCase();
+      if (svc.running === true || sState === "running" || sStatus.startsWith("up")) {
+        runningCount++;
+      }
+    }
+  }
+
+  if (partialServiceFound) return "warning";
+  if (runningCount === services.length && services.length > 0) return "ok";
+  if (runningCount > 0) return "warning";
+  return "muted";
+}
+
+/**
+ * Matches a row against a search query string across name, image, service, project, and ports (DM-12).
+ * Empty query matches everything. Case-insensitive substring match.
+ *
+ * @param {any} row
+ * @param {string} query
+ * @returns {boolean}
+ */
+export function matchesFilter(row, query) {
+  if (!query || typeof query !== "string") return true;
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  if (!row) return false;
+
+  const name = String(row.name || row.data?.name || "").toLowerCase();
+  if (name.includes(q)) return true;
+
+  const image = String(row.image || row.data?.image || "").toLowerCase();
+  if (image.includes(q)) return true;
+
+  const service = String(row.service || row.data?.service || "").toLowerCase();
+  if (service.includes(q)) return true;
+
+  const project = String(row.project || row.data?.project || "").toLowerCase();
+  if (project.includes(q)) return true;
+
+  const ports = String(row.ports || row.publishedPorts || row.port || row.data?.ports || "");
+  if (ports.toLowerCase().includes(q)) return true;
+
+  if (Array.isArray(row.ports)) {
+    if (JSON.stringify(row.ports).toLowerCase().includes(q)) return true;
+  }
+  if (Array.isArray(row.data?.ports)) {
+    if (JSON.stringify(row.data.ports).toLowerCase().includes(q)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Flattens a project -> service -> replica tree into a linear list of render rows (DM-20..27).
+ *
+ * Ordering:
+ * 1. Projects: inSpace first, then alphabetical by name.
+ * 2. Services: declaration order from compose config, then alphabetical.
+ * 3. Replicas: numerically by container number.
+ * 4. Dockerfiles & Standalone containers.
+ *
+ * @param {{ projects?: any[], dockerfiles?: any[], standalone?: any[] }} tree
+ * @param {any} expandState
+ * @returns {any[]}
+ */
+export function flattenContainerRows(tree = {}, expandState = null) {
+  const rows = [];
+  if (!tree) return rows;
+
+  const projects = Array.isArray(tree.projects) ? [...tree.projects] : [];
+  projects.sort((a, b) => {
+    const aInSpace = Boolean(a.inSpace);
+    const bInSpace = Boolean(b.inSpace);
+    if (aInSpace !== bInSpace) return aInSpace ? -1 : 1;
+    return (a.name || "").localeCompare(b.name || "");
+  });
+
+  for (const proj of projects) {
+    let isProjExpanded = false;
+    if (expandState instanceof Set) {
+      isProjExpanded = expandState.has(proj.name) || expandState.has(`project:${proj.name}`);
+    } else if (typeof expandState === "function") {
+      isProjExpanded = Boolean(expandState(proj.name));
+    } else if (typeof expandState === "object" && expandState !== null) {
+      if (proj.name in expandState) isProjExpanded = Boolean(expandState[proj.name]);
+      else if (`project:${proj.name}` in expandState) isProjExpanded = Boolean(expandState[`project:${proj.name}`]);
+      else isProjExpanded = Boolean(proj.inSpace);
+    } else {
+      isProjExpanded = Boolean(proj.inSpace);
+    }
+
+    const services = Array.isArray(proj.services) ? [...proj.services] : [];
+    const projStatus = proj.status || aggregateProjectStatus(services);
+
+    rows.push({
+      type: "project",
+      kind: "project",
+      id: `project:${proj.name}`,
+      key: `project:${proj.name}`,
+      name: proj.name,
+      project: proj.name,
+      status: projStatus,
+      runningCount: proj.runningCount || 0,
+      totalCount: proj.totalCount || 0,
+      inSpace: Boolean(proj.inSpace),
+      mixedSources: Boolean(proj.mixedSources),
+      configFiles: proj.configFilesList || Array.from(proj.configFiles || []),
+      expanded: isProjExpanded,
+      depth: 0,
+      data: proj,
+    });
+
+    if (isProjExpanded) {
+      services.sort((a, b) => {
+        const orderA = typeof a.declaredOrder === "number" ? a.declaredOrder : 9999;
+        const orderB = typeof b.declaredOrder === "number" ? b.declaredOrder : 9999;
+        if (orderA !== orderB) return orderA - orderB;
+        return (a.name || "").localeCompare(b.name || "");
+      });
+
+      for (const svc of services) {
+        const isNotCreated =
+          svc.status === "not-created" ||
+          svc.created === false ||
+          (!svc.containers?.length && svc.declared);
+        const svcStatus = isNotCreated ? "not-created" : (svc.status || (svc.running ? "running" : "stopped"));
+
+        const containers = Array.isArray(svc.containers) ? [...svc.containers] : [];
+        const hasReplicas = containers.length > 1;
+
+        let isSvcExpanded = false;
+        if (hasReplicas) {
+          const k1 = `${proj.name}/${svc.name}`;
+          const k2 = `${proj.name}:${svc.name}`;
+          const k3 = svc.name;
+          if (expandState instanceof Set) {
+            isSvcExpanded = expandState.has(k1) || expandState.has(k2) || expandState.has(k3) || expandState.has(proj.name);
+          } else if (typeof expandState === "object" && expandState !== null) {
+            if (k1 in expandState) isSvcExpanded = Boolean(expandState[k1]);
+            else if (k2 in expandState) isSvcExpanded = Boolean(expandState[k2]);
+            else if (k3 in expandState) isSvcExpanded = Boolean(expandState[k3]);
+            else isSvcExpanded = true;
+          } else {
+            isSvcExpanded = true;
+          }
+        }
+
+        const targetCont = containers.length > 0 ? containers[0] : null;
+        const containerId = targetCont ? targetCont.id : "";
+        const shortId = targetCont ? (targetCont.shortId || targetCont.id?.slice(0, 12)) : "";
+        const image = targetCont ? targetCont.image : (svc.config?.image || "");
+        const ports = targetCont ? targetCont.ports : (svc.ports || "");
+
+        rows.push({
+          type: "service",
+          kind: "service",
+          id: `service:${proj.name}/${svc.name}`,
+          key: `service:${proj.name}/${svc.name}`,
+          name: svc.name,
+          service: svc.name,
+          project: proj.name,
+          status: svcStatus,
+          state: svc.state || (isNotCreated ? "not-created" : (svc.running ? "running" : "exited")),
+          running: Boolean(svc.running),
+          declared: Boolean(svc.declared),
+          created: !isNotCreated,
+          containerCount: containers.length,
+          hasReplicas,
+          containerId,
+          shortId,
+          image,
+          ports,
+          expanded: isSvcExpanded,
+          depth: 1,
+          data: svc,
+        });
+
+        if (hasReplicas && isSvcExpanded) {
+          containers.sort((a, b) => {
+            const numA = parseInt(a.containerNumber || "1", 10) || 1;
+            const numB = parseInt(b.containerNumber || "1", 10) || 1;
+            if (numA !== numB) return numA - numB;
+            return (a.name || "").localeCompare(b.name || "");
+          });
+
+          for (const c of containers) {
+            rows.push({
+              type: "container",
+              kind: "container",
+              id: `container:${c.id || c.name}`,
+              key: `container:${c.id || c.name}`,
+              name: c.name,
+              containerId: c.id,
+              shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
+              service: svc.name,
+              project: proj.name,
+              containerNumber: c.containerNumber || "1",
+              status: c.status || c.state || "",
+              state: c.state || "",
+              running: Boolean(c.isRunning || c.running || c.state === "running"),
+              image: c.image || "",
+              ports: c.ports || "",
+              depth: 2,
+              data: c,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Dockerfiles
+  const dockerfiles = Array.isArray(tree.dockerfiles) ? [...tree.dockerfiles] : [];
+  for (const df of dockerfiles) {
+    let isDfExpanded = false;
+    if (expandState instanceof Set) {
+      isDfExpanded = expandState.has(df.path);
+    } else if (typeof expandState === "object" && expandState !== null && df.path in expandState) {
+      isDfExpanded = Boolean(expandState[df.path]);
+    } else {
+      isDfExpanded = Boolean(df.inSpace);
+    }
+
+    rows.push({
+      type: "dockerfile",
+      kind: "dockerfile",
+      id: `dockerfile:${df.path}`,
+      key: `dockerfile:${df.path}`,
+      name: df.path,
+      path: df.path,
+      inSpace: Boolean(df.inSpace),
+      containerCount: df.containers?.length || 0,
+      expanded: isDfExpanded,
+      depth: 0,
+      data: df,
+    });
+
+    if (isDfExpanded && Array.isArray(df.containers)) {
+      for (const c of df.containers) {
+        rows.push({
+          type: "container",
+          kind: "container",
+          id: `container:${c.id || c.name}`,
+          key: `container:${c.id || c.name}`,
+          name: c.name,
+          containerId: c.id,
+          shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
+          service: "",
+          project: "",
+          status: c.status || "",
+          state: c.state || "",
+          running: Boolean(c.isRunning || c.running),
+          image: c.image || "",
+          ports: c.ports || "",
+          depth: 1,
+          data: c,
+        });
+      }
+    }
+  }
+
+  // Standalone
+  const standalone = Array.isArray(tree.standalone) ? [...tree.standalone] : [];
+  standalone.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  for (const c of standalone) {
+    rows.push({
+      type: "container",
+      kind: "container",
+      id: `standalone:${c.id || c.name}`,
+      key: `standalone:${c.id || c.name}`,
+      name: c.name,
+      containerId: c.id,
+      shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
+      service: "",
+      project: "",
+      isStandalone: true,
+      status: c.status || "",
+      state: c.state || "",
+      running: Boolean(c.isRunning || c.running || c.state === "running"),
+      image: c.image || "",
+      ports: c.ports || "",
+      depth: 0,
+      data: c,
+    });
+  }
+
+  return rows;
 }

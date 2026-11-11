@@ -33,6 +33,14 @@ import {
   buildContainerTree,
   isPathEqualOrInside,
   resolveDockerContext,
+  flattenContainerRows,
+  aggregateProjectStatus,
+  matchesFilter,
+  parseEngineInfo,
+  engineStateFromResults,
+  parseComposeConfig,
+  discoverComposeGroups,
+  parseComposeLs,
 } from "../mods/docker-manager/docker-logic.js";
 
 // =============================================================================
@@ -1029,3 +1037,326 @@ test("resolveDockerContext resolves explicit and active space locations", () => 
   });
   assert.deepEqual(ctxSpace, { root: "/space/root", machine: null });
 });
+
+// =============================================================================
+// Suite 12: flattenContainerRows (R2 AC 2)
+// =============================================================================
+test("flattenContainerRows preserves stable order: in-space first, declaration order, numeric replicas, not-created rows", () => {
+  const tree = {
+    projects: [
+      {
+        name: "other-proj",
+        inSpace: false,
+        services: [
+          { name: "web", status: "running", running: true, containers: [{ id: "c1", name: "other-web-1", containerNumber: "1" }] },
+        ],
+      },
+      {
+        name: "space-proj",
+        inSpace: true,
+        services: [
+          // "worker" has declaredOrder: 0, "api" has declaredOrder: 1, "db" has no declaredOrder (alpha fallback)
+          {
+            name: "worker",
+            declaredOrder: 0,
+            status: "running",
+            running: true,
+            containers: [{ id: "w1", name: "worker-1", containerNumber: "1" }],
+          },
+          {
+            name: "api",
+            declaredOrder: 1,
+            status: "running",
+            running: true,
+            // Multi-container replicas out of numeric order: 10, 2, 1
+            containers: [
+              { id: "a10", name: "api-10", containerNumber: "10" },
+              { id: "a2", name: "api-2", containerNumber: "2" },
+              { id: "a1", name: "api-1", containerNumber: "1" },
+            ],
+          },
+          {
+            name: "db",
+            status: "not-created",
+            created: false,
+            declared: true,
+            running: false,
+            containers: [],
+          },
+        ],
+      },
+    ],
+    dockerfiles: [],
+    standalone: [],
+  };
+
+  // Expand space-proj explicitly
+  const rows = flattenContainerRows(tree, { "space-proj": true, "other-proj": false });
+
+  // 1. Projects order: in-space first ("space-proj"), then "other-proj"
+  assert.equal(rows[0].type, "project");
+  assert.equal(rows[0].name, "space-proj");
+
+  // 2. Services under space-proj:
+  // worker (declaredOrder: 0)
+  assert.equal(rows[1].type, "service");
+  assert.equal(rows[1].name, "worker");
+  // api (declaredOrder: 1)
+  assert.equal(rows[2].type, "service");
+  assert.equal(rows[2].name, "api");
+  assert.equal(rows[2].hasReplicas, true);
+
+  // 3. Replicas under api sorted numerically: 1, 2, 10
+  assert.equal(rows[3].type, "container");
+  assert.equal(rows[3].name, "api-1");
+  assert.equal(rows[4].type, "container");
+  assert.equal(rows[4].name, "api-2");
+  assert.equal(rows[5].type, "container");
+  assert.equal(rows[5].name, "api-10");
+
+  // 4. Not-created service included with status: "not-created"
+  assert.equal(rows[6].type, "service");
+  assert.equal(rows[6].name, "db");
+  assert.equal(rows[6].status, "not-created");
+  assert.equal(rows[6].created, false);
+
+  // 5. Next project is other-proj, collapsed (no service rows)
+  assert.equal(rows[7].type, "project");
+  assert.equal(rows[7].name, "other-proj");
+  assert.equal(rows.length, 8);
+});
+
+// =============================================================================
+// Suite 13: aggregateProjectStatus (R2 AC 2)
+// =============================================================================
+test("aggregateProjectStatus returns ok when all services are running", () => {
+  const services = [
+    { name: "web", running: true, status: "Up 2 hours", containers: [{ isRunning: true }] },
+    { name: "db", running: true, status: "Up 2 hours", containers: [{ isRunning: true }] },
+  ];
+  assert.equal(aggregateProjectStatus(services), "ok");
+});
+
+test("aggregateProjectStatus returns warning when mixed running and stopped/not-created", () => {
+  const mixed = [
+    { name: "web", running: true, status: "Up 2 hours", containers: [{ isRunning: true }] },
+    { name: "worker", running: false, status: "Exited (0) 10m ago", containers: [{ isRunning: false }] },
+  ];
+  assert.equal(aggregateProjectStatus(mixed), "warning");
+
+  const withNotCreated = [
+    { name: "web", running: true, status: "Up 2 hours", containers: [{ isRunning: true }] },
+    { name: "cache", running: false, status: "not-created", containers: [] },
+  ];
+  assert.equal(aggregateProjectStatus(withNotCreated), "warning");
+});
+
+test("aggregateProjectStatus returns muted when none are running or empty", () => {
+  assert.equal(aggregateProjectStatus([]), "muted");
+  const none = [
+    { name: "web", running: false, status: "Exited (0)", containers: [{ isRunning: false }] },
+    { name: "db", running: false, status: "not-created", containers: [] },
+  ];
+  assert.equal(aggregateProjectStatus(none), "muted");
+});
+
+test("aggregateProjectStatus returns error when any is unhealthy, restarting, or dead", () => {
+  const unhealthy = [
+    { name: "web", running: true, status: "Up 2 hours (healthy)", containers: [{ isRunning: true, status: "Up 2h (healthy)" }] },
+    { name: "api", running: true, status: "Up 2 hours (unhealthy)", containers: [{ isRunning: true, status: "Up 2h (unhealthy)", health: { status: "unhealthy" } }] },
+  ];
+  assert.equal(aggregateProjectStatus(unhealthy), "error");
+
+  const restarting = [
+    { name: "web", running: true, status: "Up 2 hours", containers: [{ isRunning: true }] },
+    { name: "app", running: false, state: "restarting", status: "Restarting (1) 5 seconds ago", containers: [{ isRunning: false, state: "restarting" }] },
+  ];
+  assert.equal(aggregateProjectStatus(restarting), "error");
+
+  const dead = [
+    { name: "web", running: true, status: "Up 2 hours", containers: [{ isRunning: true }] },
+    { name: "legacy", running: false, state: "dead", status: "Dead", containers: [{ isRunning: false, state: "dead" }] },
+  ];
+  assert.equal(aggregateProjectStatus(dead), "error");
+});
+
+// =============================================================================
+// Suite 14: matchesFilter (R2 AC 2)
+// =============================================================================
+test("matchesFilter matches name, image, service, project, and published port case-insensitively", () => {
+  const row = {
+    name: "cv-mapa-web-1",
+    image: "cv-mapa-web:latest",
+    service: "web",
+    project: "cv-mapa",
+    ports: "0.0.0.0:8000->8000/tcp",
+  };
+
+  // Empty query matches everything
+  assert.equal(matchesFilter(row, ""), true);
+  assert.equal(matchesFilter(row, "   "), true);
+  assert.equal(matchesFilter(row, null), true);
+
+  // Name match
+  assert.equal(matchesFilter(row, "cv-mapa-web-1"), true);
+  assert.equal(matchesFilter(row, "WEB-1"), true);
+
+  // Image match
+  assert.equal(matchesFilter(row, "cv-mapa-web"), true);
+  assert.equal(matchesFilter(row, "LATEST"), true);
+
+  // Service match
+  assert.equal(matchesFilter(row, "web"), true);
+  assert.equal(matchesFilter(row, "WEB"), true);
+
+  // Project match
+  assert.equal(matchesFilter(row, "cv-mapa"), true);
+  assert.equal(matchesFilter(row, "CV-MAPA"), true);
+
+  // Port match
+  assert.equal(matchesFilter(row, "8000"), true);
+
+  // Non-matching query
+  assert.equal(matchesFilter(row, "redis"), false);
+  assert.equal(matchesFilter(row, "9000"), false);
+});
+
+// =============================================================================
+// Suite 15: parseEngineInfo & engineStateFromResults (R2 AC 2)
+// =============================================================================
+test("parseEngineInfo parses info JSON stdout correctly", () => {
+  const jsonStr = JSON.stringify({
+    ID: "engine-123",
+    ServerVersion: "29.5.3",
+    Containers: 19,
+    ContainersRunning: 16,
+    ContainersPaused: 0,
+    ContainersStopped: 3,
+    Images: 101,
+    OperatingSystem: "Linux",
+    Architecture: "aarch64",
+  });
+
+  const parsed = parseEngineInfo(jsonStr);
+  assert.equal(parsed.serverVersion, "29.5.3");
+  assert.equal(parsed.containers, 19);
+  assert.equal(parsed.containersRunning, 16);
+  assert.equal(parsed.images, 101);
+
+  assert.equal(parseEngineInfo(""), null);
+  assert.equal(parseEngineInfo(null), null);
+});
+
+test("engineStateFromResults distinguishes reachable, daemon-down, and cli-missing", () => {
+  // Reachable
+  const reachable = engineStateFromResults({
+    info: { code: 0, ServerVersion: "29.5.3" },
+    versionProbe: { code: 0, stdout: JSON.stringify({ Server: { Version: "29.5.3" } }) },
+  });
+  assert.equal(reachable.status, "reachable");
+  assert.equal(reachable.reachable, true);
+  assert.equal(reachable.version, "29.5.3");
+
+  // Daemon down
+  const daemonDown = engineStateFromResults({
+    info: { code: 1, stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" },
+    versionProbe: { code: 1, stderr: "Cannot connect to the Docker daemon" },
+  });
+  assert.equal(daemonDown.status, "daemon-down");
+  assert.equal(daemonDown.reachable, false);
+  assert.equal(daemonDown.version, null);
+
+  // CLI missing
+  const cliMissing = engineStateFromResults({
+    info: { code: 127, error: new Error("spawn docker ENOENT") },
+    versionProbe: { code: 127, stderr: "bash: docker: command not found" },
+  });
+  assert.equal(cliMissing.status, "cli-missing");
+  assert.equal(cliMissing.reachable, false);
+  assert.equal(cliMissing.version, null);
+});
+
+// =============================================================================
+// Suite 16: parseComposeConfig & discoverComposeGroups (R2 AC 2)
+// =============================================================================
+test("parseComposeConfig parses declared services, profiles, ports, and image/build", () => {
+  const jsonStr = JSON.stringify({
+    name: "test-app",
+    services: {
+      web: {
+        image: "nginx:alpine",
+        ports: [{ mode: "ingress", target: 80, published: "8080", protocol: "tcp" }],
+        profiles: ["frontend"],
+      },
+      api: {
+        build: { context: "./api", dockerfile: "Dockerfile" },
+        ports: [{ mode: "ingress", target: 3000, published: "3000", protocol: "tcp" }],
+        profiles: [],
+      },
+    },
+  });
+
+  const parsed = parseComposeConfig(jsonStr);
+  assert.equal(parsed.name, "test-app");
+  assert.equal(parsed.services.web.image, "nginx:alpine");
+  assert.deepEqual(parsed.services.web.profiles, ["frontend"]);
+  assert.equal(parsed.services.web.ports[0].published, "8080");
+  assert.deepEqual(parsed.services.api.build, { context: "./api", dockerfile: "Dockerfile" });
+});
+
+test("discoverComposeGroups pairs compose.yaml with compose.override.yaml and keeps compose.dev.yaml separate", () => {
+  const paths = [
+    "/projects/my-app/compose.yaml",
+    "/projects/my-app/compose.override.yaml",
+    "/projects/my-app/compose.dev.yaml",
+    "/projects/other-app/docker-compose.yml",
+    "/projects/other-app/docker-compose.override.yml",
+  ];
+
+  const groups = discoverComposeGroups(paths);
+
+  // Group 1: /projects/my-app/compose.yaml paired with compose.override.yaml
+  const myAppMain = groups.find((g) => g.file === "/projects/my-app/compose.yaml");
+  assert.ok(myAppMain);
+  assert.deepEqual(myAppMain.files, [
+    "/projects/my-app/compose.yaml",
+    "/projects/my-app/compose.override.yaml",
+  ]);
+  assert.equal(myAppMain.override, "/projects/my-app/compose.override.yaml");
+
+  // Group 2: /projects/my-app/compose.dev.yaml stays separate
+  const myAppDev = groups.find((g) => g.file === "/projects/my-app/compose.dev.yaml");
+  assert.ok(myAppDev);
+  assert.deepEqual(myAppDev.files, ["/projects/my-app/compose.dev.yaml"]);
+  assert.equal(myAppDev.variant, "dev");
+
+  // Group 3: /projects/other-app/docker-compose.yml paired with docker-compose.override.yml
+  const otherAppMain = groups.find((g) => g.file === "/projects/other-app/docker-compose.yml");
+  assert.ok(otherAppMain);
+  assert.deepEqual(otherAppMain.files, [
+    "/projects/other-app/docker-compose.yml",
+    "/projects/other-app/docker-compose.override.yml",
+  ]);
+});
+
+// =============================================================================
+// Suite 17: parseComposeLs (R2 AC 2)
+// =============================================================================
+test("parseComposeLs parses JSON array from docker compose ls --all --format json", () => {
+  const jsonStr = JSON.stringify([
+    { Name: "cv-mapa", Status: "running(3)", ConfigFiles: "/home/cv-mapa/compose.yaml" },
+    { Name: "node-aec", Status: "exited(2), running(5)", ConfigFiles: "/home/node-aec/compose.yaml" },
+  ]);
+
+  const parsed = parseComposeLs(jsonStr);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].name, "cv-mapa");
+  assert.equal(parsed[0].status, "running(3)");
+  assert.equal(parsed[0].configFiles, "/home/cv-mapa/compose.yaml");
+  assert.equal(parsed[1].name, "node-aec");
+
+  // Empty input returns empty array
+  assert.deepEqual(parseComposeLs(""), []);
+  assert.deepEqual(parseComposeLs(null), []);
+});
+
