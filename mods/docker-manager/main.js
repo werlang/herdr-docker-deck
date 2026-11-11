@@ -87,7 +87,7 @@ const SECTIONS = [
 
 export default class DockerManager extends View {
   /**
-   * Initializes the Docker Manager view (DM-02).
+   * Initializes the Docker Manager view (DM-02, DM-44).
    *
    * @param {Record<string, any>} _props
    * @param {import("gpui-kit").ViewContext} cx
@@ -100,6 +100,62 @@ export default class DockerManager extends View {
     this.inspectMode = Boolean(p.inspect);
     this.inspectTarget = p.inspect || null;
 
+    if (this.inspectMode) {
+      this.initInspectMode(p, cx);
+      return;
+    }
+
+    this.initPanelMode(p, cx);
+  }
+
+  /**
+   * Initializes full-size inspector tab mode (DM-44..46).
+   *
+   * @param {Record<string, any>} p
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  initInspectMode(p, cx) {
+    this.inspectTarget = p.inspect || null;
+    this.inspectSubView = "overview";
+    this.inspectData = null;
+    this.rawInspectJson = "";
+    this.inspectLoading = true;
+    this.inspectError = null;
+    this.targetGone = false;
+    this.statsData = null;
+    this.statsLoading = false;
+    this.statsToken = 0;
+    this.lastStatsUpdate = 0;
+    this.revealedEnvKeys = new Set();
+    this.revealAllSecrets = false;
+    this.jsonEditorState = null;
+    this.busyTargets = new Map();
+    this.confirmDialog = null;
+
+    const ctx = this.getContext();
+    this.root = p.folder || ctx.root;
+    this.machine = p.on || ctx.machine;
+
+    this.wasVisible = this.isViewVisible();
+
+    this.loadInspectTab(cx);
+
+    // Live stats poll: only while the tab's Stats sub-view is visible
+    cx.timer.every(3000, (cx) => {
+      if (this.closed) return;
+      if (this.inspectSubView === "stats" && this.isViewVisible()) {
+        this.pollInspectStats(cx);
+      }
+    });
+  }
+
+  /**
+   * Initializes panel mode (DM-10..43).
+   *
+   * @param {Record<string, any>} _p
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  initPanelMode(_p, cx) {
     // Panel state
     this.section = "containers";
     this.scope = shared("docker-manager.scope") || "all"; // "all" | "space" (DM-35, DM-36)
@@ -170,12 +226,23 @@ export default class DockerManager extends View {
   async close(_cx) {
     this.closed = true;
     this.pollSeq++;
+    this.statsToken = 0;
+    if (this.jsonEditorState) {
+      try {
+        this.jsonEditorState.release();
+      } catch {}
+      this.jsonEditorState = null;
+    }
     if (this.filterInput) {
-      this.filterInput.release();
+      try {
+        this.filterInput.release();
+      } catch {}
       this.filterInput = null;
     }
     if (this.confirmDialog?.inputState) {
-      this.confirmDialog.inputState.release();
+      try {
+        this.confirmDialog.inputState.release();
+      } catch {}
       this.confirmDialog = null;
     }
   }
@@ -187,6 +254,15 @@ export default class DockerManager extends View {
    */
   isViewVisible() {
     const p = props() || {};
+    if (this.inspectMode) {
+      const spaceList = spaces() || [];
+      const activeSpace = spaceList.find((s) => s.active);
+      if (!activeSpace) return true;
+      const activeTab = (activeSpace.tabs ?? []).find((t) => t.active);
+      if (!activeTab) return true;
+      if (p.tab) return activeTab.id === p.tab;
+      return activeTab.mod === "docker-manager";
+    }
     if (p.panel) {
       const root = layout();
       return isLayoutNodeVisible(root, (n) => n?.id === "docker" || n?.content?.mod === "docker-manager");
@@ -340,6 +416,18 @@ export default class DockerManager extends View {
   handleRowClick(key, cx) {
     const row = this.rows.find((r) => r.key === key);
     if (!row) return;
+
+    const now = Date.now();
+    if (this.lastClickKey === key && now - (this.lastClickTime || 0) < 350) {
+      this.lastClickKey = null;
+      this.lastClickTime = 0;
+      if (row.type === "service" || row.type === "container") {
+        this.openInspectTab(row, cx);
+        return;
+      }
+    }
+    this.lastClickKey = key;
+    this.lastClickTime = now;
 
     if (row.type === "project") {
       this.expandState[row.name] = !row.expanded;
@@ -1233,22 +1321,193 @@ export default class DockerManager extends View {
           )
       )
       .child(
-        div()
-          .w(18)
-          .h(18)
-          .rounded(3)
+        h_flex()
           .items_center()
-          .justify_center()
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => {
-            this.selectedRow = null;
-            this.selectedKey = null;
-            this.inspectData = null;
-            cx.notify();
-          })
-          .child(div().text_size(11).text_color(t.muted).child("✕"))
+          .gap(4)
+          .child(
+            div()
+              .id("docker-drawer-open-tab-btn")
+              .w(18)
+              .h(18)
+              .rounded(3)
+              .items_center()
+              .justify_center()
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .tooltip("Open in new tab")
+              .on_click((_e, cx) => {
+                if (this.selectedRow) {
+                  this.openInspectTab(this.selectedRow, cx);
+                }
+              })
+              .child(svg("mods/docker-manager/icons/external.svg").size(11).text_color(t.muted))
+          )
+          .child(
+            div()
+              .w(18)
+              .h(18)
+              .rounded(3)
+              .items_center()
+              .justify_center()
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_click((_e, cx) => {
+                this.selectedRow = null;
+                this.selectedKey = null;
+                this.inspectData = null;
+                cx.notify();
+              })
+              .child(div().text_size(11).text_color(t.muted).child("✕"))
+          )
       );
+  }
+
+  /**
+   * Renders overview fields for container/service/image/volume/network (DM-41, DM-45).
+   * Shared between bottom drawer and full inspector tab Overview.
+   *
+   * @param {any} data
+   * @param {any} row
+   * @param {ReturnType<typeof theme>} t
+   * @param {import("gpui-kit").ViewContext} cx
+   * @returns {import("gpui-kit").Element[]}
+   */
+  renderOverviewFields(data, row, t, cx) {
+    if (!data && row) {
+      const config = row.data?.config;
+      return [
+        this.renderDrawerField("Status", row.status, t, cx),
+        this.renderDrawerField("Service", row.service, t, cx),
+        this.renderDrawerField("Project", row.project, t, cx),
+        config?.image ? this.renderDrawerField("Image (declared)", config.image, t, cx) : null,
+        config?.ports ? this.renderDrawerField("Ports (declared)", JSON.stringify(config.ports), t, cx) : null,
+        config?.profiles ? this.renderDrawerField("Profiles", config.profiles.join(", "), t, cx) : null,
+      ].filter(Boolean);
+    }
+
+    if (!data) return [];
+
+    // Image inspect data
+    if (data.tags !== undefined && data.architecture !== undefined) {
+      return [
+        this.renderDrawerField("Image ID", data.shortId || data.id, t, cx, { isCode: true, copyVal: data.id }),
+        this.renderDrawerField("Tags", (data.tags || []).join(", "), t, cx),
+        this.renderDrawerField("Size", data.sizeFormatted || formatBytes(data.size), t, cx),
+        this.renderDrawerField("Created", formatRelativeTime(data.created) || data.created, t, cx),
+        this.renderDrawerField("OS / Architecture", `${data.os} / ${data.architecture}`, t, cx),
+        this.renderDrawerField("Command", (data.cmd || []).join(" "), t, cx, { isCode: true }),
+        this.renderDrawerField("Entrypoint", (data.entrypoint || []).join(" "), t, cx, { isCode: true }),
+      ].filter(Boolean);
+    }
+
+    // Volume inspect data
+    if (data.mountpoint !== undefined && data.driver !== undefined && data.scope !== undefined && data.options !== undefined) {
+      return [
+        this.renderDrawerField("Name", data.name, t, cx, { isCode: true }),
+        this.renderDrawerField("Driver", data.driver, t, cx),
+        this.renderDrawerField("Mountpoint", data.mountpoint, t, cx, { isCode: true }),
+        this.renderDrawerField("Created", formatRelativeTime(data.createdAt) || data.createdAt, t, cx),
+        this.renderDrawerField("Scope", data.scope, t, cx),
+      ].filter(Boolean);
+    }
+
+    // Network inspect data
+    if (data.subnet !== undefined && data.gateway !== undefined && data.containers !== undefined) {
+      return [
+        this.renderDrawerField("Name", data.name, t, cx),
+        this.renderDrawerField("Network ID", data.shortId || data.id, t, cx, { isCode: true, copyVal: data.id }),
+        this.renderDrawerField("Driver", data.driver, t, cx),
+        this.renderDrawerField("Scope", data.scope, t, cx),
+        this.renderDrawerField("Subnet", data.subnet, t, cx, { isCode: true }),
+        this.renderDrawerField("Gateway", data.gateway, t, cx, { isCode: true }),
+        this.renderDrawerField("Internal", String(data.internal), t, cx),
+        this.renderDrawerField("Containers", String((data.containers || []).length), t, cx),
+      ].filter(Boolean);
+    }
+
+    // Standard container inspect data
+    const isUnhealthy =
+      data.health?.status === "unhealthy" || data.state?.status === "unhealthy";
+    const lastHealthLog =
+      isUnhealthy && data.health?.lastLog
+        ? data.health.lastLog.replace(/\r?\n/g, " ").trim()
+        : null;
+
+    const cmdStr = Array.isArray(data.cmd) ? data.cmd.join(" ") : data.cmd || "";
+    const entrypointStr = Array.isArray(data.entrypoint)
+      ? data.entrypoint.join(" ")
+      : data.entrypoint || "";
+    const composeFilesStr = Array.isArray(data.composeFiles)
+      ? data.composeFiles.join(", ")
+      : data.composeFiles || "";
+    const dependsOnStr = Array.isArray(data.dependsOn)
+      ? data.dependsOn.join(", ")
+      : data.dependsOn || "";
+
+    const imageDisplay = formatImageLabel(
+      data.image,
+      data.shortImageId || data.imageShortId
+    );
+    const restartPolicyDisplay = formatRestartPolicy(data.restartPolicy);
+
+    return [
+      this.renderDrawerField("Container ID", data.shortId || data.id, t, cx, {
+        isCode: true,
+        copyVal: data.id || data.shortId,
+      }),
+      this.renderDrawerField("Name", data.name, t, cx),
+      this.renderDrawerField("Image", imageDisplay, t, cx, {
+        copyVal: data.image || data.shortImageId || imageDisplay,
+      }),
+      this.renderDrawerField(
+        "Status",
+        data.health?.status
+          ? `${data.state?.status} (${data.health.status})`
+          : data.state?.status,
+        t,
+        cx
+      ),
+      lastHealthLog
+        ? this.renderDrawerField("Health Check", lastHealthLog, t, cx, {
+            truncate: true,
+            copyVal: data.health.lastLog,
+          })
+        : null,
+      this.renderDrawerField("Restart Policy", restartPolicyDisplay, t, cx),
+      this.renderDrawerPorts(data.ports, t, cx),
+      this.renderDrawerMounts(data.mounts, t, cx),
+      this.renderDrawerNetworks(data.networks, t, cx),
+      this.renderDrawerField("Command", cmdStr, t, cx, {
+        isCode: true,
+        truncate: true,
+        copyVal: cmdStr,
+      }),
+      this.renderDrawerField("Entrypoint", entrypointStr, t, cx, {
+        isCode: true,
+        truncate: true,
+        copyVal: entrypointStr,
+      }),
+      this.renderDrawerField("Project", data.project, t, cx),
+      this.renderDrawerField("Service", data.service, t, cx),
+      this.renderDrawerField(
+        "Started / Created",
+        data.startedAt && data.created
+          ? `${formatRelativeTime(data.startedAt) || data.startedAt} / ${formatRelativeTime(data.created) || data.created}`
+          : data.startedAt || data.created,
+        t,
+        cx,
+        { copyVal: `Started: ${data.startedAt || "-"}, Created: ${data.created || "-"}` }
+      ),
+      this.renderDrawerField("Working Dir", data.workingDir, t, cx, { isCode: true }),
+      this.renderDrawerField("Compose Files", composeFilesStr, t, cx, {
+        truncate: true,
+        copyVal: composeFilesStr,
+      }),
+      this.renderDrawerField("Depends On", dependsOnStr, t, cx, {
+        truncate: true,
+        copyVal: dependsOnStr,
+      }),
+    ].filter(Boolean);
   }
 
   /**
@@ -1278,105 +1537,9 @@ export default class DockerManager extends View {
               div().p(12).text_size(11).text_color(t.muted).child("Loading inspection details…")
             )
           )
-          .when(!this.inspectLoading && Boolean(data), (el) => {
-            const isUnhealthy =
-              data.health?.status === "unhealthy" || data.state?.status === "unhealthy";
-            const lastHealthLog =
-              isUnhealthy && data.health?.lastLog
-                ? data.health.lastLog.replace(/\r?\n/g, " ").trim()
-                : null;
-
-            const cmdStr = Array.isArray(data.cmd) ? data.cmd.join(" ") : data.cmd || "";
-            const entrypointStr = Array.isArray(data.entrypoint)
-              ? data.entrypoint.join(" ")
-              : data.entrypoint || "";
-            const composeFilesStr = Array.isArray(data.composeFiles)
-              ? data.composeFiles.join(", ")
-              : data.composeFiles || "";
-            const dependsOnStr = Array.isArray(data.dependsOn)
-              ? data.dependsOn.join(", ")
-              : data.dependsOn || "";
-
-            const imageDisplay = formatImageLabel(
-              data.image,
-              data.shortImageId || data.imageShortId
-            );
-            const restartPolicyDisplay = formatRestartPolicy(data.restartPolicy);
-
-            const fields = [
-              this.renderDrawerField("Container ID", data.shortId || data.id, t, cx, {
-                isCode: true,
-                copyVal: data.id || data.shortId,
-              }),
-              this.renderDrawerField("Name", data.name, t, cx),
-              this.renderDrawerField("Image", imageDisplay, t, cx, {
-                copyVal: data.image || data.shortImageId || imageDisplay,
-              }),
-              this.renderDrawerField(
-                "Status",
-                data.health?.status
-                  ? `${data.state?.status} (${data.health.status})`
-                  : data.state?.status,
-                t,
-                cx
-              ),
-              lastHealthLog
-                ? this.renderDrawerField("Health Check", lastHealthLog, t, cx, {
-                    truncate: true,
-                    copyVal: data.health.lastLog,
-                  })
-                : null,
-              this.renderDrawerField("Restart Policy", restartPolicyDisplay, t, cx),
-              this.renderDrawerPorts(data.ports, t, cx),
-              this.renderDrawerMounts(data.mounts, t, cx),
-              this.renderDrawerNetworks(data.networks, t, cx),
-              this.renderDrawerField("Command", cmdStr, t, cx, {
-                isCode: true,
-                truncate: true,
-                copyVal: cmdStr,
-              }),
-              this.renderDrawerField("Entrypoint", entrypointStr, t, cx, {
-                isCode: true,
-                truncate: true,
-                copyVal: entrypointStr,
-              }),
-              this.renderDrawerField("Project", data.project, t, cx),
-              this.renderDrawerField("Service", data.service, t, cx),
-              this.renderDrawerField(
-                "Started / Created",
-                data.startedAt && data.created
-                  ? `${formatRelativeTime(data.startedAt) || data.startedAt} / ${formatRelativeTime(data.created) || data.created}`
-                  : data.startedAt || data.created,
-                t,
-                cx,
-                { copyVal: `Started: ${data.startedAt || "-"}, Created: ${data.created || "-"}` }
-              ),
-              this.renderDrawerField("Working Dir", data.workingDir, t, cx, { isCode: true }),
-              this.renderDrawerField("Compose Files", composeFilesStr, t, cx, {
-                truncate: true,
-                copyVal: composeFilesStr,
-              }),
-              this.renderDrawerField("Depends On", dependsOnStr, t, cx, {
-                truncate: true,
-                copyVal: dependsOnStr,
-              }),
-            ].filter(Boolean);
-
-            return el.children(fields);
-          })
-          .when(!this.inspectLoading && !data && Boolean(row), (el) => {
-            const config = row.data?.config;
-            const fields = [
-              this.renderDrawerField("Status", row.status, t, cx),
-              this.renderDrawerField("Service", row.service, t, cx),
-              this.renderDrawerField("Project", row.project, t, cx),
-              config?.image ? this.renderDrawerField("Image (declared)", config.image, t, cx) : null,
-              config?.ports ? this.renderDrawerField("Ports (declared)", JSON.stringify(config.ports), t, cx) : null,
-              config?.profiles ? this.renderDrawerField("Profiles", config.profiles.join(", "), t, cx) : null,
-            ].filter(Boolean);
-
-            return el.children(fields);
-          })
+          .when(!this.inspectLoading && Boolean(data || row), (el) =>
+            el.children(this.renderOverviewFields(data, row, t, cx))
+          )
       );
   }
 
@@ -1493,7 +1656,7 @@ export default class DockerManager extends View {
     }
 
     if (item.id === "service.inspect" || item.id === "container.inspect" || item.id === "inspect") {
-      this.handleRowClick(row.key, cx);
+      this.openInspectTab(row, cx);
       return;
     }
 
@@ -1900,11 +2063,1435 @@ export default class DockerManager extends View {
   }
 
   /**
-   * Renders the view (GPUI render cycle).
+   * Opens an inspector tab or selects an existing one (DM-44).
+   *
+   * @param {any} target
+   * @param {import("gpui-kit").ViewContext} [_cx]
+   */
+  openInspectTab(target, _cx) {
+    if (!target) return;
+    const tabObj = buildInspectTabProps(target, { folder: this.root, on: this.machine });
+    const name = inspectTabName(target);
+    const targetInspect = tabObj.props.inspect;
+
+    const activeSpace = (spaces() || []).find((s) => s.active);
+    const existing = (activeSpace?.tabs || []).find((t) => {
+      if (t.mod !== "docker-manager") return false;
+      const tInspect = t.props?.inspect;
+      if (!tInspect) return false;
+      if (targetInspect.project && targetInspect.service) {
+        return (
+          tInspect.project === targetInspect.project &&
+          tInspect.service === targetInspect.service
+        );
+      }
+      return tInspect.id === targetInspect.id && tInspect.kind === targetInspect.kind;
+    });
+
+    if (existing) {
+      run("tab.select", { id: existing.id }).catch(() => {});
+    } else {
+      run("tab.new", {
+        name,
+        mod: "docker-manager",
+        props: tabObj.props,
+      }).catch(() => {});
+    }
+  }
+
+  /**
+   * Loads inspection data for the active inspector tab (DM-44..46).
    *
    * @param {import("gpui-kit").ViewContext} cx
    */
-  render(cx) {
+  loadInspectTab(cx) {
+    if (this.closed) return;
+    this.inspectLoading = true;
+    this.inspectError = null;
+    this.targetGone = false;
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const target = this.inspectTarget || {};
+        const kind = target.kind || "container";
+        let id = target.id || target.containerId || target.name || "";
+
+        // Re-resolve Compose service across recreation if tree is available
+        if (target.project && target.service && this.tree) {
+          const resolved = resolveInspectorTarget(target, this.tree);
+          if (resolved) {
+            id = resolved;
+          }
+        }
+
+        if (!id && !target.project && !target.service) {
+          this.inspectLoading = false;
+          this.targetGone = true;
+          cx.notify();
+          return;
+        }
+
+        let argv = ["inspect", "--format", "{{json .}}", id];
+        if (kind === "volume") {
+          argv = ["volume", "inspect", "--format", "{{json .}}", id];
+        } else if (kind === "network") {
+          argv = ["network", "inspect", "--format", "{{json .}}", id];
+        } else if (kind === "image") {
+          argv = ["inspect", "--format", "{{json .}}", id];
+        }
+
+        const res = await exec("docker", argv, {
+          cwd: this.root,
+          on: this.machine,
+          timeout: 10000,
+        });
+
+        if (this.closed) return;
+
+        if (res.code === 0 && res.stdout.trim()) {
+          const rawStdout = res.stdout.trim();
+          this.rawInspectJson = prettyJson(rawStdout);
+
+          if (kind === "image") {
+            this.inspectData = normalizeImageInspect(rawStdout);
+          } else if (kind === "volume") {
+            this.inspectData = normalizeVolumeInspect(rawStdout);
+          } else if (kind === "network") {
+            this.inspectData = normalizeNetworkInspect(rawStdout);
+          } else {
+            this.inspectData = normalizeContainerInspect(rawStdout);
+          }
+
+          if (this.jsonEditorState) {
+            try {
+              this.jsonEditorState.release();
+            } catch {}
+            this.jsonEditorState = null;
+          }
+          this.jsonEditorState = EditorState.new({
+            language: "json",
+            value: this.rawInspectJson,
+            readonly: true,
+            line_numbers: true,
+            soft_wrap: false,
+            font_size: 12,
+            syntax: buildSyntaxTheme(theme()),
+          });
+
+          this.targetGone = false;
+          this.inspectLoading = false;
+          cx.notify();
+
+          if (this.inspectSubView === "stats") {
+            this.pollInspectStats(cx);
+          }
+        } else {
+          this.targetGone = true;
+          this.inspectData = null;
+          this.inspectLoading = false;
+          cx.notify();
+        }
+      } catch (err) {
+        if (this.closed) return;
+        this.inspectError = err.message || String(err);
+        this.inspectLoading = false;
+        cx.notify();
+      }
+    });
+  }
+
+  /**
+   * Polls live container resource usage stats (DM-45).
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  pollInspectStats(cx) {
+    if (this.closed || !this.inspectMode || this.inspectSubView !== "stats") return;
+    const kind = this.inspectTarget?.kind || "container";
+    if (kind !== "container" && kind !== "service") return;
+    const targetId = this.inspectData?.id || this.inspectTarget?.id;
+    if (!targetId) return;
+
+    const token = ++this.statsToken;
+    this.statsLoading = !this.statsData;
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "docker",
+          ["stats", "--no-stream", "--format", "{{json .}}", targetId],
+          { cwd: this.root, on: this.machine, timeout: 5000 }
+        );
+        if (token !== this.statsToken || this.closed) return;
+        this.statsLoading = false;
+        if (res.code === 0 && res.stdout) {
+          this.statsData = parseDockerStats(res.stdout);
+          this.lastStatsUpdate = Date.now();
+          cx.notify();
+        }
+      } catch {
+        if (token === this.statsToken && !this.closed) {
+          this.statsLoading = false;
+        }
+      }
+    });
+  }
+
+  /**
+   * Switches inspector tab sub-view (DM-45).
+   *
+   * @param {string} id
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  switchSubView(id, cx) {
+    if (this.inspectSubView === id) return;
+    this.inspectSubView = id;
+    if (id === "stats") {
+      this.statsToken++;
+      this.pollInspectStats(cx);
+    } else {
+      this.statsToken++;
+    }
+    cx.notify();
+  }
+
+  /**
+   * Opens terminal logs or shell for the inspected container or service (DM-46).
+   *
+   * @param {"logs" | "shell"} mode
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  openInspectTerminal(mode, cx) {
+    const isService = Boolean(this.inspectTarget?.project && this.inspectTarget?.service);
+    const fakeRow = {
+      type: isService ? "service" : "container",
+      project: this.inspectTarget?.project || null,
+      service: this.inspectTarget?.service || null,
+      name: this.inspectData?.name || this.inspectTarget?.id || "",
+      containerId: this.inspectData?.id || this.inspectTarget?.id || "",
+      id: this.inspectData?.id || this.inspectTarget?.id || "",
+      data: {
+        composeFiles: this.inspectData?.composeFiles || [],
+        workingDir: this.inspectData?.workingDir || this.root || null,
+      },
+    };
+    const item = {
+      id:
+        mode === "logs"
+          ? isService
+            ? "service.logs"
+            : "container.logs"
+          : isService
+            ? "service.shell"
+            : "container.shell",
+    };
+    this.openTerminal(item, fakeRow, { alt: false }, cx);
+  }
+
+  /**
+   * Handles lifecycle action from inspector tab header (DM-46).
+   *
+   * @param {string} actionName
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  handleInspectLifecycle(actionName, cx) {
+    const isService = Boolean(this.inspectTarget?.project && this.inspectTarget?.service);
+    const row = {
+      type: isService ? "service" : "container",
+      project: this.inspectTarget?.project || null,
+      service: this.inspectTarget?.service || null,
+      name: this.inspectData?.name || this.inspectTarget?.id || "",
+      containerId: this.inspectData?.id || this.inspectTarget?.id || "",
+      id: this.inspectData?.id || this.inspectTarget?.id || "",
+      data: {
+        composeFiles: this.inspectData?.composeFiles || [],
+        workingDir: this.inspectData?.workingDir || this.root || null,
+      },
+    };
+    const item = {
+      id: isService ? `service.${actionName}` : `container.${actionName}`,
+      label: actionName.charAt(0).toUpperCase() + actionName.slice(1),
+      danger: actionName === "stop" || actionName === "down",
+    };
+    if (requiresConfirm(item)) {
+      this.openConfirmDialog(item, row, confirmKind(item), cx);
+    } else {
+      this.executeLifecycleAction(item, row, cx);
+    }
+  }
+
+  /**
+   * Renders the full-size inspector tab (DM-44..46).
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  renderInspectTab(cx) {
+    const t = theme();
+
+    return v_flex()
+      .id("docker-inspect-tab-root")
+      .size_full()
+      .bg(t.background)
+      .text_color(t.foreground)
+      .on_size_change((size, _cx) => {
+        this.width = size.width;
+        this.height = size.height;
+      })
+      .on_mouse_down("left", (e, _cx) => this.updateRootOrigin(e))
+      .on_mouse_down("right", (e, _cx) => this.updateRootOrigin(e))
+      .child(this.renderInspectHeader(t, cx))
+      .child(this.renderInspectSubViewBar(t, cx))
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .when(this.inspectLoading, (el) =>
+            el.child(
+              v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap(8)
+                .child(div().text_size(12).text_color(t.muted).child("Loading inspection data…"))
+            )
+          )
+          .when(!this.inspectLoading && Boolean(this.inspectError), (el) =>
+            el.child(this.renderInspectError(t, cx))
+          )
+          .when(!this.inspectLoading && !this.inspectError && this.targetGone, (el) =>
+            el.child(this.renderInspectGone(t, cx))
+          )
+          .when(!this.inspectLoading && !this.inspectError && !this.targetGone && Boolean(this.inspectData), (el) =>
+            el.child(this.renderInspectActiveSubView(t, cx))
+          )
+      )
+      .when(Boolean(this.confirmDialog), (el) => el.child(this.renderConfirmDialog(t, cx)));
+  }
+
+  /**
+   * Renders the inspector tab header bar (DM-46).
+   *
+   * @param {ReturnType<typeof theme>} t
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  renderInspectHeader(t, cx) {
+    const data = this.inspectData;
+    const target = this.inspectTarget || {};
+    const kind = target.kind || "container";
+    const isRunning = data?.state?.status === "running";
+    const isService = Boolean(target.project && target.service);
+
+    // Status dot color
+    let statusBg = t.muted || "#94a3b8";
+    if (this.targetGone) {
+      statusBg = t.error || "#ef4444";
+    } else if (isRunning) {
+      statusBg =
+        data?.health?.status === "unhealthy"
+          ? t.warning || "#f59e0b"
+          : t.success || "#22c55e";
+    } else if (data?.state?.status === "restarting") {
+      statusBg = t.warning || "#f59e0b";
+    }
+
+    // Target icon
+    let iconPath = "mods/docker-manager/icons/container.svg";
+    if (isService) iconPath = "mods/docker-manager/icons/compose.svg";
+    else if (kind === "image") iconPath = "mods/docker-manager/icons/layers.svg";
+    else if (kind === "volume") iconPath = "mods/docker-manager/icons/volume.svg";
+    else if (kind === "network") iconPath = "mods/docker-manager/icons/network.svg";
+
+    return h_flex()
+      .id("docker-inspect-header")
+      .h(38)
+      .w_full()
+      .px(12)
+      .items_center()
+      .justify_between()
+      .bg(t.chrome)
+      .border_b_1()
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .items_center()
+          .gap(8)
+          .min_w(0)
+          .child(div().size(8).rounded_full().bg(statusBg))
+          .child(svg(iconPath).size(14).text_color(t.accent))
+          .when(isService, (el) =>
+            el.child(
+              h_flex()
+                .items_center()
+                .gap(4)
+                .min_w(0)
+                .child(
+                  div()
+                    .font_semibold()
+                    .text_size(12)
+                    .text_color(t.dim)
+                    .child(target.project)
+                )
+                .child(div().text_size(11).text_color(t.dim).child("/"))
+                .child(
+                  div()
+                    .font_bold()
+                    .text_size(12.5)
+                    .text_color(t.foreground)
+                    .truncate()
+                    .child(target.service)
+                )
+                .when(Boolean(data?.name), (sub) =>
+                  sub.child(
+                    div()
+                      .text_size(10.5)
+                      .text_color(t.dim)
+                      .child(`(${data.name})`)
+                  )
+                )
+            )
+          )
+          .when(!isService, (el) => {
+            let label = data?.name || target.id || "Resource";
+            if (kind === "image") {
+              label = data?.tags?.[0] || data?.shortId || target.id || "Image";
+            }
+            return el.child(
+              h_flex()
+                .items_center()
+                .gap(6)
+                .min_w(0)
+                .child(
+                  div()
+                    .font_bold()
+                    .text_size(12.5)
+                    .text_color(t.foreground)
+                    .truncate()
+                    .child(label)
+                )
+                .when(Boolean(data?.shortId && data?.name), (sub) =>
+                  sub.child(
+                    div()
+                      .font_family("monospace")
+                      .text_size(10.5)
+                      .text_color(t.dim)
+                      .child(`(${data.shortId})`)
+                  )
+                )
+            );
+          })
+      )
+      .child(
+        h_flex()
+          .items_center()
+          .gap(6)
+          .flex_shrink_0()
+          .child(
+            this.renderInspectHeaderBtn(
+              "docker-inspect-copy-id",
+              "Copy ID",
+              null,
+              (_e, cx) => {
+                const idToCopy = data?.id || target.id || "";
+                cx.write_to_clipboard(idToCopy);
+                notify({
+                  title: "Copied ID",
+                  body: idToCopy.slice(0, 12),
+                  level: "info",
+                });
+              },
+              t
+            )
+          )
+          .when(Boolean(data && (kind === "container" || kind === "service")), (el) =>
+            el
+              .when(!isRunning, (b) =>
+                b.child(
+                  this.renderInspectHeaderBtn(
+                    "docker-inspect-start",
+                    "Start",
+                    "mods/docker-manager/icons/play.svg",
+                    (_e, cx) => this.handleInspectLifecycle("start", cx),
+                    t
+                  )
+                )
+              )
+              .when(isRunning, (b) =>
+                b.child(
+                  this.renderInspectHeaderBtn(
+                    "docker-inspect-stop",
+                    "Stop",
+                    "mods/docker-manager/icons/stop.svg",
+                    (_e, cx) => this.handleInspectLifecycle("stop", cx),
+                    t
+                  )
+                )
+              )
+              .child(
+                this.renderInspectHeaderBtn(
+                  "docker-inspect-restart",
+                  "Restart",
+                  "mods/docker-manager/icons/restart.svg",
+                  (_e, cx) => this.handleInspectLifecycle("restart", cx),
+                  t
+                )
+              )
+              .when(isService, (b) =>
+                b.child(
+                  this.renderInspectHeaderBtn(
+                    "docker-inspect-rebuild",
+                    "Rebuild",
+                    null,
+                    (_e, cx) => this.handleInspectLifecycle("rebuild", cx),
+                    t
+                  )
+                )
+              )
+              .child(
+                this.renderInspectHeaderBtn(
+                  "docker-inspect-logs",
+                  "Logs",
+                  "mods/docker-manager/icons/logs.svg",
+                  (_e, cx) => this.openInspectTerminal("logs", cx),
+                  t
+                )
+              )
+              .child(
+                this.renderInspectHeaderBtn(
+                  "docker-inspect-shell",
+                  "Shell",
+                  "mods/docker-manager/icons/terminal.svg",
+                  (_e, cx) => this.openInspectTerminal("shell", cx),
+                  t
+                )
+              )
+          )
+          .child(
+            this.renderInspectHeaderBtn(
+              "docker-inspect-refresh",
+              "Refresh",
+              "mods/docker-manager/icons/refresh.svg",
+              (_e, cx) => this.loadInspectTab(cx),
+              t
+            )
+          )
+      );
+  }
+
+  /**
+   * Renders a button in the inspector tab header.
+   */
+  renderInspectHeaderBtn(id, label, iconPath, onClick, t) {
+    return h_flex()
+      .id(id)
+      .px(8)
+      .py(3)
+      .rounded(4)
+      .bg(t.surface)
+      .border_1()
+      .border_color(t.border)
+      .items_center()
+      .gap(4)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_click(onClick)
+      .when(Boolean(iconPath), (el) =>
+        el.child(svg(iconPath).size(11).text_color(t.muted))
+      )
+      .child(
+        div()
+          .text_size(10.5)
+          .text_color(t.foreground)
+          .font_medium()
+          .child(label)
+      );
+  }
+
+  /**
+   * Renders the inspector sub-view switcher bar (DM-45).
+   *
+   * @param {ReturnType<typeof theme>} t
+   * @param {import("gpui-kit").ViewContext} _cx
+   */
+  renderInspectSubViewBar(t, _cx) {
+    const subViews = [
+      { id: "overview", label: "Overview", icon: "container" },
+      { id: "env", label: "Environment", icon: "docker" },
+      { id: "mounts", label: "Mounts", icon: "volume" },
+      { id: "network", label: "Network", icon: "network" },
+      { id: "labels", label: "Labels", icon: "layers" },
+      { id: "stats", label: "Stats", icon: "whale" },
+      { id: "json", label: "Raw JSON", icon: "compose" },
+    ];
+
+    return h_flex()
+      .id("docker-inspect-subview-bar")
+      .h(32)
+      .w_full()
+      .px(8)
+      .items_center()
+      .gap(4)
+      .bg(t.chrome)
+      .border_b_1()
+      .border_color(t.border)
+      .children(
+        subViews.map((sv) => {
+          const isActive = this.inspectSubView === sv.id;
+          return h_flex()
+            .id(`docker-inspect-subview-${sv.id}`)
+            .px(10)
+            .py(3)
+            .rounded(4)
+            .items_center()
+            .gap(5)
+            .cursor_pointer()
+            .when(isActive, (el) =>
+              el
+                .bg(t.surface)
+                .border_1()
+                .border_color(t.border)
+            )
+            .when(!isActive, (el) =>
+              el.hover((s) => s.bg(t.hover))
+            )
+            .on_click((_e, cx) => this.switchSubView(sv.id, cx))
+            .child(
+              svg(`mods/docker-manager/icons/${sv.icon}.svg`)
+                .size(11)
+                .text_color(isActive ? t.accent : t.muted)
+            )
+            .child(
+              div()
+                .text_size(11)
+                .when(isActive, (el) => el.font_semibold().text_color(t.foreground))
+                .when(!isActive, (el) => el.text_color(t.muted))
+                .child(sv.label)
+            );
+        })
+      );
+  }
+
+  /**
+   * Renders the active sub-view content (DM-45).
+   *
+   * @param {ReturnType<typeof theme>} t
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  renderInspectActiveSubView(t, cx) {
+    switch (this.inspectSubView) {
+      case "overview":
+        return this.renderInspectOverview(t, cx);
+      case "env":
+        return this.renderInspectEnv(t, cx);
+      case "mounts":
+        return this.renderInspectMounts(t, cx);
+      case "network":
+        return this.renderInspectNetwork(t, cx);
+      case "labels":
+        return this.renderInspectLabels(t, cx);
+      case "stats":
+        return this.renderInspectStats(t, cx);
+      case "json":
+        return this.renderInspectRawJson(t, cx);
+      default:
+        return this.renderInspectOverview(t, cx);
+    }
+  }
+
+  /**
+   * Renders the Overview sub-view reusing drawer field renderers (DM-41, DM-45).
+   */
+  renderInspectOverview(t, cx) {
+    const fields = this.renderOverviewFields(this.inspectData, null, t, cx);
+    return v_flex()
+      .id("docker-inspect-overview-view")
+      .size_full()
+      .overflow_y_scrollbar()
+      .p(12)
+      .gap(2)
+      .children(fields);
+  }
+
+  /**
+   * Renders the Environment sub-view with secret masking and reveal toggle (DM-45).
+   */
+  renderInspectEnv(t, cx) {
+    const rawEnv = this.inspectData?.env || [];
+    const revealed = this.revealAllSecrets ? true : this.revealedEnvKeys;
+    const entries = maskEnvEntries(rawEnv, revealed);
+
+    if (entries.length === 0) {
+      return div()
+        .id("docker-inspect-env-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("No environment variables defined.");
+    }
+
+    return v_flex()
+      .id("docker-inspect-env-view")
+      .size_full()
+      .child(
+        h_flex()
+          .h(32)
+          .w_full()
+          .px(12)
+          .items_center()
+          .justify_between()
+          .bg(t.chrome)
+          .border_b_1()
+          .border_color(t.border)
+          .child(
+            div()
+              .text_size(11)
+              .font_medium()
+              .text_color(t.dim)
+              .child(`${entries.length} environment variables`)
+          )
+          .child(
+            h_flex()
+              .id("docker-inspect-env-reveal-all")
+              .px(8)
+              .py(3)
+              .rounded(4)
+              .bg(t.surface)
+              .border_1()
+              .border_color(t.border)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .items_center()
+              .gap(4)
+              .on_click((_e, cx) => {
+                this.revealAllSecrets = !this.revealAllSecrets;
+                cx.notify();
+              })
+              .child(
+                svg("mods/docker-manager/icons/eye.svg")
+                  .size(11)
+                  .text_color(this.revealAllSecrets ? t.accent : t.muted)
+              )
+              .child(
+                div()
+                  .text_size(10.5)
+                  .text_color(t.foreground)
+                  .child(this.revealAllSecrets ? "Hide secrets" : "Reveal secrets")
+              )
+          )
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .overflow_y_scrollbar()
+          .p(12)
+          .gap(2)
+          .children(
+            entries.map((entry) =>
+              h_flex()
+                .w_full()
+                .py(3)
+                .px(8)
+                .items_center()
+                .gap(12)
+                .rounded(4)
+                .hover((s) => s.bg(t.hover))
+                .child(
+                  div()
+                    .w(220)
+                    .flex_shrink_0()
+                    .font_family("monospace")
+                    .text_size(11)
+                    .font_medium()
+                    .text_color(entry.secret ? t.accent : t.foreground)
+                    .truncate()
+                    .child(entry.key)
+                )
+                .child(
+                  h_flex()
+                    .flex_1()
+                    .min_w(0)
+                    .items_center()
+                    .gap(6)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => {
+                      const orig = Array.isArray(rawEnv)
+                        ? (rawEnv.find((s) => typeof s === "string" && s.startsWith(`${entry.key}=`)) || "")
+                            .slice(entry.key.length + 1)
+                        : (rawEnv[entry.key] ?? "");
+                      cx.write_to_clipboard(orig);
+                      notify({ title: `Copied ${entry.key}`, level: "info" });
+                    })
+                    .child(
+                      div()
+                        .font_family("monospace")
+                        .text_size(11)
+                        .text_color(entry.masked ? t.dim : t.foreground)
+                        .truncate()
+                        .child(entry.value)
+                    )
+                    .when(entry.secret && entry.masked, (el) =>
+                      el.child(
+                        div()
+                          .px(4)
+                          .py(0.5)
+                          .rounded(3)
+                          .bg(t.surface)
+                          .border_1()
+                          .border_color(t.border)
+                          .text_size(9)
+                          .text_color(t.dim)
+                          .child("secret")
+                      )
+                    )
+                )
+                .when(entry.secret, (el) =>
+                  el.child(
+                    div()
+                      .w(20)
+                      .h(20)
+                      .rounded(3)
+                      .items_center()
+                      .justify_center()
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.surface))
+                      .on_click((_e, cx) => {
+                        if (this.revealAllSecrets) {
+                          this.revealAllSecrets = false;
+                          this.revealedEnvKeys = new Set(
+                            entries.filter((e) => e.secret && e.key !== entry.key).map((e) => e.key)
+                          );
+                        } else if (this.revealedEnvKeys.has(entry.key)) {
+                          this.revealedEnvKeys.delete(entry.key);
+                        } else {
+                          this.revealedEnvKeys.add(entry.key);
+                        }
+                        cx.notify();
+                      })
+                      .child(
+                        svg("mods/docker-manager/icons/eye.svg")
+                          .size(11)
+                          .text_color(entry.masked ? t.muted : t.accent)
+                      )
+                  )
+                )
+            )
+          )
+      );
+  }
+
+  /**
+   * Renders the Mounts sub-view (DM-45).
+   */
+  renderInspectMounts(t, cx) {
+    const mounts = this.inspectData?.mounts || [];
+    if (mounts.length === 0) {
+      return div()
+        .id("docker-inspect-mounts-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("No mounts configured.");
+    }
+
+    return v_flex()
+      .id("docker-inspect-mounts-view")
+      .size_full()
+      .child(
+        h_flex()
+          .h(32)
+          .w_full()
+          .px(12)
+          .items_center()
+          .bg(t.chrome)
+          .border_b_1()
+          .border_color(t.border)
+          .child(div().text_size(11).font_medium().text_color(t.dim).child(`${mounts.length} mounts`))
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .overflow_y_scrollbar()
+          .p(12)
+          .gap(4)
+          .children(
+            mounts.map((m) =>
+              h_flex()
+                .w_full()
+                .py(4)
+                .px(8)
+                .items_center()
+                .gap(8)
+                .rounded(4)
+                .hover((s) => s.bg(t.hover))
+                .child(
+                  div()
+                    .w(60)
+                    .flex_shrink_0()
+                    .px(4)
+                    .py(1)
+                    .rounded(3)
+                    .bg(t.surface)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(9.5)
+                    .text_color(t.accent)
+                    .child(m.type || "volume")
+                )
+                .child(
+                  div()
+                    .w(50)
+                    .flex_shrink_0()
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(m.rw ? (t.success || "#22c55e") : t.muted)
+                    .child(m.rw ? "rw" : "ro")
+                )
+                .child(
+                  v_flex()
+                    .flex_1()
+                    .min_w(0)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => {
+                      cx.write_to_clipboard(`${m.source} -> ${m.destination}`);
+                      notify({ title: "Copied mount path", level: "info" });
+                    })
+                    .child(
+                      div()
+                        .font_family("monospace")
+                        .text_size(10.5)
+                        .text_color(t.foreground)
+                        .truncate()
+                        .child(m.destination)
+                    )
+                    .child(
+                      div()
+                        .font_family("monospace")
+                        .text_size(9.5)
+                        .text_color(t.dim)
+                        .truncate()
+                        .child(`from: ${m.source}`)
+                    )
+                )
+            )
+          )
+      );
+  }
+
+  /**
+   * Renders the Network sub-view (DM-45).
+   */
+  renderInspectNetwork(t, cx) {
+    const isNetworkTarget = this.inspectTarget?.kind === "network";
+    if (isNetworkTarget) {
+      const net = this.inspectData || {};
+      const containers = net.containers || [];
+      return v_flex()
+        .id("docker-inspect-network-view")
+        .size_full()
+        .child(
+          h_flex()
+            .h(32)
+            .w_full()
+            .px(12)
+            .items_center()
+            .bg(t.chrome)
+            .border_b_1()
+            .border_color(t.border)
+            .child(
+              div()
+                .text_size(11)
+                .font_medium()
+                .text_color(t.dim)
+                .child(`${containers.length} connected containers`)
+            )
+        )
+        .child(
+          v_flex()
+            .flex_1()
+            .overflow_y_scrollbar()
+            .p(12)
+            .gap(4)
+            .children(
+              containers.map((c) =>
+                h_flex()
+                  .w_full()
+                  .py(3)
+                  .px(8)
+                  .items_center()
+                  .gap(8)
+                  .rounded(4)
+                  .hover((s) => s.bg(t.hover))
+                  .cursor_pointer()
+                  .on_click((_e, cx) => {
+                    cx.write_to_clipboard(c.ip || c.name);
+                    notify({ title: "Copied container IP", level: "info" });
+                  })
+                  .child(
+                    div()
+                      .w(180)
+                      .flex_shrink_0()
+                      .font_semibold()
+                      .text_size(11)
+                      .text_color(t.foreground)
+                      .truncate()
+                      .child(c.name)
+                  )
+                  .child(
+                    div()
+                      .w(140)
+                      .font_family("monospace")
+                      .text_size(10.5)
+                      .text_color(t.accent)
+                      .child(c.ip || "-")
+                  )
+                  .child(
+                    div()
+                      .flex_1()
+                      .font_family("monospace")
+                      .text_size(10)
+                      .text_color(t.dim)
+                      .child(c.macAddress || "-")
+                  )
+              )
+            )
+        );
+    }
+
+    const networks = this.inspectData?.networks || [];
+    if (networks.length === 0) {
+      return div()
+        .id("docker-inspect-network-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("No networks connected.");
+    }
+
+    return v_flex()
+      .id("docker-inspect-network-view")
+      .size_full()
+      .child(
+        h_flex()
+          .h(32)
+          .w_full()
+          .px(12)
+          .items_center()
+          .bg(t.chrome)
+          .border_b_1()
+          .border_color(t.border)
+          .child(
+            div()
+              .text_size(11)
+              .font_medium()
+              .text_color(t.dim)
+              .child(`${networks.length} connected networks`)
+          )
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .overflow_y_scrollbar()
+          .p(12)
+          .gap(4)
+          .children(
+            networks.map((net) =>
+              h_flex()
+                .w_full()
+                .py(4)
+                .px(8)
+                .items_center()
+                .gap(12)
+                .rounded(4)
+                .hover((s) => s.bg(t.hover))
+                .child(
+                  div()
+                    .w(160)
+                    .flex_shrink_0()
+                    .font_semibold()
+                    .text_size(11)
+                    .text_color(t.accent)
+                    .truncate()
+                    .child(net.name)
+                )
+                .child(
+                  div()
+                    .w(130)
+                    .flex_shrink_0()
+                    .font_family("monospace")
+                    .text_size(10.5)
+                    .text_color(t.foreground)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => {
+                      cx.write_to_clipboard(net.ip);
+                      notify({ title: "Copied IP address", level: "info" });
+                    })
+                    .child(net.ip || "-")
+                )
+                .child(
+                  div()
+                    .w(130)
+                    .flex_shrink_0()
+                    .font_family("monospace")
+                    .text_size(10)
+                    .text_color(t.dim)
+                    .child(`GW: ${net.gateway || "-"}`)
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .font_family("monospace")
+                    .text_size(10)
+                    .text_color(t.dim)
+                    .truncate()
+                    .child(Array.isArray(net.aliases) ? net.aliases.join(", ") : "-")
+                )
+            )
+          )
+      );
+  }
+
+  /**
+   * Renders the Labels sub-view (DM-45).
+   */
+  renderInspectLabels(t, cx) {
+    const labels = this.inspectData?.labels || {};
+    const entries = Object.entries(labels).sort(([a], [b]) => a.localeCompare(b));
+
+    if (entries.length === 0) {
+      return div()
+        .id("docker-inspect-labels-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("No labels defined.");
+    }
+
+    return v_flex()
+      .id("docker-inspect-labels-view")
+      .size_full()
+      .child(
+        h_flex()
+          .h(32)
+          .w_full()
+          .px(12)
+          .items_center()
+          .bg(t.chrome)
+          .border_b_1()
+          .border_color(t.border)
+          .child(
+            div()
+              .text_size(11)
+              .font_medium()
+              .text_color(t.dim)
+              .child(`${entries.length} labels`)
+          )
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .overflow_y_scrollbar()
+          .p(12)
+          .gap(2)
+          .children(
+            entries.map(([key, val]) =>
+              h_flex()
+                .w_full()
+                .py(3)
+                .px(8)
+                .items_center()
+                .gap(12)
+                .rounded(4)
+                .hover((s) => s.bg(t.hover))
+                .cursor_pointer()
+                .on_click((_e, cx) => {
+                  cx.write_to_clipboard(`${key}=${val}`);
+                  notify({ title: `Copied label: ${key}`, level: "info" });
+                })
+                .child(
+                  div()
+                    .w(260)
+                    .flex_shrink_0()
+                    .font_family("monospace")
+                    .text_size(10.5)
+                    .text_color(t.accent)
+                    .truncate()
+                    .child(key)
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .font_family("monospace")
+                    .text_size(10.5)
+                    .text_color(t.foreground)
+                    .truncate()
+                    .child(String(val))
+                )
+            )
+          )
+      );
+  }
+
+  /**
+   * Renders the Stats sub-view (DM-45).
+   */
+  renderInspectStats(t, cx) {
+    const isRunning = this.inspectData?.state?.status === "running";
+    if (!isRunning) {
+      return div()
+        .id("docker-inspect-stats-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("Container is not running — live stats are only available for running containers.");
+    }
+
+    const stats = this.statsData;
+    if (!stats && this.statsLoading) {
+      return div()
+        .id("docker-inspect-stats-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("Connecting to container stats stream…");
+    }
+
+    if (!stats) {
+      return div()
+        .id("docker-inspect-stats-view")
+        .p(24)
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("No stats data received yet.");
+    }
+
+    return v_flex()
+      .id("docker-inspect-stats-view")
+      .size_full()
+      .child(
+        h_flex()
+          .h(32)
+          .w_full()
+          .px(12)
+          .items_center()
+          .justify_between()
+          .bg(t.chrome)
+          .border_b_1()
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(6)
+              .child(div().size(6).rounded_full().bg(t.success || "#22c55e"))
+              .child(div().text_size(10.5).text_color(t.muted).child("Live (refreshes every 3s)"))
+          )
+          .child(
+            h_flex()
+              .px(6)
+              .py(2)
+              .rounded(3)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.surface))
+              .on_click((_e, cx) => this.pollInspectStats(cx))
+              .child(svg("mods/docker-manager/icons/refresh.svg").size(11).text_color(t.muted))
+          )
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .overflow_y_scrollbar()
+          .p(16)
+          .gap(12)
+          .child(
+            h_flex()
+              .w_full()
+              .gap(12)
+              .child(this.renderStatCard("CPU USAGE", stats.cpuPerc, null, t))
+              .child(this.renderStatCard("MEMORY USAGE", stats.memUsageRaw, stats.memPerc, t))
+          )
+          .child(
+            h_flex()
+              .w_full()
+              .gap(12)
+              .child(this.renderStatCard("NETWORK I/O", stats.netIO, null, t))
+              .child(this.renderStatCard("BLOCK I/O", stats.blockIO, null, t))
+          )
+          .child(
+            h_flex()
+              .w_full()
+              .gap(12)
+              .child(this.renderStatCard("PIDS (PROCESSES)", String(stats.pids), null, t))
+          )
+      );
+  }
+
+  /**
+   * Renders a statistic display card.
+   */
+  renderStatCard(title, value, sub, t) {
+    return v_flex()
+      .flex_1()
+      .p(12)
+      .rounded(6)
+      .bg(t.surface)
+      .border_1()
+      .border_color(t.border)
+      .gap(4)
+      .child(div().text_size(10).font_semibold().text_color(t.dim).child(title))
+      .child(
+        div()
+          .font_family("monospace")
+          .font_bold()
+          .text_size(15)
+          .text_color(t.foreground)
+          .child(value)
+      )
+      .when(Boolean(sub), (el) =>
+        el.child(div().text_size(10.5).text_color(t.muted).child(sub))
+      );
+  }
+
+  /**
+   * Renders the Raw JSON sub-view (DM-45).
+   */
+  renderInspectRawJson(t, cx) {
+    return v_flex()
+      .id("docker-inspect-raw-json-view")
+      .size_full()
+      .child(
+        h_flex()
+          .h(32)
+          .w_full()
+          .px(12)
+          .items_center()
+          .justify_between()
+          .bg(t.chrome)
+          .border_b_1()
+          .border_color(t.border)
+          .child(div().text_size(11).text_color(t.muted).child("docker inspect output (JSON)"))
+          .child(
+            h_flex()
+              .id("docker-inspect-copy-json")
+              .px(8)
+              .py(3)
+              .rounded(4)
+              .bg(t.surface)
+              .border_1()
+              .border_color(t.border)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .items_center()
+              .gap(4)
+              .on_click((_e, cx) => {
+                const text = this.rawInspectJson || prettyJson(this.inspectData?.raw || this.inspectData || {});
+                cx.write_to_clipboard(text);
+                notify({ title: "Copied JSON to clipboard", level: "info" });
+              })
+              .child(div().text_size(10.5).text_color(t.foreground).child("Copy JSON"))
+          )
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .when(Boolean(this.jsonEditorState), (el) =>
+            el.child(Editor.new(this.jsonEditorState).id("docker-raw-json").flex_1().min_h(0))
+          )
+          .when(!this.jsonEditorState, (el) =>
+            el.child(
+              v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(div().text_size(11).text_color(t.muted).child("Loading JSON…"))
+            )
+          )
+      );
+  }
+
+  /**
+   * Renders target gone placeholder (DM-46).
+   */
+  renderInspectGone(t, cx) {
+    return v_flex()
+      .size_full()
+      .items_center()
+      .justify_center()
+      .p(32)
+      .gap(12)
+      .child(svg("mods/docker-manager/icons/trash.svg").size(32).text_color(t.muted))
+      .child(
+        div()
+          .font_semibold()
+          .text_size(14)
+          .text_color(t.foreground)
+          .child("Target is no longer available")
+      )
+      .child(
+        div()
+          .text_size(11.5)
+          .text_color(t.muted)
+          .child("The container or service has been removed or no longer exists.")
+      )
+      .child(
+        div()
+          .px(10)
+          .py(4)
+          .rounded(4)
+          .bg(t.surface)
+          .border_1()
+          .border_color(t.border)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.loadInspectTab(cx))
+          .child(div().text_size(11).text_color(t.foreground).child("Re-check"))
+      );
+  }
+
+  /**
+   * Renders inspect loading error.
+   */
+  renderInspectError(t, cx) {
+    return v_flex()
+      .size_full()
+      .items_center()
+      .justify_center()
+      .p(32)
+      .gap(12)
+      .child(
+        div()
+          .font_semibold()
+          .text_size(14)
+          .text_color(t.error || "#ef4444")
+          .child("Failed to load inspection data")
+      )
+      .child(
+        div()
+          .text_size(11.5)
+          .text_color(t.muted)
+          .child(String(this.inspectError))
+      )
+      .child(
+        div()
+          .px(10)
+          .py(4)
+          .rounded(4)
+          .bg(t.surface)
+          .border_1()
+          .border_color(t.border)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.loadInspectTab(cx))
+          .child(div().text_size(11).text_color(t.foreground).child("Retry"))
+      );
+  }
+
+  /**
+   * Renders the Docker Manager panel mode.
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  renderPanel(cx) {
     const t = theme();
 
     return v_flex()
@@ -1923,5 +3510,17 @@ export default class DockerManager extends View {
       .child(this.renderBody(t, cx))
       .when(Boolean(this.contextMenu), (el) => el.child(this.renderContextMenu(t, cx)))
       .when(Boolean(this.confirmDialog), (el) => el.child(this.renderConfirmDialog(t, cx)));
+  }
+
+  /**
+   * Renders the view (GPUI render cycle).
+   *
+   * @param {import("gpui-kit").ViewContext} cx
+   */
+  render(cx) {
+    if (this.inspectMode) {
+      return this.renderInspectTab(cx);
+    }
+    return this.renderPanel(cx);
   }
 }
