@@ -42,7 +42,7 @@ Following `file-editor` (`file-logic.js`) and `git-graph` (`git-logic.js`), keep
    - Renders:
      - Top toolbar (`h(38)`, `bg(t.chrome)`): engine status badge, **This space / All** scope toggle, refresh button (its icon spins while `refreshing`), and `⋯` menu.
      - Section bar (`h(32)`): `Containers` | `Images` | `Volumes` | `Networks` | `System` + inline filter input.
-     - Virtualized main list (`uniform_list` with `Scrollbar.vertical`).
+     - Row list inside one `overflow_y_scrollbar` container; the whole section scrolls.
      - Collapsible bottom **Inspector Drawer** (`#docker-inspector-drawer`, default height `220px`, resizable) when a service or container row is selected (`DM-40..43`).
      - In-panel overlays: `#docker-context-menu` + `#docker-context-backdrop`, confirmation modals (`#docker-confirm-dialog`), and parameter modals (`#docker-run-dialog`, `#docker-backup-dialog`).
 
@@ -104,7 +104,7 @@ Key labels extracted per container:
 When `root` changes or `watchFolder(root)` fires:
 
 1. Scan `root` up to depth 3:
-   - Local spaces (`machine === null`): `exec("find", [root, "-maxdepth", "3", "(", "-name", ".git", "-o", "-name", "node_modules", "-o", "-name", "vendor", "-o", "-name", "dist", "-o", "-name", "build", "-o", "-name", ".venv", ")", "-prune", "-o", "-type", "f", "(", "-name", "*compose*.y*ml", "-o", "-name", "Dockerfile*", "-o", "-name", "*.Dockerfile", "-o", "-name", "Containerfile", ")", "-print"])`.
+   - Local spaces (`machine === null`): `exec("find", [root, "-maxdepth", "3", "(", "-name", ".git", "-o", "-name", "node_modules", "-o", "-name", "vendor", "-o", "-name", "dist", "-o", "-name", "build", "-o", "-name", ".venv", ")", "-prune", "-o", "-type", "f", "(", "-name", "*compose*.y*ml", "-o", "-name", "Dockerfile*", "-o", "-name", "*.Dockerfile", "-o", "-name", "Containerfile", ")", "-print"])`. Cached after the first scan and only re-run when the cwd changes, the folder watcher fires, or the user presses Refresh — never on every 3s poll.
 2. Group discovered Compose files by folder:
    - Pair `compose.yaml`/`compose.yml`/`docker-compose.yaml`/`docker-compose.yml` automatically with its `*.override.*` sibling (`DM-32`).
    - Keep named environment files (`compose.dev.yaml`, `compose.local.yaml`, `compose.test.yaml`) as distinct entries unless an active project's `config_files` label already combines them.
@@ -194,7 +194,7 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 ## 5. Polling, Concurrency & GPUI Invariants
 
 1. **Visibility-Aware Polling**:
-   - The fast poll (`3s`) runs only when the Docker panel is actually shown (`!panel.hidden && body.active === "docker"`) or when the mod is mounted as a visible split/tab pane. While hidden in the stack, background polling pauses completely, and transitioning from hidden → visible triggers an immediate refresh.
+   - The fast poll (`3s`) runs only when the Docker panel is actually shown (`!panel.hidden && body.active === "docker"`). While hidden in the stack, background polling pauses completely, and transitioning from hidden → visible triggers an immediate refresh. An inspector tab does **not** run the full list/workspace refresh on that timer; only an open Stats sub-view polls `docker stats`.
 2. **Single-Flight Refresh Token**:
    - A `refreshSeq` counter guards async refreshes; if the space or machine switches mid-flight, stale responses are dropped.
 3. **Per-Target Busy State**:
@@ -202,7 +202,7 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 4. **GPUI Safety Invariants**:
    - Never pass `null` or `undefined` to `.child()` — always guard optional UI elements with `.when(cond, el => el.child(...))`.
    - Never hold a synchronous event `cx` across an `await` — extract event coordinates/props synchronously, then enter `cx.spawn(async (cx) => { ...; cx.notify(); })`.
-   - Clamp context menus inside `panelBounds` measured on mouse move, with a full-pane transparent backdrop to close on outside click.
+   - Clamp context menus inside `panelBounds` measured on mouse move, with a full-pane transparent backdrop to close on outside click. The row itself owns the right-click (`on_mouse_down("right")` plus `cursor_context_menu()`); `uniform_list.on_item_secondary_click` did not reach these rows. Inner overlays stop propagation with `cx.stop_propagation()`, not the event object.
 
 ---
 

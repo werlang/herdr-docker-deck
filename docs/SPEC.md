@@ -63,7 +63,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 │ 🔍 filter…                                │
 ├──────────────────────────────────────────┤
 │ ▾ biofisqui-pelotas   ●4/4  compose.dev  │  project row
-│     ▸ web     ● healthy  :3000→3000      │  service row
+│     ▸ web     ●                           │  service row (details on click)
 │     ▸ api     ● up 12h   :8080→8080      │
 │ ▾ myapp (not created)  compose.yaml      │  discovered, dimmed
 │     ○ db      not created                 │
@@ -82,7 +82,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 | DM-10 | **Toolbar**: engine status dot + version (green = reachable, red = daemon down, grey = CLI missing), scope toggle **This space / All** (§5.3), refresh button (the icon spins and turns accent-coloured while a refresh is in flight), `⋯` menu (Hygiene, Open Docker Desktop, Copy diagnostics). |
 | DM-11 | **Section switcher**: Containers (default), Images, Volumes, Networks, System. Visual language matches `file-editor`/`git-graph` (24 px icon buttons, `theme()` colors, no hardcoded hex). |
 | DM-12 | **Filter box** filters the current section by name, image, service, project, port (substring, case-insensitive). `Esc` clears it. |
-| DM-13 | Rows are virtualized (`uniform_list`) so 500+ containers/images scroll smoothly. |
+| DM-13 | Tree and section rows render from one stable row list inside a scroll container, so the whole section scrolls smoothly without virtualization gaps. |
 | DM-14 | Every row has a hover state, a selected state, and a right-click context menu (§7). Double-click on a container/service row opens the inspector tab. |
 | DM-15 | **Engine unavailable** empty state: explains whether the CLI is missing or the daemon is unreachable, with **Retry** and, on macOS, **Start Docker Desktop** (`open -a Docker`). |
 | DM-16 | Long or slow operations show a row spinner (native `.spin()`), never block the UI thread, and report failures with a toast containing the first lines of stderr plus a "Copy full error" action. |
@@ -97,7 +97,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 |---|---|
 | DM-20 | Top-level groups, in order: **Compose projects** (one row each, sorted: projects of the current space first, then by name), **Dockerfiles**, **Standalone**. Empty groups are hidden. |
 | DM-21 | A project row shows: chevron, name, running/total count (`●3/4`), aggregate status color (all running = ok, some = warning, none = muted, any unhealthy/restarting = error), and the basename(s) of its compose file(s). A badge **"this space"** marks projects whose working dir or config files are inside the space root. |
-| DM-22 | Under a project, one row per **service**: status dot, service name, health/status text (`healthy`, `up 12h`, `exited (1) 3m ago`, `not created`), published ports (`3000→3000`). |
+| DM-22 | Under a project, one row per **service**: state dot, service name, and a `not created` / busy marker only. Status text, health, ports, mounts and networks live in the details drawer (DM-41), keeping the tree scannable. |
 | DM-23 | A service with more than one container (scale > 1, one-off `run` containers) expands to its containers (`web-1`, `web-2`, `run-a1b2`). A single-container service shows container actions directly on the service row. |
 | DM-24 | **Discovered but not created** services (§5.2) appear dimmed with a hollow dot and status `not created`. A project with no container at all shows `(not created)` after its name. |
 | DM-25 | **Mixed sources warning**: when containers of one project come from different `working_dir`s (two checkouts using the same project name), the project row shows a warning icon whose tooltip lists the folders. Actions use the folder of the space when it is one of them, otherwise ask which folder to use. |
@@ -130,7 +130,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 | ID | Requirement |
 |---|---|
 | DM-40 | Selecting a service/container row opens a details drawer at the bottom of the panel (resizable, collapsible, closes with `Esc` or ✕). Selecting another row swaps its content without flicker. |
-| DM-41 | The drawer shows, in compact label/value rows: **name**, **project**, **service**, **container ID** (short, copyable), **image** (+ short ID), **status/health** (+ last health check output when unhealthy), **started / created**, **restart policy**, **ports** (`host:port → container/proto`, host ports clickable → open `http://localhost:<port>`), **volumes/mounts** (type, source, destination, `ro`/`rw`; named volumes link to the Volumes section), **networks** (name, IP, aliases; link to Networks section), **command/entrypoint**, **compose files + working dir**, **depends_on**. |
+| DM-41 | The drawer shows, in compact label/value rows that **wrap long values** instead of truncating them: **name**, **project**, **service**, **container ID** (short, copyable), **image** (+ short ID), **status/health** (+ last health check output when unhealthy), **started / created**, **restart policy**, **ports** (`host:port → container/proto`, host ports clickable → open `http://localhost:<port>`), **volumes/mounts** (type, source, destination, `ro`/`rw`; named volumes link to the Volumes section), **networks** (name, IP, aliases; link to Networks section), **command/entrypoint**, **compose files + working dir**, **depends_on**. |
 | DM-42 | For a not-created service, the drawer shows the declared config from `docker compose config` (image/build, ports, volumes, networks, env keys) and an **Up this service** button. |
 | DM-43 | Every value has copy-on-click with a toast. |
 

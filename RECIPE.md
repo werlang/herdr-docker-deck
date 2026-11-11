@@ -11,7 +11,7 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - **Section strip** (`32px`): **Containers**, **Images**, **Volumes**, **Networks**, and **System**, plus an instant filter bar.
 - **Containers tree**:
   - **Compose projects** with aggregate running count (`●4/4`), compose file basename, **"this space"** badge, and expandable service rows.
-  - **Service rows** with health/state dot, service name, status (`healthy`, `up 12h`, `not created`), and clickable published ports (`:3000→3000`).
+  - **Service rows** with a state dot, service name, and `not created` / busy marker. Status, health, published ports, mounts and networks stay in the **Details** drawer, opened by clicking the row; long values wrap there instead of truncating.
   - **Dockerfiles** discovered in the active workspace and their containers.
   - **Standalone** containers.
 - **Inspector drawer**: a collapsible bottom pane (`220px`) displaying the selected service or container's project, image, container ID, health log, ports, mounts, networks, and compose files.
@@ -41,7 +41,10 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 
 - Always pass `--no-trunc` to `docker container ls --format '{{json .}}'` so long `com.docker.compose.project.config_files` labels are never truncated mid-path.
 - `Labels` in `docker container ls` is a comma-separated string where `config_files` itself contains commas; split only on commas followed by `<key>=`.
-- Pause the 3s status poll whenever the Docker panel is hidden in the `panel-body` stack so background spaces cost zero CPU/processes.
+- Pause the 3s status poll whenever the Docker panel is hidden in the `panel-body` stack so background spaces cost zero CPU/processes. An inspector tab polls only its Stats sub-view, never the full list/workspace sweep.
+- Cache the workspace `find`/`stat` scan; re-run it only on cwd change, folder-watch event, or manual Refresh.
+- Overlay dialogs/menus must stop clicks with `cx.stop_propagation()` inside `on_mouse_down`; `MouseButtonEvent` has no `stop_propagation`, and calling it leaves the backdrop to close the dialog.
+- Rows own right-click (`on_mouse_down("right")` + `cursor_context_menu()`); `uniform_list.on_item_secondary_click` does not reach them. Keep Images/Volumes/Networks as one scrollable row list under the subheader rather than a nested virtual list.
 - Volume backup and restore mount the target volume into a disposable `alpine:3` container; warn before backing up a volume attached to a running database container and refuse restore while any running container mounts the target volume.
 
 ## Done when

@@ -2,13 +2,12 @@
 // Native panel to observe, inspect, and manage Docker containers, Compose projects,
 // images, volumes, networks, and hygiene directly within Herdr.
 
-import { View, div, svg, uniform_list } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import {
   v_flex,
   h_flex,
   InputState,
   Input,
-  Scrollbar,
   v_resizable,
   resizable_panel,
 } from "gpui-base";
@@ -108,6 +107,7 @@ export default class DockerManager extends View {
 
     // Panel size & tracking
     this.panelSize = { width: 368, height: 600 };
+    this.panelOrigin = { x: 0, y: 0 };
 
     // Filter input (DM-12)
     this.filterQuery = "";
@@ -233,6 +233,8 @@ export default class DockerManager extends View {
     this.composeConfigCache = new Map();
     this.expandedProfiles = new Set();
     this.watchedCwd = null;
+    this.scannedCwd = null;
+    this.workspaceDirty = true;
 
     // Cross-mod request tracking (DM-93, INTEGRATION §3.4)
     this.lastHandledRequestTs = 0;
@@ -291,10 +293,13 @@ export default class DockerManager extends View {
   /** Polling handler called every 3 seconds */
   poll(cx) {
     if (!this.isPanelVisible()) return;
-    this.refresh(cx);
+
+    const p = props();
+    // An inspector tab already has its target; running the full list/workspace
+    // refresh there every 3s is pure load. Only the panel needs the sweep.
+    if (!p?.inspect) this.refresh(cx);
 
     // In inspector tab mode, poll live stats if stats sub-view is open
-    const p = props();
     if (p?.inspect && this.inspectTabSubView === "stats") {
       let cid = p.inspect.id;
       if (p.inspect.project && p.inspect.service) {
@@ -849,11 +854,18 @@ export default class DockerManager extends View {
     // Setup folder watch if cwd changed (DESIGN §4.2)
     if (this.watchedCwd !== ctx.cwd) {
       this.watchedCwd = ctx.cwd;
+      this.workspaceDirty = true;
       const targetCwd = ctx.cwd;
       cx.spawn(async (cx) => {
         try {
           while (this.watchedCwd === targetCwd) {
+            const started = Date.now();
             await watchFolder(targetCwd);
+            // A watcher that resolves immediately must not spin this loop; a
+            // minimum gap keeps a broken watch from becoming a refresh storm.
+            const elapsed = Date.now() - started;
+            if (elapsed < 500) await cx.sleep(500 - elapsed);
+            this.workspaceDirty = true;
             this.composeConfigCache.clear();
             this.refresh(cx);
           }
@@ -862,6 +874,12 @@ export default class DockerManager extends View {
         }
       });
     }
+
+    // The 3s status poll must not re-run `find`/`stat` over the workspace.
+    // Only a cwd change, a folder-watch event, or a manual refresh sets this.
+    if (!this.workspaceDirty && this.scannedCwd === ctx.cwd) return;
+    this.workspaceDirty = false;
+    this.scannedCwd = ctx.cwd;
 
     try {
       const findRes = await exec(
@@ -1013,8 +1031,9 @@ export default class DockerManager extends View {
   }
 
   /** Fast status refresh (DM-15, DESIGN §4.1) */
-  refresh(cx) {
+  refresh(cx, options = {}) {
     const seq = ++this.refreshSeq;
+    if (options.rescan) this.workspaceDirty = true;
     this.refreshing = true;
     cx.notify();
     const ctx = resolveDockerContext({
@@ -1232,7 +1251,7 @@ export default class DockerManager extends View {
     return Array.from(list);
   }
 
-  // --- Click & Event Handling for uniform_list (Finding 2, P2 Menus) ---
+  // --- Row click & context-menu handling ---
 
   handleRowClick(key, cx) {
     const row = this.rowByKey.get(key);
@@ -1411,8 +1430,12 @@ export default class DockerManager extends View {
       this.selectTarget({ ...row.data, type: row.type, key: row.key }, cx);
     }
 
-    const clickX = event?.position?.x ?? event?.local_position?.x ?? 120;
-    const clickY = event?.position?.y ?? event?.local_position?.y ?? 120;
+    // The menu paints inside the panel overlay, but the event reports window
+    // coordinates; subtract the panel origin captured from the last mouse move.
+    const clickX =
+      typeof event?.position?.x === "number" ? event.position.x - this.panelOrigin.x : 120;
+    const clickY =
+      typeof event?.position?.y === "number" ? event.position.y - this.panelOrigin.y : 120;
     const menuW = 220;
     const menuH = Math.min(320, items.length * 26 + 16);
     const clamped = clampMenuPosition(
@@ -2220,7 +2243,7 @@ export default class DockerManager extends View {
               .child(
                 h_flex()
                   .px(6)
-                  .h_full()
+                  .h(20)
                   .rounded(3)
                   .items_center()
                   .text_size(10)
@@ -2240,7 +2263,7 @@ export default class DockerManager extends View {
               .child(
                 h_flex()
                   .px(6)
-                  .h_full()
+                  .h(20)
                   .rounded(3)
                   .items_center()
                   .text_size(10)
@@ -2266,7 +2289,7 @@ export default class DockerManager extends View {
               .items_center()
               .justify_center()
               .hover((s) => s.bg(toColor(t.hover)))
-              .on_click((_e, cx) => this.refresh(cx))
+              .on_click((_e, cx) => this.refresh(cx, { rescan: true }))
               .child(
                 svg("mods/docker-manager/icons/refresh.svg")
                   .size(14)
@@ -2385,7 +2408,7 @@ export default class DockerManager extends View {
       );
   }
 
-  /** Flattens container tree into visible rows for uniform_list virtualization (DM-13) */
+  /** Flattens the container tree into the visible row list (DM-13). */
   flattenTree(tree) {
     const rows = [];
 
@@ -2599,7 +2622,20 @@ export default class DockerManager extends View {
   }
 
   /** Renders a single row in the virtual list (DM-13, DM-14, DM-16, DM-20..27) */
-  renderTreeRow(row, t, _cx) {
+  /**
+   * One tree row with the shared click and right-click wiring. The row owns
+   * the context-menu event, like the file tree does.
+   */
+  renderTreeRow(row, t, cx) {
+    return this.renderTreeRowContent(row, t, cx)
+      .id(row.key)
+      .cursor_pointer()
+      .cursor_context_menu()
+      .on_mouse_down("right", (event, cx2) => this.handleRowSecondaryClick(row.key, event, cx2))
+      .on_click((_event, cx2) => this.handleRowClick(row.key, cx2));
+  }
+
+  renderTreeRowContent(row, t, _cx) {
     const isSelected =
       this.selectedTarget &&
       (this.selectedTarget.key === row.key ||
@@ -2813,25 +2849,6 @@ export default class DockerManager extends View {
                     .spin(900)
                 )
                 .child(div().text_size(10).text_color(toColor(t.dim)).child(busyLabel || ""))
-            )
-        )
-        .child(
-          h_flex()
-            .items_center()
-            .gap(6)
-            .child(
-              div()
-                .text_size(10)
-                .text_color(toColor(t.dim))
-                .child(s.statusText)
-            )
-            .when(Boolean(s.portsText), (el) =>
-              el.child(
-                div()
-                  .text_size(10)
-                  .text_color(toColor(t.accent))
-                  .child(s.portsText)
-              )
             )
         );
     }
@@ -3701,19 +3718,22 @@ export default class DockerManager extends View {
     const str = String(value);
     const toCopy = copyVal !== null && copyVal !== undefined ? String(copyVal) : str;
     return h_flex()
+      .items_start()
       .gap(8)
       .text_size(11)
       .child(
         div()
           .w(80)
+          .flex_none()
           .text_color(toColor(t.muted))
           .child(label)
       )
       .child(
         div()
           .flex_1()
+          .min_w(0)
+          .whitespace_normal()
           .text_color(toColor(t.foreground))
-          .truncate()
           .when(copyable, (el) =>
             el
               .cursor_pointer()
@@ -3756,8 +3776,8 @@ export default class DockerManager extends View {
           .shadow_md()
           .p(4)
           .gap(1)
-          .on_mouse_down("left", (e) => e.stop_propagation())
-          .on_mouse_down("right", (e) => e.stop_propagation())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
           .children(
             menu.items.map((item, idx) => {
               const isDestructive = Boolean(item.destructive);
@@ -3851,7 +3871,7 @@ export default class DockerManager extends View {
           .shadow_md()
           .p(14)
           .gap(10)
-          .on_mouse_down("left", (e) => e.stop_propagation())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .child(
             h_flex()
               .gap(6)
@@ -3986,7 +4006,7 @@ export default class DockerManager extends View {
           .shadow_md()
           .p(4)
           .gap(2)
-          .on_mouse_down("left", (e) => e.stop_propagation())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .child(
             h_flex()
               .h(24)
@@ -4107,7 +4127,7 @@ export default class DockerManager extends View {
               .font_semibold()
               .text_color(toColor(t.solid_foreground))
               .hover((s) => s.opacity(0.9))
-              .on_click((_e, cx) => this.refresh(cx))
+              .on_click((_e, cx) => this.refresh(cx, { rescan: true }))
               .child("Retry")
           )
           // Start Docker Desktop (macOS)
@@ -4126,7 +4146,7 @@ export default class DockerManager extends View {
               .on_click((_e, cx) => {
                 exec("open", ["-a", "Docker"]);
                 notify({ title: "Starting Docker Desktop", body: "Launching Docker.app…" });
-                cx.timer.after(4000, (cx) => this.refresh(cx));
+                cx.timer.after(4000, (cx) => this.refresh(cx, { rescan: true }));
               })
               .child("Start Docker Desktop")
           )
@@ -4319,6 +4339,12 @@ export default class DockerManager extends View {
 
     const isRunning = Boolean(this.inspectData?.state?.running);
     const isService = Boolean(p?.inspect?.project && p?.inspect?.service);
+    // A tab mod does not get `props().pane`; when this tab is focused, its
+    // pane is the focused pane in `panes()`. That is enough to draw the
+    // standard split / zoom / close controls the pane header would own.
+    const focusedPaneInfo = panes().find((candidate) => candidate.pane === focused()?.pane);
+    const paneId = p?.pane || (focusedPaneInfo?.mod === "docker-manager" ? focusedPaneInfo.pane : null);
+    const paneInfo = panes().find((candidate) => candidate.pane === paneId);
 
     let subViews;
     if (kind === "image") {
@@ -4690,6 +4716,29 @@ export default class DockerManager extends View {
                       .when(this.refreshing, (el) => el.spin(900))
                   )
               )
+              // Standard pane controls, since a mod pane has no pane-plus header.
+              .when(Boolean(paneId), (btn) => {
+                const paneButton = (icon, tip, action) =>
+                  h_flex()
+                    .size(24)
+                    .rounded(4)
+                    .items_center()
+                    .justify_center()
+                    .tooltip(tip)
+                    .hover((s) => s.bg(toColor(t.hover)))
+                    .on_click((_e) => action())
+                    .child(svg(`mods/docker-manager/icons/${icon}`).size(13).text_color(toColor(t.muted)));
+                return btn
+                  .child(div().w(1).h(16).mx(2).bg(toColor(t.border)))
+                  .child(paneButton("split-right.svg", "Split right", () => run("pane.split", { direction: "right", pane: paneId })))
+                  .child(paneButton("split-down.svg", "Split down", () => run("pane.split", { direction: "down", pane: paneId })))
+                  .child(
+                    paneButton(paneInfo?.zoomed ? "unzoom.svg" : "zoom.svg", paneInfo?.zoomed ? "Unzoom" : "Zoom", () =>
+                      run("pane.zoom", { pane: paneId })
+                    )
+                  )
+                  .child(paneButton("close.svg", "Close pane", () => run("pane.close", { pane: paneId })));
+              })
           )
       )
       // Sub-view switcher bar
@@ -5425,7 +5474,7 @@ export default class DockerManager extends View {
           .rounded(6)
           .shadow_md()
           .gap(10)
-          .on_mouse_down("left", (e) => e.stop_propagation())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           // Header
           .child(
             h_flex()
@@ -5605,7 +5654,7 @@ export default class DockerManager extends View {
           .items_center()
           .gap(8)
           .child(
-            div()
+            h_flex()
               .size(15)
               .rounded(3)
               .border_1()
@@ -5691,6 +5740,7 @@ export default class DockerManager extends View {
     return v_flex()
       .size_full()
       .relative()
+      .overflow_y_scrollbar()
       .when(rows.length === 0, (el) =>
         el
           .items_center()
@@ -5704,26 +5754,7 @@ export default class DockerManager extends View {
           )
       )
       .when(rows.length > 0, (el) =>
-        el
-          .child(
-            uniform_list(
-              "docker-containers-virtual-list",
-              rows.length,
-              (i) => rows[i]?.key || String(i),
-              (range, cx) => {
-                const slice = rows.slice(range.start, range.end);
-                return slice.map((row) => this.renderTreeRow(row, t, cx));
-              }
-            )
-              .size_full()
-              .on_item_click((key, cx) => this.handleRowClick(key, cx))
-              .on_item_secondary_click((key, event, cx) => this.handleRowSecondaryClick(key, event, cx))
-          )
-          .child(
-            Scrollbar.vertical("docker-containers-virtual-list")
-              .absolute()
-              .inset_0()
-          )
+        el.children(rows.map((row) => this.renderTreeRow(row, t, cx)))
       );
   }
 
@@ -5737,6 +5768,7 @@ export default class DockerManager extends View {
 
     return v_flex()
       .size_full()
+      .relative()
       // Subheader toolbar (DM-100, DM-102)
       .child(
         h_flex()
@@ -5874,8 +5906,12 @@ export default class DockerManager extends View {
       // List
       .child(
         v_flex()
-          .size_full()
-          .relative()
+          .absolute()
+          .left(0)
+          .right(0)
+          .top(30)
+          .bottom(0)
+          .overflow_y_scrollbar()
           .when(rows.length === 0, (el) =>
             el
               .items_center()
@@ -5889,23 +5925,7 @@ export default class DockerManager extends View {
               )
           )
           .when(rows.length > 0, (el) =>
-            el
-              .child(
-                uniform_list(
-                  "docker-images-virtual-list",
-                  rows.length,
-                  (i) => rows[i]?.key || String(i),
-                  (range, cx) => rows.slice(range.start, range.end).map((row) => this.renderTreeRow(row, t, cx))
-                )
-                  .size_full()
-                  .on_item_click((key, cx) => this.handleRowClick(key, cx))
-                  .on_item_secondary_click((key, event, cx) => this.handleRowSecondaryClick(key, event, cx))
-              )
-              .child(
-                Scrollbar.vertical("docker-images-virtual-list")
-                  .absolute()
-                  .inset_0()
-              )
+            el.children(rows.map((row) => this.renderTreeRow(row, t, cx)))
           )
       );
   }
@@ -5922,6 +5942,7 @@ export default class DockerManager extends View {
 
     return v_flex()
       .size_full()
+      .relative()
       // Subheader toolbar (DM-105, DM-110)
       .child(
         h_flex()
@@ -6006,8 +6027,12 @@ export default class DockerManager extends View {
       // List
       .child(
         v_flex()
-          .size_full()
-          .relative()
+          .absolute()
+          .left(0)
+          .right(0)
+          .top(30)
+          .bottom(0)
+          .overflow_y_scrollbar()
           .when(rows.length === 0, (el) =>
             el
               .items_center()
@@ -6021,23 +6046,7 @@ export default class DockerManager extends View {
               )
           )
           .when(rows.length > 0, (el) =>
-            el
-              .child(
-                uniform_list(
-                  "docker-volumes-virtual-list",
-                  rows.length,
-                  (i) => rows[i]?.key || String(i),
-                  (range, cx) => rows.slice(range.start, range.end).map((row) => this.renderTreeRow(row, t, cx))
-                )
-                  .size_full()
-                  .on_item_click((key, cx) => this.handleRowClick(key, cx))
-                  .on_item_secondary_click((key, event, cx) => this.handleRowSecondaryClick(key, event, cx))
-              )
-              .child(
-                Scrollbar.vertical("docker-volumes-virtual-list")
-                  .absolute()
-                  .inset_0()
-              )
+            el.children(rows.map((row) => this.renderTreeRow(row, t, cx)))
           )
       );
   }
@@ -6051,6 +6060,7 @@ export default class DockerManager extends View {
 
     return v_flex()
       .size_full()
+      .relative()
       // Subheader toolbar (DM-115, DM-117)
       .child(
         h_flex()
@@ -6101,8 +6111,12 @@ export default class DockerManager extends View {
       // List
       .child(
         v_flex()
-          .size_full()
-          .relative()
+          .absolute()
+          .left(0)
+          .right(0)
+          .top(30)
+          .bottom(0)
+          .overflow_y_scrollbar()
           .when(rows.length === 0, (el) =>
             el
               .items_center()
@@ -6116,23 +6130,7 @@ export default class DockerManager extends View {
               )
           )
           .when(rows.length > 0, (el) =>
-            el
-              .child(
-                uniform_list(
-                  "docker-networks-virtual-list",
-                  rows.length,
-                  (i) => rows[i]?.key || String(i),
-                  (range, cx) => rows.slice(range.start, range.end).map((row) => this.renderTreeRow(row, t, cx))
-                )
-                  .size_full()
-                  .on_item_click((key, cx) => this.handleRowClick(key, cx))
-                  .on_item_secondary_click((key, event, cx) => this.handleRowSecondaryClick(key, event, cx))
-              )
-              .child(
-                Scrollbar.vertical("docker-networks-virtual-list")
-                  .absolute()
-                  .inset_0()
-              )
+            el.children(rows.map((row) => this.renderTreeRow(row, t, cx)))
           )
       );
   }
@@ -6531,7 +6529,7 @@ export default class DockerManager extends View {
           .rounded(6)
           .shadow_md()
           .gap(10)
-          .on_mouse_down("left", (e) => e.stop_propagation())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           // Header
           .child(
             h_flex()
@@ -6733,7 +6731,7 @@ export default class DockerManager extends View {
           .rounded(6)
           .shadow_md()
           .gap(10)
-          .on_mouse_down("left", (e) => e.stop_propagation())
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           // Header
           .child(
             h_flex()
@@ -6967,6 +6965,14 @@ export default class DockerManager extends View {
       .on_size_change((size, cx) => {
         this.panelSize = size;
       })
+      .on_mouse_move((e, _cx) => {
+        if (e.position && e.local_position) {
+          this.panelOrigin = {
+            x: e.position.x - e.local_position.x,
+            y: e.position.y - e.local_position.y,
+          };
+        }
+      })
       .on_key_down((e, cx) => {
         if (e.key === "Escape") {
           if (this.contextMenu) {
@@ -7031,7 +7037,7 @@ export default class DockerManager extends View {
         )
       )
       .when(!this.drawerOpen || !this.selectedTarget, (el) =>
-        el.child(div().flex_1().min_h(0).child(mainList))
+        el.child(v_flex().flex_1().min_h(0).child(mainList))
       )
       // Overlays painted last in painter's algorithm order
       .when(Boolean(this.contextMenu), (el) => el.child(this.renderContextMenu(t, cx)))
