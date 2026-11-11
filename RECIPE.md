@@ -47,9 +47,14 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 ## Done when
 
 - `herdr-app check mods/docker-manager` passes with zero errors.
-- `docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/` passes all unit tests.
+- `docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/*.test.js` passes all unit tests; `test/mod-safety.test.js` fails on a chained element method that is not in `gpui-kit.d.ts` (it cannot judge a call on a receiver it cannot type, so the studio check is still the authority).
 - Running and stopped containers appear grouped under their Compose project and service, and uncreated services from workspace Compose files appear as `not created`.
 - Project and single-service lifecycle actions (`Up`, `Down`, `Start`, `Stop`, `Restart`, `Rebuild`, `Remove`) work from the right-click menu.
 - **Logs** and **Shell** open working Herdr terminals for the chosen service or container.
-- The top **Docker** button toggles the panel, and Compose/Dockerfile headers in `file-editor` trigger `Up`/`Build` and `Show in Docker`.
 - Images, volumes, and networks can be inspected and pruned, and volume backup/restore round-trips data cleanly.
+- The inspector tab (`props.inspect`) resolves its target from `props()` on a timer, never from `render()`, and follows a Compose service across recreation.
+
+## Not in this repository yet
+
+The top **Docker** button in `tabs-ref` and the compose/Dockerfile header actions in `file-editor` live in sibling mods. `docs/INTEGRATION.md` specifies both; each is a separate change so every mod stays publishable alone.
+

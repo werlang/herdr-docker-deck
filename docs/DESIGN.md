@@ -1,6 +1,6 @@
 # docker-manager — Technical Design & CLI Contracts
 
-Status: **draft, not implemented**. Companion to [`SPEC.md`](SPEC.md) (functional requirements `DM-xx`) and [`INTEGRATION.md`](INTEGRATION.md) (cross-repo wiring).
+Status: **implemented** — `mods/docker-manager/main.js` + `docker-logic.js`.
 
 ---
 
@@ -211,7 +211,7 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 Because the host machine does not install Node.js locally, unit tests execute inside a container:
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/
+docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/*.test.js
 ```
 
 Test suites in `test/docker-logic.test.js`:

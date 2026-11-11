@@ -1,0 +1,37 @@
+[
+  {
+    "Name": "cv-mapa",
+    "Status": "running(3)",
+    "ConfigFiles": "/srv/cv-mapa/compose.yaml"
+  },
+  {
+    "Name": "home",
+    "Status": "running(1)",
+    "ConfigFiles": "/srv/compose.yaml"
+  },
+  {
+    "Name": "kuma",
+    "Status": "running(1)",
+    "ConfigFiles": "/srv/kuma/compose.yaml"
+  },
+  {
+    "Name": "node-aec",
+    "Status": "exited(2), running(5)",
+    "ConfigFiles": "/srv/node-aec/compose.yaml"
+  },
+  {
+    "Name": "qstoes",
+    "Status": "running(2)",
+    "ConfigFiles": "/srv/qstoes/compose.yaml"
+  },
+  {
+    "Name": "tuya",
+    "Status": "exited(1), running(1)",
+    "ConfigFiles": "/srv/tuya/compose.yaml"
+  },
+  {
+    "Name": "whatsbot",
+    "Status": "running(3)",
+    "ConfigFiles": "/srv/whatsbot/compose.yaml"
+  }
+]

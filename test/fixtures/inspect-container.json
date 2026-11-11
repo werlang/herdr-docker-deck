@@ -1,0 +1,309 @@
+[
+  {
+    "Id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "Created": "2026-11-09T15:03:07.583194394Z",
+    "Path": "/entrypoint.sh",
+    "Args": [
+      "rustfs"
+    ],
+    "State": {
+      "Status": "running",
+      "Running": true,
+      "Paused": false,
+      "Restarting": false,
+      "OOMKilled": false,
+      "Dead": false,
+      "Pid": 2920999,
+      "ExitCode": 0,
+      "Error": "",
+      "StartedAt": "2026-11-09T15:03:08.575542896Z",
+      "FinishedAt": "0001-01-01T00:00:00Z",
+      "Health": {
+        "Status": "healthy",
+        "FailingStreak": 0,
+        "Log": [
+          {
+            "Start": "2026-11-11T15:35:26.91269071-03:00",
+            "End": "2026-11-11T15:35:26.959199596-03:00",
+            "ExitCode": 0,
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 513.2k      0                              0\r100    462 100    462   0      0 500.7k      0                              0\r100    462 100    462   0      0 492.5k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:35:26.956848208Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+          },
+          {
+            "Start": "2026-11-11T15:35:41.960844495-03:00",
+            "End": "2026-11-11T15:35:42.038676635-03:00",
+            "ExitCode": 0,
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 659.6k      0                              0\r100    462 100    462   0      0 636.3k      0                              0\r100    462 100    462   0      0 624.8k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:35:42.036463878Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+          },
+          {
+            "Start": "2026-11-11T15:35:57.040310367-03:00",
+            "End": "2026-11-11T15:35:57.088156541-03:00",
+            "ExitCode": 0,
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    461 100    461   0      0 619.2k      0                              0\r100    461 100    461   0      0 601.0k      0                              0\r100    461 100    461   0      0 587.7k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:35:57.08599147Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+          },
+          {
+            "Start": "2026-11-11T15:36:12.089420381-03:00",
+            "End": "2026-11-11T15:36:12.162168576-03:00",
+            "ExitCode": 0,
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 613.8k      0                              0\r100    462 100    462   0      0 594.4k      0                              0\r100    462 100    462   0      0 580.6k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:36:12.159946874Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+          },
+          {
+            "Start": "2026-11-11T15:36:27.16323134-03:00",
+            "End": "2026-11-11T15:36:27.270802334-03:00",
+            "ExitCode": 0,
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    461 100    461   0      0 344.9k      0                              0\r100    461 100    461   0      0 315.0k      0                              0\r100    461 100    461   0      0 310.9k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:36:27.26527983Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+          }
+        ]
+      }
+    },
+    "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "ResolvConfPath": "/var/lib/docker/containers/e0c792ee4dfff04ee4ea9cb0d9463fc766db8218d36b816d0f1aa767ad1a4eed/resolv.conf",
+    "HostnamePath": "/var/lib/docker/containers/e0c792ee4dfff04ee4ea9cb0d9463fc766db8218d36b816d0f1aa767ad1a4eed/hostname",
+    "HostsPath": "/var/lib/docker/containers/e0c792ee4dfff04ee4ea9cb0d9463fc766db8218d36b816d0f1aa767ad1a4eed/hosts",
+    "LogPath": "/var/lib/docker/containers/fixture/fixture-json.log",
+    "Name": "/fixture-container",
+    "RestartCount": 0,
+    "Driver": "overlayfs",
+    "Platform": "linux",
+    "MountLabel": "",
+    "ProcessLabel": "",
+    "AppArmorProfile": "docker-default",
+    "ExecIDs": null,
+    "HostConfig": {
+      "Binds": [
+        "cv-mapa_cv-rustfs-data:/data:rw"
+      ],
+      "ContainerIDFile": "",
+      "LogConfig": {
+        "Type": "json-file",
+        "Config": {
+          "max-file": "5",
+          "max-size": "10m"
+        }
+      },
+      "NetworkMode": "cv-mapa",
+      "PortBindings": {},
+      "RestartPolicy": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "AutoRemove": false,
+      "VolumeDriver": "",
+      "VolumesFrom": null,
+      "ConsoleSize": [
+        0,
+        0
+      ],
+      "CapAdd": null,
+      "CapDrop": null,
+      "CgroupnsMode": "private",
+      "Dns": null,
+      "DnsOptions": null,
+      "DnsSearch": null,
+      "ExtraHosts": [],
+      "GroupAdd": null,
+      "IpcMode": "private",
+      "Cgroup": "",
+      "Links": null,
+      "OomScoreAdj": 0,
+      "PidMode": "",
+      "Privileged": false,
+      "PublishAllPorts": false,
+      "ReadonlyRootfs": false,
+      "SecurityOpt": null,
+      "UTSMode": "",
+      "UsernsMode": "",
+      "ShmSize": 67108864,
+      "Runtime": "runc",
+      "Isolation": "",
+      "CpuShares": 0,
+      "Memory": 0,
+      "NanoCpus": 0,
+      "CgroupParent": "",
+      "BlkioWeight": 0,
+      "BlkioWeightDevice": null,
+      "BlkioDeviceReadBps": null,
+      "BlkioDeviceWriteBps": null,
+      "BlkioDeviceReadIOps": null,
+      "BlkioDeviceWriteIOps": null,
+      "CpuPeriod": 0,
+      "CpuQuota": 0,
+      "CpuRealtimePeriod": 0,
+      "CpuRealtimeRuntime": 0,
+      "CpusetCpus": "",
+      "CpusetMems": "",
+      "Devices": null,
+      "DeviceCgroupRules": null,
+      "DeviceRequests": null,
+      "MemoryReservation": 0,
+      "MemorySwap": 0,
+      "MemorySwappiness": null,
+      "OomKillDisable": null,
+      "PidsLimit": null,
+      "Ulimits": null,
+      "CpuCount": 0,
+      "CpuPercent": 0,
+      "IOMaximumIOps": 0,
+      "IOMaximumBandwidth": 0,
+      "MaskedPaths": [
+        "/proc/acpi",
+        "/proc/asound",
+        "/proc/interrupts",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/sched_debug",
+        "/proc/scsi",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/sys/devices/virtual/powercap",
+        "/sys/firmware"
+      ],
+      "ReadonlyPaths": [
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+        "/proc/sys",
+        "/proc/sysrq-trigger"
+      ]
+    },
+    "Storage": {
+      "RootFS": {
+        "Snapshot": {
+          "Name": "overlayfs"
+        }
+      }
+    },
+    "Mounts": [
+      {
+        "Type": "volume",
+        "Name": "cv-mapa_cv-rustfs-data",
+        "Source": "/var/lib/docker/volumes/cv-mapa_cv-rustfs-data/_data",
+        "Destination": "/data",
+        "Driver": "local",
+        "Mode": "rw",
+        "RW": true,
+        "Propagation": ""
+      }
+    ],
+    "Config": {
+      "Hostname": "e0c792ee4dff",
+      "Domainname": "",
+      "User": "rustfs",
+      "AttachStdin": false,
+      "AttachStdout": true,
+      "AttachStderr": true,
+      "ExposedPorts": {
+        "9000/tcp": {},
+        "9001/tcp": {}
+      },
+      "Tty": false,
+      "OpenStdin": false,
+      "StdinOnce": false,
+      "Env": [
+        "RUSTFS_ADDRESS=REDACTED",
+        "RUSTFS_CONSOLE_ADDRESS=REDACTED",
+        "RUSTFS_CONSOLE_ENABLE=REDACTED",
+        "RUSTFS_ACCESS_KEY=REDACTED",
+        "RUSTFS_SECRET_KEY=REDACTED",
+        "PATH=REDACTED",
+        "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=REDACTED",
+        "RUSTFS_VOLUMES=REDACTED",
+        "RUSTFS_OBS_LOGGER_LEVEL=REDACTED",
+        "RUSTFS_OBS_LOG_DIRECTORY=REDACTED",
+        "RUSTFS_OBS_ENVIRONMENT=REDACTED"
+      ],
+      "Cmd": [
+        "rustfs"
+      ],
+      "Healthcheck": {
+        "Test": [
+          "CMD",
+          "curl",
+          "-f",
+          "http://127.0.0.1:9000/minio/health/ready"
+        ],
+        "Interval": 15000000000,
+        "Timeout": 5000000000,
+        "StartPeriod": 5000000000,
+        "Retries": 3
+      },
+      "Image": "rustfs/rustfs:latest",
+      "Volumes": {
+        "/data": {}
+      },
+      "WorkingDir": "/",
+      "Entrypoint": [
+        "/entrypoint.sh"
+      ],
+      "Labels": {
+        "build-date": "",
+        "com.docker.compose.config-hash": "69f63c0e6cf6aa2fb349a23fccce51d93c509ab4e0eaa7a26336f4604fe4630f",
+        "com.docker.compose.container-number": "1",
+        "com.docker.compose.depends_on": "",
+        "com.docker.compose.image": "sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2",
+        "com.docker.compose.oneoff": "False",
+        "com.docker.compose.project": "cv-mapa",
+        "com.docker.compose.project.config_files": "/srv/cv-mapa/compose.yaml",
+        "com.docker.compose.project.working_dir": "/srv/cv-mapa",
+        "com.docker.compose.replace": "rustfs-1",
+        "com.docker.compose.service": "rustfs",
+        "com.docker.compose.version": "5.1.4",
+        "description": "RustFS is a distributed object storage system written in Rust, supporting erasure coding, multi-tenant management, and observability.",
+        "license": "Apache-2.0",
+        "maintainer": "RustFS Team <dev@rustfs.com>",
+        "name": "RustFS",
+        "org.opencontainers.image.title": "RustFS,org.opencontainers.image.description=RustFS distributed object storage system,org.opencontainers.image.version=1.0.4,org.opencontainers.image.revision=46337942d55f3a8e6a97b147ca98d9ea8115555d,org.opencontainers.image.source=https://github.com/rustfs/rustfs,org.opencontainers.image.created=2026-10-25T16:27:49Z,org.opencontainers.image.build-type=release",
+        "release": "1.0.4",
+        "summary": "High-performance distributed object storage system compatible with S3 API",
+        "url": "https://rustfs.com",
+        "vcs-ref": "",
+        "vendor": "RustFS Team",
+        "version": "v1.0.4"
+      }
+    },
+    "NetworkSettings": {
+      "SandboxID": "7b0418df393b78c56f01e99aa0ca78e0b1e21cceed36d3dec1ad31ab17f67303",
+      "SandboxKey": "/var/run/docker/netns/7b0418df393b",
+      "Ports": {
+        "9000/tcp": null,
+        "9001/tcp": null
+      },
+      "Networks": {
+        "cv-mapa": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": [
+            "cv-mapa-rustfs-1",
+            "rustfs"
+          ],
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "812b27e78c29b4d0776b857c13087210c2b1f0c0b598dcd6431cb9c91ad4bfdd",
+          "EndpointID": "51200572fae2f56a9ba4a0346457aeca32f92604751d02e43620c78a26e69f4e",
+          "Gateway": "172.25.0.1",
+          "IPAddress": "172.25.0.3",
+          "MacAddress": "de:53:8c:e2:2b:cd",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": [
+            "cv-mapa-rustfs-1",
+            "rustfs",
+            "e0c792ee4dff"
+          ]
+        }
+      }
+    },
+    "ImageManifestDescriptor": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:6be0def183a9ec8c05147594ac71c030648fcb0a4b79f29f74cebd1d128ba17a",
+      "size": 1810,
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    },
+    "Hostname": "host"
+  }
+]
