@@ -159,6 +159,7 @@ export default class DockerManager extends View {
     this.discoveredCompose = [];
     this.discoveredDockerfiles = [];
     this.refreshSeq = 0;
+    this.refreshing = false; // drives the toolbar refresh spinner
     this.busyTargets = new Map(); // targetKey -> actionLabel
 
     // Inspector Tab Mode state (DM-44..46)
@@ -1014,6 +1015,8 @@ export default class DockerManager extends View {
   /** Fast status refresh (DM-15, DESIGN §4.1) */
   refresh(cx) {
     const seq = ++this.refreshSeq;
+    this.refreshing = true;
+    cx.notify();
     const ctx = resolveDockerContext({
       props: props(),
       spaces: spaces(),
@@ -1044,6 +1047,7 @@ export default class DockerManager extends View {
           this.engineStatus = "unavailable";
           this.engineError =
             infoRes.stderr || infoRes.stdout || "Cannot connect to the Docker daemon. Is the daemon running?";
+          this.refreshing = false;
           cx.notify();
           return;
         }
@@ -1051,6 +1055,7 @@ export default class DockerManager extends View {
         if (seq !== this.refreshSeq) return;
         this.engineStatus = "unavailable";
         this.engineError = err.message || "Failed to execute Docker CLI";
+        this.refreshing = false;
         cx.notify();
         return;
       }
@@ -1197,9 +1202,11 @@ export default class DockerManager extends View {
           }
         }
 
+        this.refreshing = false;
         cx.notify();
       } catch (err) {
         if (seq !== this.refreshSeq) return;
+        this.refreshing = false;
         cx.notify();
       }
     });
@@ -2211,7 +2218,7 @@ export default class DockerManager extends View {
               .border_color(toColor(t.border))
               .p(1)
               .child(
-                div()
+                h_flex()
                   .px(6)
                   .h_full()
                   .rounded(3)
@@ -2231,7 +2238,7 @@ export default class DockerManager extends View {
                   .child("This space")
               )
               .child(
-                div()
+                h_flex()
                   .px(6)
                   .h_full()
                   .rounded(3)
@@ -2253,18 +2260,23 @@ export default class DockerManager extends View {
           )
           // Refresh button
           .child(
-            div()
+            h_flex()
               .size(24)
               .rounded(4)
               .items_center()
               .justify_center()
               .hover((s) => s.bg(toColor(t.hover)))
               .on_click((_e, cx) => this.refresh(cx))
-              .child(svg("mods/docker-manager/icons/refresh.svg").size(14).text_color(toColor(t.muted)))
+              .child(
+                svg("mods/docker-manager/icons/refresh.svg")
+                  .size(14)
+                  .text_color(toColor(this.refreshing ? t.accent : t.muted))
+                  .when(this.refreshing, (el) => el.spin(900))
+              )
           )
           // Toolbar ⋯ menu button (DM-10)
           .child(
-            div()
+            h_flex()
               .size(24)
               .rounded(4)
               .items_center()
@@ -2357,7 +2369,7 @@ export default class DockerManager extends View {
       )
       .when(Boolean(this.filterQuery), (el) =>
         el.child(
-          div()
+          h_flex()
             .size(16)
             .rounded(2)
             .items_center()
@@ -3301,7 +3313,7 @@ export default class DockerManager extends View {
               .gap(4)
               // Expand to Inspector Tab (DM-44)
               .child(
-                div()
+                h_flex()
                   .size(20)
                   .rounded(2)
                   .items_center()
@@ -3329,7 +3341,7 @@ export default class DockerManager extends View {
               )
               // Close drawer (✕)
               .child(
-                div()
+                h_flex()
                   .size(20)
                   .rounded(2)
                   .items_center()
@@ -3647,7 +3659,7 @@ export default class DockerManager extends View {
                       .child("Declared in Compose, but not yet created.")
                   )
                   .child(
-                    div()
+                    h_flex()
                       .px(10)
                       .h(24)
                       .rounded(4)
@@ -3895,7 +3907,7 @@ export default class DockerManager extends View {
               .gap(8)
               .mt(4)
               .child(
-                div()
+                h_flex()
                   .px(10)
                   .h(26)
                   .rounded(4)
@@ -3913,7 +3925,7 @@ export default class DockerManager extends View {
                   .child("Cancel")
               )
               .child(
-                div()
+                h_flex()
                   .px(10)
                   .h(26)
                   .rounded(4)
@@ -4085,7 +4097,7 @@ export default class DockerManager extends View {
           .mt(8)
           // Retry button
           .child(
-            div()
+            h_flex()
               .px(12)
               .h(28)
               .rounded(4)
@@ -4100,7 +4112,7 @@ export default class DockerManager extends View {
           )
           // Start Docker Desktop (macOS)
           .child(
-            div()
+            h_flex()
               .px(12)
               .h(28)
               .rounded(4)
@@ -4400,7 +4412,7 @@ export default class DockerManager extends View {
               // --- CONTAINER ACTIONS ---
               .when(kind === "container" && !isRunning && Boolean(targetId), (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4419,7 +4431,7 @@ export default class DockerManager extends View {
               )
               .when(kind === "container" && isRunning && Boolean(targetId), (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4438,7 +4450,7 @@ export default class DockerManager extends View {
               )
               .when(kind === "container" && Boolean(targetId), (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4457,7 +4469,7 @@ export default class DockerManager extends View {
               )
               .when(kind === "container" && isService, (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4478,7 +4490,7 @@ export default class DockerManager extends View {
               )
               .when(kind === "container" && Boolean(targetId), (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4497,7 +4509,7 @@ export default class DockerManager extends View {
               )
               .when(kind === "container" && isRunning && Boolean(targetId), (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4518,7 +4530,7 @@ export default class DockerManager extends View {
               .when(kind === "image", (btn) =>
                 btn
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4535,7 +4547,7 @@ export default class DockerManager extends View {
                       .child(div().text_size(11).text_color(toColor(t.foreground)).child("Run…"))
                   )
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4551,7 +4563,7 @@ export default class DockerManager extends View {
                       .child(div().text_size(11).text_color(toColor(t.foreground)).child("Tag…"))
                   )
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4572,7 +4584,7 @@ export default class DockerManager extends View {
               .when(kind === "volume", (btn) =>
                 btn
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4592,7 +4604,7 @@ export default class DockerManager extends View {
                       .child(div().text_size(11).text_color(toColor(t.foreground)).child("Browse"))
                   )
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4608,7 +4620,7 @@ export default class DockerManager extends View {
                       .child(div().text_size(11).text_color(toColor(t.foreground)).child("Backup…"))
                   )
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4624,7 +4636,7 @@ export default class DockerManager extends View {
                       .child(div().text_size(11).text_color(toColor(t.foreground)).child("Restore…"))
                   )
                   .child(
-                    div()
+                    h_flex()
                       .px(8)
                       .h(24)
                       .rounded(3)
@@ -4643,7 +4655,7 @@ export default class DockerManager extends View {
               // --- GENERAL COPY & REFRESH ---
               .when(Boolean(targetId), (btn) =>
                 btn.child(
-                  div()
+                  h_flex()
                     .px(8)
                     .h(24)
                     .rounded(3)
@@ -4661,7 +4673,7 @@ export default class DockerManager extends View {
                 )
               )
               .child(
-                div()
+                h_flex()
                   .size(24)
                   .rounded(4)
                   .items_center()
@@ -4671,7 +4683,12 @@ export default class DockerManager extends View {
                     if (targetId) this.loadInspectData(targetId, cx, kind);
                     this.refresh(cx);
                   })
-                  .child(svg("mods/docker-manager/icons/refresh.svg").size(13).text_color(toColor(t.muted)))
+                  .child(
+                    svg("mods/docker-manager/icons/refresh.svg")
+                      .size(13)
+                      .text_color(toColor(this.refreshing ? t.accent : t.muted))
+                      .when(this.refreshing, (el) => el.spin(900))
+                  )
               )
           )
       )
@@ -4754,7 +4771,7 @@ export default class DockerManager extends View {
           h_flex()
             .justify_end()
             .child(
-              div()
+              h_flex()
                 .px(8)
                 .h(22)
                 .rounded(3)
@@ -4808,7 +4825,7 @@ export default class DockerManager extends View {
                 .items_center()
                 .child(div().font_semibold().text_size(11).text_color(toColor(t.foreground)).child(k))
                 .child(
-                  div()
+                  h_flex()
                     .size(16)
                     .rounded(2)
                     .items_center()
@@ -4824,7 +4841,7 @@ export default class DockerManager extends View {
                 .items_center()
                 .child(div().text_size(11).text_color(toColor(t.dim)).child(v))
                 .child(
-                  div()
+                  h_flex()
                     .size(16)
                     .rounded(2)
                     .items_center()
@@ -5154,7 +5171,7 @@ export default class DockerManager extends View {
                 .items_center()
                 .child(div().font_semibold().text_size(11).text_color(toColor(t.foreground)).child(e.key))
                 .child(
-                  div()
+                  h_flex()
                     .size(16)
                     .rounded(2)
                     .items_center()
@@ -5178,7 +5195,7 @@ export default class DockerManager extends View {
                 )
                 .when(e.secret, (btn) =>
                   btn.child(
-                    div()
+                    h_flex()
                       .size(18)
                       .items_center()
                       .justify_center()
@@ -5203,7 +5220,7 @@ export default class DockerManager extends View {
                   )
                 )
                 .child(
-                  div()
+                  h_flex()
                     .size(16)
                     .rounded(2)
                     .items_center()
@@ -5263,7 +5280,7 @@ export default class DockerManager extends View {
                 .child(div().text_size(11).text_color(toColor(t.foreground)).child(m.source || "(anonymous)"))
                 .when(Boolean(m.source), (cBtn) =>
                   cBtn.child(
-                    div()
+                    h_flex()
                       .size(16)
                       .rounded(2)
                       .items_center()
@@ -5317,7 +5334,7 @@ export default class DockerManager extends View {
             .items_center()
             .child(div().text_size(11).text_color(toColor(t.dim)).child("Live container performance (via docker stats)"))
             .child(
-              div()
+              h_flex()
                 .px(8)
                 .h(22)
                 .rounded(3)
@@ -5422,7 +5439,7 @@ export default class DockerManager extends View {
                   .child(title)
               )
               .child(
-                div()
+                h_flex()
                   .size(18)
                   .rounded(2)
                   .items_center()
@@ -5540,7 +5557,7 @@ export default class DockerManager extends View {
               .gap(6)
               .mt(6)
               .child(
-                div()
+                h_flex()
                   .px(10)
                   .h(24)
                   .rounded(4)
@@ -5557,7 +5574,7 @@ export default class DockerManager extends View {
                   .child("Cancel")
               )
               .child(
-                div()
+                h_flex()
                   .px(12)
                   .h(24)
                   .rounded(4)
@@ -5804,7 +5821,7 @@ export default class DockerManager extends View {
               )
               // Prune Dangling
               .child(
-                div()
+                h_flex()
                   .h(22)
                   .px(6)
                   .rounded(3)
@@ -5829,7 +5846,7 @@ export default class DockerManager extends View {
               )
               // Prune Unused
               .child(
-                div()
+                h_flex()
                   .h(22)
                   .px(6)
                   .rounded(3)
@@ -5940,7 +5957,7 @@ export default class DockerManager extends View {
               .gap(4)
               // Compute sizes
               .child(
-                div()
+                h_flex()
                   .h(22)
                   .px(6)
                   .rounded(3)
@@ -5961,7 +5978,7 @@ export default class DockerManager extends View {
               )
               // Prune Unused Volumes
               .child(
-                div()
+                h_flex()
                   .h(22)
                   .px(6)
                   .rounded(3)
@@ -6059,7 +6076,7 @@ export default class DockerManager extends View {
           )
           .child(
             // Prune Unused Networks
-            div()
+            h_flex()
               .h(22)
               .px(6)
               .rounded(3)
@@ -6146,7 +6163,7 @@ export default class DockerManager extends View {
           )
           .child(
             // Run deep size check button
-            div()
+            h_flex()
               .h(22)
               .px(6)
               .rounded(3)
@@ -6422,7 +6439,7 @@ export default class DockerManager extends View {
                       .justify_end()
                       .mt(4)
                       .child(
-                        div()
+                        h_flex()
                           .px(10)
                           .h(26)
                           .rounded(4)
@@ -6528,7 +6545,7 @@ export default class DockerManager extends View {
                   .child(title)
               )
               .child(
-                div()
+                h_flex()
                   .size(18)
                   .rounded(2)
                   .items_center()
@@ -6645,7 +6662,7 @@ export default class DockerManager extends View {
               .gap(6)
               .mt(6)
               .child(
-                div()
+                h_flex()
                   .px(10)
                   .h(24)
                   .rounded(4)
@@ -6662,7 +6679,7 @@ export default class DockerManager extends View {
                   .child("Cancel")
               )
               .child(
-                div()
+                h_flex()
                   .px(12)
                   .h(24)
                   .rounded(4)
@@ -6730,7 +6747,7 @@ export default class DockerManager extends View {
                   .child(title)
               )
               .child(
-                div()
+                h_flex()
                   .size(18)
                   .rounded(2)
                   .items_center()
@@ -6863,7 +6880,7 @@ export default class DockerManager extends View {
               .gap(6)
               .mt(6)
               .child(
-                div()
+                h_flex()
                   .px(10)
                   .h(24)
                   .rounded(4)
@@ -6880,7 +6897,7 @@ export default class DockerManager extends View {
                   .child("Cancel")
               )
               .child(
-                div()
+                h_flex()
                   .px(12)
                   .h(24)
                   .rounded(4)
