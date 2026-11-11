@@ -1,614 +1,302 @@
-/**
- * docker-logic.js — Pure, zero-dependency domain logic for Docker Manager mod.
- *
- * Implements label parsing, Compose/Dockerfile classification, argv construction,
- * deep container inspect normalization, secret masking, tree merging, system df parsing,
- * and context menu clamping.
- *
- * References:
- * - docs/SPEC.md: DM-20..27 (Container tree), DM-30..36 (Discovery & Scope),
- *   DM-40..46 (Inspection), DM-50..87 (CLI actions & safety), DM-100..123 (Resources & Hygiene)
- * - docs/DESIGN.md: Sections 3, 4, 5, 6
- */
+// Pure, zero-dependency domain logic for docker-manager mod.
+// Handles label extraction, CLI argv generation, workspace tree construction,
+// secret masking, and inspect normalization without DOM or GPUI dependencies.
 
 /**
- * Parses raw Docker container labels.
+ * Validates Docker resource identifiers (container names, project names, volumes, networks).
+ * Prevents shell injection, path traversal, and empty arguments (DM-87).
  *
- * In `docker container ls --format '{{json .}}'`, `Labels` is a comma-separated
- * `k=v` string where values themselves can contain commas — most notably
- * `com.docker.compose.project.config_files=/path/a.yaml,/path/b.yaml` and
- * `desktop.docker.io/binds/...`.
+ * @param {string} name
+ * @param {string} [type="identifier"]
+ * @returns {boolean}
+ */
+export function validateDockerIdentifier(name, type = "identifier") {
+  if (typeof name !== "string" || name.trim().length === 0) {
+    throw new Error(`Invalid Docker ${type}: name must be a non-empty string`);
+  }
+  const trimmed = name.trim();
+  // Reject shell metacharacters: ;, &, |, $, `, \, ", ', <, >, (, ), whitespace, control chars
+  if (/[\s;&|$`\\"\'<>(){}\r\n\t\0]/.test(trimmed)) {
+    throw new Error(`Invalid Docker ${type}: "${trimmed}" contains forbidden characters`);
+  }
+  // Reject path traversal
+  if (trimmed.includes("..")) {
+    throw new Error(`Invalid Docker ${type}: "${trimmed}" contains path traversal`);
+  }
+  return true;
+}
+
+/**
+ * Classifies a file path into a Docker file type based on its basename (DM-30..34, DM-90..91).
  *
- * Splits only on commas that precede a valid label key token (`/[a-zA-Z0-9_./-]+=/`),
- * preserving multi-file paths in compose labels intact.
+ * @param {string} filePath
+ * @returns {"compose" | "dockerfile" | null}
+ */
+export function classifyDockerFile(filePath) {
+  if (!filePath || typeof filePath !== "string") return null;
+  const basename = filePath.split("/").pop() || "";
+  // Compose files: compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml,
+  // plus compose.override.yml, compose.dev.yaml, docker-compose.prod.yml, etc.
+  if (/^(?:docker-)?compose(?:\.[a-z0-9_-]+)*\.ya?ml$/i.test(basename)) {
+    return "compose";
+  }
+  // Dockerfiles: Dockerfile, Dockerfile.dev, web.Dockerfile, Containerfile, Containerfile.prod, etc.
+  if (/^(?:Dockerfile(?:\.[a-z0-9_-]+)*|[a-z0-9_.-]+\.Dockerfile|Containerfile(?:\.[a-z0-9_-]+)*)$/i.test(basename)) {
+    return "dockerfile";
+  }
+  return null;
+}
+
+/**
+ * Checks whether an environment variable key should be masked as a secret (DM-45).
+ * Matches PASS, SECRET, TOKEN, KEY, CREDENTIAL, PRIVATE, etc.
  *
- * @param {string | Record<string, string> | null | undefined} rawLabels
+ * @param {string} key
+ * @returns {boolean}
+ */
+export function isSecretEnvKey(key) {
+  if (!key || typeof key !== "string") return false;
+  return /(?:^|_)(?:PASS(?:WORD|PHRASE)?|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|AUTH|CREDENTIALS?|CLIENT_SECRET|DATABASE_URL|REDIS_URL|CONNECTION_STRING)(?:$|_)/i.test(key);
+}
+
+/**
+ * Parses raw comma-separated labels string from `docker container ls --format '{{json .}}'`
+ * into a key-value record.
+ * Preserves multi-file paths in `com.docker.compose.project.config_files` and other comma-containing values
+ * by only splitting on commas immediately preceding a valid key token (DESIGN §4.1).
+ *
+ * @param {string | Record<string, string>} rawLabels
  * @returns {Record<string, string>}
  */
 export function parseContainerLabels(rawLabels) {
   if (!rawLabels) return {};
-  if (typeof rawLabels === "object") {
-    return { ...rawLabels };
-  }
+  if (typeof rawLabels === "object") return { ...rawLabels };
   if (typeof rawLabels !== "string") return {};
 
   const trimmed = rawLabels.trim();
   if (trimmed.length === 0) return {};
 
-  // Match commas that are followed by a key token like `key=` or `domain.io/key=`
-  // Key must start with alphanumeric and end with `=`
-  const entries = trimmed.split(/,(?=[a-zA-Z0-9][a-zA-Z0-9_./-]*=)/);
-  const result = {};
+  const labels = {};
+  // Split only on commas that are followed by a key token ending with '='
+  // e.g. `,com.docker.compose.project=` or `,desktop.docker.io/binds/0/source=`
+  const tokens = trimmed.split(/,(?=[a-zA-Z0-9_./-]+=[^,]*)/);
 
-  for (const entry of entries) {
-    const eqIdx = entry.indexOf("=");
-    if (eqIdx === -1) {
-      const key = entry.trim();
-      if (key) result[key] = "";
-    } else {
-      const key = entry.slice(0, eqIdx).trim();
-      const val = entry.slice(eqIdx + 1);
-      if (key) result[key] = val;
+  for (const token of tokens) {
+    const eqIdx = token.indexOf("=");
+    if (eqIdx > 0) {
+      const key = token.slice(0, eqIdx).trim();
+      const val = token.slice(eqIdx + 1).trim();
+      labels[key] = val;
     }
   }
 
-  return result;
+  return labels;
 }
 
 /**
- * Validates a Docker identifier (container name, ID, volume name, network name, project name).
+ * Checks if a target path is equal to or inside a parent directory.
  *
- * Accepts alphanumeric characters, dots, underscores, and hyphens up to 255 chars.
- * Rejects empty names, spaces, semicolons, path traversal (`..`), slashes (`/`),
- * shell command substitution (`$()`), and identifiers > 255 chars (DM-87).
- *
- * @param {string | null | undefined} name
+ * @param {string} parent
+ * @param {string} child
  * @returns {boolean}
  */
-export function validateDockerIdentifier(name) {
-  if (typeof name !== "string") return false;
-  const trimmed = name.trim();
-  if (trimmed.length === 0 || trimmed.length > 255) return false;
-  if (name !== trimmed) return false;
-  // Docker resource names must start with an alphanumeric character
-  return /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name);
+export function isPathInside(parent, child) {
+  if (!parent || !child || typeof parent !== "string" || typeof child !== "string") return false;
+  const p = parent.replace(/\/+$/, "");
+  const c = child.replace(/\/+$/, "");
+  return c === p || c.startsWith(p + "/");
 }
 
 /**
- * Classifies a workspace file into Compose or Dockerfile target (DM-30, DM-34).
+ * Resolves current workspace execution context (cwd, on/machine)
+ * following Herdr standard (DESIGN §3).
  *
- * Recognizes:
- * - Compose: `compose.yaml`, `compose.yml`, `compose.dev.yaml`, `compose.override.yaml`,
- *   `docker-compose.yml`, `docker-compose.yaml`, `docker-compose.override.yml`, etc.
- * - Dockerfile: `Dockerfile`, `Dockerfile.dev`, `app.Dockerfile`, `Containerfile`, `Containerfile.dev`, etc.
- * Rejects unrelated files like `values.yaml`, `README.md`.
- *
- * @param {string | null | undefined} filePath
- * @returns {{ type: "compose" | "dockerfile", kind: "compose" | "dockerfile", isCompose: boolean, isDockerfile: boolean, isOverride: boolean, env: string | null, variant: string | null } | null}
+ * @param {object} params
+ * @param {object} [params.props]
+ * @param {Array<object>} [params.spaces]
+ * @param {Array<object>} [params.panes]
+ * @param {Array<object>} [params.terminals]
+ * @param {object} [params.focused]
+ * @param {Function} [params.shared]
+ * @param {string} [params.currentRoot]
+ * @returns {{ cwd: string, on: string | null, machine: string | null }}
  */
-export function classifyDockerFile(filePath) {
-  if (!filePath || typeof filePath !== "string") return null;
-
-  const base = filePath.split("/").pop();
-  if (!base) return null;
-  const lower = base.toLowerCase();
-
-  // 1. Compose file patterns:
-  // ^(?:docker-)?compose(?:\.(?<variant>.*?))?\.ya?ml$
-  const composeMatch = lower.match(/^(?:docker-)?compose(?:\.(.+?))?\.ya?ml$/);
-  if (composeMatch) {
-    const variant = composeMatch[1] || null;
-    const isOverride = Boolean(variant && variant.toLowerCase().includes("override"));
-    const env = variant && !isOverride ? variant : null;
-    return {
-      type: "compose",
-      kind: "compose",
-      isCompose: true,
-      isDockerfile: false,
-      isOverride,
-      env,
-      variant,
-    };
+export function resolveDockerContext({ props, spaces = [], panes = [], terminals = [], focused = null, shared = null, currentRoot = null } = {}) {
+  // 1. Explicit props override
+  if (props?.folder || props?.cwd || props?.repo) {
+    const cwd = props.folder || props.cwd || props.repo;
+    const on = props.on ?? null;
+    return { cwd, on, machine: on };
   }
 
-  // 2. Dockerfile patterns:
-  // dockerfile, dockerfile.<variant>, <variant>.dockerfile, containerfile, containerfile.<variant>, <variant>.containerfile
-  let isDocker = false;
-  let dfVariant = null;
+  // 2. Active space
+  const spaceList = typeof spaces === "function" ? spaces() : spaces;
+  const activeSpace = spaceList.find((s) => s.active);
+  const machine = activeSpace?.machine ?? null;
 
-  if (lower === "dockerfile" || lower === "containerfile") {
-    isDocker = true;
-  } else if (lower.startsWith("dockerfile.") || lower.startsWith("containerfile.")) {
-    isDocker = true;
-    dfVariant = base.slice(base.indexOf(".") + 1);
-  } else if (lower.endsWith(".dockerfile") || lower.endsWith(".containerfile")) {
-    isDocker = true;
-    dfVariant = base.slice(0, base.indexOf("."));
-  }
+  if (activeSpace) {
+    // Check pinned location
+    const pinnedMap = typeof shared === "function" ? shared("spaces.pinned_locations") : null;
+    if (pinnedMap && pinnedMap[activeSpace.id]) {
+      const cwd = pinnedMap[activeSpace.id];
+      return { cwd, on: machine, machine };
+    }
 
-  if (isDocker) {
-    return {
-      type: "dockerfile",
-      kind: "dockerfile",
-      isCompose: false,
-      isDockerfile: true,
-      isOverride: false,
-      env: null,
-      variant: dfVariant,
-    };
-  }
+    // Check focused cwd if it matches active space
+    const f = typeof focused === "function" ? focused() : focused;
+    if (f && f.space === activeSpace.id && f.cwd) {
+      return { cwd: f.cwd, on: machine, machine };
+    }
 
-  return null;
-}
-
-/**
- * Checks whether an environment variable name matches secret/sensitive patterns (DM-45).
- *
- * Matches PASSWORD, DB_PASSWORD, SECRET, TOKEN, API_KEY, PRIVATE_KEY, AUTH,
- * CREDENTIAL, CLIENT_SECRET, DATABASE_URL, REDIS_URL, CONNECTION_STRING.
- * Leaves ordinary variables like PATH, NODE_ENV, PORT, HOME unmasked.
- *
- * @param {string | null | undefined} key
- * @returns {boolean}
- */
-export function isSecretEnvKey(key) {
-  if (!key || typeof key !== "string") return false;
-  return /(?:^|_)(?:PASS(?:WORD|PHRASE)?|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|AUTH|CREDENTIAL|CLIENT_SECRET|DATABASE_URL|REDIS_URL|CONNECTION_STRING)(?:$|_)/i.test(
-    key
-  );
-}
-
-/**
- * Normalizes raw container JSON from `docker inspect` into a structured, safe model (DM-40..46).
- *
- * @param {any} raw
- * @returns {Record<string, any>}
- */
-export function normalizeContainerInspect(raw) {
-  if (!raw) return {};
-  const data = Array.isArray(raw) ? raw[0] || {} : typeof raw === "string" ? JSON.parse(raw) : raw;
-
-  const id = data.Id || "";
-  const shortId = id.slice(0, 12);
-  const name = (data.Name || "").replace(/^\//, "");
-  const labels = parseContainerLabels(data.Config?.Labels);
-  const project = labels["com.docker.compose.project"] || null;
-  const service = labels["com.docker.compose.service"] || null;
-  const composeFilesStr = labels["com.docker.compose.project.config_files"] || "";
-  const composeFiles = composeFilesStr ? composeFilesStr.split(",").filter(Boolean) : [];
-  const dependsOnStr = labels["com.docker.compose.depends_on"] || "";
-  const dependsOn = dependsOnStr ? dependsOnStr.split(",").filter(Boolean) : [];
-
-  // State & Health
-  const stateObj = data.State || {};
-  const state = {
-    status: stateObj.Status || "unknown",
-    running: Boolean(stateObj.Running),
-    paused: Boolean(stateObj.Paused),
-    restarting: Boolean(stateObj.Restarting),
-    oomKilled: Boolean(stateObj.OOMKilled),
-    dead: Boolean(stateObj.Dead),
-    exitCode: typeof stateObj.ExitCode === "number" ? stateObj.ExitCode : 0,
-    error: stateObj.Error || "",
-    startedAt: stateObj.StartedAt || "",
-    finishedAt: stateObj.FinishedAt || "",
-  };
-
-  const healthObj = stateObj.Health || null;
-  let health = null;
-  if (healthObj) {
-    const logArr = Array.isArray(healthObj.Log) ? healthObj.Log : [];
-    const lastLog = logArr.length > 0 ? logArr[logArr.length - 1].Output || "" : null;
-    health = {
-      status: healthObj.Status || null,
-      failingStreak: healthObj.FailingStreak || 0,
-      lastLog,
-    };
-  }
-
-  // HostConfig RestartPolicy
-  const restartPolicyObj = data.HostConfig?.RestartPolicy || {};
-  const restartPolicy = {
-    name: restartPolicyObj.Name || "",
-    maximumRetryCount: restartPolicyObj.MaximumRetryCount || 0,
-  };
-
-  // Ports
-  const ports = [];
-  const rawPorts = data.NetworkSettings?.Ports || {};
-  for (const [containerPortProto, bindings] of Object.entries(rawPorts)) {
-    const slashIdx = containerPortProto.indexOf("/");
-    const containerPort = slashIdx !== -1 ? containerPortProto.slice(0, slashIdx) : containerPortProto;
-    const proto = slashIdx !== -1 ? containerPortProto.slice(slashIdx + 1) : "tcp";
-
-    if (Array.isArray(bindings) && bindings.length > 0) {
-      for (const b of bindings) {
-        ports.push({
-          hostIp: b.HostIp || "0.0.0.0",
-          hostPort: b.HostPort || "",
-          containerPort,
-          proto,
-        });
+    // Terminal cwd in active space
+    const paneList = typeof panes === "function" ? panes() : panes;
+    const activePanes = paneList.filter((p) => p.space === activeSpace.id);
+    for (const p of activePanes) {
+      if (p.cwd) {
+        return { cwd: p.cwd, on: machine, machine };
       }
-    } else {
-      ports.push({
-        hostIp: null,
-        hostPort: null,
-        containerPort,
-        proto,
-      });
+    }
+
+    if (activeSpace.folder) {
+      return { cwd: activeSpace.folder, on: machine, machine };
     }
   }
 
-  // Mounts
-  const mounts = (data.Mounts || []).map((m) => ({
-    type: m.Type || "bind",
-    name: m.Name || null,
-    source: m.Source || "",
-    destination: m.Destination || "",
-    rw: Boolean(m.RW),
-    driver: m.Driver || null,
-    mode: m.Mode || "",
-  }));
-
-  // Networks
-  const networks = [];
-  const rawNetworks = data.NetworkSettings?.Networks || {};
-  for (const [netName, netObj] of Object.entries(rawNetworks)) {
-    networks.push({
-      name: netName,
-      ipAddress: netObj.IPAddress || "",
-      gateway: netObj.Gateway || "",
-      macAddress: netObj.MacAddress || "",
-      aliases: Array.isArray(netObj.Aliases) ? netObj.Aliases : [],
-      networkId: netObj.NetworkID || "",
-    });
-  }
-
-  // Environment
-  const env = (data.Config?.Env || []).map((entry) => {
-    const eqIdx = entry.indexOf("=");
-    const key = eqIdx === -1 ? entry : entry.slice(0, eqIdx);
-    const value = eqIdx === -1 ? "" : entry.slice(eqIdx + 1);
-    return {
-      key,
-      value,
-      secret: isSecretEnvKey(key),
-    };
-  });
-
-  const imageId = data.Image || "";
-  const shortImageId = imageId.replace(/^sha256:/, "").slice(0, 12);
-
-  return {
-    id,
-    shortId,
-    name,
-    project,
-    service,
-    image: data.Config?.Image || "",
-    imageId,
-    shortImageId,
-    imageShortId: shortImageId,
-    created: data.Created || "",
-    startedAt: state.startedAt,
-    finishedAt: state.finishedAt,
-    state,
-    health,
-    restartPolicy,
-    ports,
-    mounts,
-    networks,
-    env,
-    entrypoint: data.Config?.Entrypoint || null,
-    cmd: data.Config?.Cmd || null,
-    workingDir: data.Config?.WorkingDir || "",
-    labels,
-    composeFiles,
-    dependsOn,
-  };
+  const cwd = currentRoot || "/";
+  return { cwd, on: machine, machine };
 }
 
 /**
- * Formats a container restart policy into a human-readable display string (DM-41).
+ * Builds standard Compose argv array for a target project (DESIGN §4.5).
  *
- * @param {{ name?: string, maximumRetryCount?: number } | null | undefined} policy
- * @returns {string}
- */
-export function formatRestartPolicy(policy) {
-  if (!policy || !policy.name || policy.name === "no") return "no";
-  if (policy.name === "on-failure") {
-    return policy.maximumRetryCount > 0 ? `on-failure:${policy.maximumRetryCount}` : "on-failure";
-  }
-  return policy.name;
-}
-
-/**
- * Formats an image name and short id for drawer display (DM-41).
- *
- * @param {string | null | undefined} image
- * @param {string | null | undefined} shortImageId
- * @returns {string}
- */
-export function formatImageLabel(image, shortImageId) {
-  const img = image || "";
-  const sid = shortImageId || "";
-  if (img && sid && !img.includes(sid)) {
-    return `${img} (${sid})`;
-  }
-  return img || sid || "";
-}
-
-/**
- * Formats ports into drawer rows with display label, copy value, and clickable url (DM-41).
- *
- * @param {Array<{ hostIp?: string | null, hostPort?: string | null, containerPort: string, proto?: string }>} ports
- * @returns {Array<{ label: string, url: string | null, copyVal: string, published: boolean }>}
- */
-export function formatDrawerPortRows(ports) {
-  if (!ports || !Array.isArray(ports) || ports.length === 0) return [];
-  const results = [];
-  const seen = new Set();
-
-  for (const p of ports) {
-    if (!p || !p.containerPort) continue;
-    const proto = p.proto || "tcp";
-    const hasHost = Boolean(p.hostPort);
-    const hostPort = p.hostPort ? String(p.hostPort) : null;
-    const containerPort = String(p.containerPort);
-
-    let label;
-    let url = null;
-    let copyVal;
-
-    if (hasHost) {
-      const hostIp =
-        p.hostIp && p.hostIp !== "0.0.0.0" && p.hostIp !== "::" && p.hostIp !== "[::]"
-          ? p.hostIp
-          : null;
-      const hostPart = hostIp ? `${hostIp}:${hostPort}` : hostPort;
-      label = `${hostPart} → ${containerPort}/${proto}`;
-      url = `http://localhost:${hostPort}`;
-      copyVal = url;
-    } else {
-      label = `${containerPort}/${proto}`;
-      copyVal = label;
-    }
-
-    const dedupeKey = `${hasHost ? "pub" : "unpub"}:${label}`;
-    if (!seen.has(dedupeKey)) {
-      seen.add(dedupeKey);
-      results.push({
-        label,
-        url,
-        copyVal,
-        published: hasHost,
-      });
-    }
-  }
-
-  return results;
-}
-
-/**
- * Formats mounts into drawer rows with display text, copy value, and isNamed volume flag (DM-41).
- *
- * @param {Array<{ type?: string, name?: string | null, source?: string, destination?: string, rw?: boolean }>} mounts
- * @returns {Array<{ text: string, isNamed: boolean, name: string | null, source: string, destination: string, copyVal: string }>}
- */
-export function formatDrawerMounts(mounts) {
-  if (!mounts || !Array.isArray(mounts) || mounts.length === 0) return [];
-  return mounts.map((m) => {
-    const isNamed = m.type === "volume" && Boolean(m.name);
-    const src = isNamed ? m.name : m.source;
-    const mode = m.rw === false ? "ro" : "rw";
-    const text = `${m.type || "bind"}: ${src} → ${m.destination} (${mode})`;
-    const copyVal = m.name || m.source || text;
-    return {
-      text,
-      isNamed,
-      name: m.name || null,
-      source: m.source || "",
-      destination: m.destination || "",
-      copyVal,
-    };
-  });
-}
-
-/**
- * Formats networks into drawer rows with display text, copy value, and name (DM-41).
- *
- * @param {Array<{ name: string, ipAddress?: string, aliases?: string[] }>} networks
- * @returns {Array<{ text: string, name: string, ipAddress: string, copyVal: string }>}
- */
-export function formatDrawerNetworks(networks) {
-  if (!networks || !Array.isArray(networks) || networks.length === 0) return [];
-  return networks.map((n) => {
-    const aliasStr = n.aliases && n.aliases.length > 0 ? ` [${n.aliases.join(", ")}]` : "";
-    const ipStr = n.ipAddress ? ` (${n.ipAddress})` : "";
-    const text = `${n.name}${ipStr}${aliasStr}`;
-    const copyVal = n.ipAddress || n.name;
-    return {
-      text,
-      name: n.name,
-      ipAddress: n.ipAddress || "",
-      copyVal,
-    };
-  });
-}
-
-/**
- * Checks if target has usable compose files.
- *
- * @param {{ project?: string, workingDir?: string, configFiles?: string[], hasConfigFiles?: boolean } | string} target
- * @returns {boolean}
- */
-export function hasUsableConfigFiles(target) {
-  if (!target || typeof target === "string") return false;
-  if (target.hasConfigFiles === false) return false;
-  return Array.isArray(target.configFiles) && target.configFiles.length > 0;
-}
-
-/**
- * Checks compose action availability against missing configuration files (DM-50..59).
- *
- * When compose configuration files are missing, lifecycle actions `up`, `build`,
- * and `pull` are disabled with the reason "compose file not found".
- *
- * @param {{ project?: string, workingDir?: string, configFiles?: string[], hasConfigFiles?: boolean } | string} target
- * @param {string} action
- * @returns {{ disabled: boolean, reason: string | null }}
- */
-export function getComposeActionAvailability(target, action) {
-  const act = String(action || "").toLowerCase();
-  const hasFiles = hasUsableConfigFiles(target);
-  if (!hasFiles && (act === "up" || act === "build" || act === "pull")) {
-    return { disabled: true, reason: "compose file not found" };
-  }
-  return { disabled: false, reason: null };
-}
-
-/**
- * Builds compose CLI arguments for a project target and subcommand (DM-50..69).
- *
- * Emits `-p <project> --project-directory <dir> -f <file> …` when config files exist;
- * falls back to `-p <project>` when config files are missing, marking `up`/`build`/`pull`
- * as disabled with reason `compose file not found`.
- *
- * @param {{ project?: string, workingDir?: string, configFiles?: string[], hasConfigFiles?: boolean } | string} target
- * @param {string[]} [subcommandArgs=[]]
- * @returns {string[] & { disabled: boolean, reason: string | null, args: string[] }}
+ * @param {{ project: string, workingDir?: string | null, configFiles?: string[] }} target
+ * @param {string[]} subcommandArgs
+ * @returns {string[]}
  */
 export function buildComposeArgs(target, subcommandArgs = []) {
-  const t = typeof target === "string" ? { project: target } : target || {};
-  const project = t.project || "";
-  const hasFiles = hasUsableConfigFiles(t);
+  if (!target || !target.project) {
+    throw new Error("Target must specify a project name");
+  }
+  validateDockerIdentifier(target.project, "project name");
 
-  const base = ["compose", "-p", project];
-  if (hasFiles) {
-    if (t.workingDir) {
-      base.push("--project-directory", t.workingDir);
+  const files = Array.isArray(target.configFiles) ? target.configFiles.filter(Boolean) : [];
+  const args = ["compose", "-p", target.project];
+
+  if (files.length > 0) {
+    if (target.workingDir) {
+      args.push("--project-directory", target.workingDir);
     }
-    if (Array.isArray(t.configFiles)) {
-      for (const f of t.configFiles) {
-        base.push("-f", f);
-      }
+    for (const f of files) {
+      args.push("-f", f);
     }
   }
 
-  const result = [...base, ...subcommandArgs];
+  return [...args, ...subcommandArgs];
+}
 
-  // Determine if action is disabled due to missing compose files
-  const firstSub = subcommandArgs.length > 0 ? subcommandArgs[0].toLowerCase() : "";
-  const isUpOrBuildOrPull =
-    firstSub === "up" ||
-    firstSub === "build" ||
-    firstSub === "pull" ||
-    subcommandArgs.includes("up") ||
-    subcommandArgs.includes("build") ||
-    subcommandArgs.includes("pull");
-
-  let disabled = false;
-  let reason = null;
-  if (!hasFiles && isUpOrBuildOrPull) {
-    disabled = true;
-    reason = "compose file not found";
+// Lifecycle argv builders
+export function buildComposeUpArgs(target, { build = false, service = null } = {}) {
+  const sub = ["up", "-d"];
+  if (build) sub.push("--build");
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
   }
-
-  Object.defineProperty(result, "disabled", {
-    value: disabled,
-    enumerable: false,
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(result, "reason", {
-    value: reason,
-    enumerable: false,
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(result, "args", {
-    value: result,
-    enumerable: false,
-    writable: true,
-    configurable: true,
-  });
-
-  return result;
-}
-
-// -----------------------------------------------------------------------------
-// Exact CLI Argv Builders (Section 4.5 & 4.6)
-// -----------------------------------------------------------------------------
-
-/**
- * Service rebuild argv (DM-62).
- * `docker compose <target> up -d --build --force-recreate --no-deps <service>`
- */
-export function buildServiceRebuildArgs(target, service) {
-  return buildComposeArgs(target, ["up", "-d", "--build", "--force-recreate", "--no-deps", service]);
-}
-
-/**
- * Service recreate argv (DM-63).
- * `docker compose <target> up -d --force-recreate --no-deps <service>`
- */
-export function buildServiceRecreateArgs(target, service) {
-  return buildComposeArgs(target, ["up", "-d", "--force-recreate", "--no-deps", service]);
-}
-
-/**
- * Service remove argv (DM-69).
- * `docker compose <target> rm -s -f <service>`
- */
-export function buildServiceRmArgs(target, service) {
-  return buildComposeArgs(target, ["rm", "-s", "-f", service]);
-}
-
-/**
- * Project down argv (DM-58, DM-59).
- * `docker compose <target> down [-v]`
- */
-export function buildProjectDownArgs(target, { removeVolumes = false } = {}) {
-  const sub = removeVolumes ? ["down", "-v"] : ["down"];
   return buildComposeArgs(target, sub);
 }
 
-/**
- * Project down with volumes argv (DM-59).
- */
-export function buildProjectDownVolumesArgs(target) {
-  return buildComposeArgs(target, ["down", "-v"]);
+export function buildComposeDownArgs(target, { volumes = false } = {}) {
+  const sub = ["down"];
+  if (volumes) sub.push("-v");
+  return buildComposeArgs(target, sub);
 }
 
-/**
- * Service logs argv (DM-80).
- */
-export function buildServiceLogsArgs(target, service, { tail = 500 } = {}) {
-  const composeArgs = buildComposeArgs(target, []);
-  return ["docker", ...composeArgs, "logs", "-f", "--tail", String(tail), service];
+export function buildComposeStartArgs(target, service = null) {
+  const sub = ["start"];
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
+  }
+  return buildComposeArgs(target, sub);
 }
 
-/**
- * Container logs argv (DM-80).
- */
-export function buildContainerLogsArgs(containerId, { tail = 500 } = {}) {
+export function buildComposeStopArgs(target, service = null) {
+  const sub = ["stop"];
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
+  }
+  return buildComposeArgs(target, sub);
+}
+
+export function buildComposeRestartArgs(target, service = null) {
+  const sub = ["restart"];
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
+  }
+  return buildComposeArgs(target, sub);
+}
+
+export function buildComposePullArgs(target, service = null) {
+  const sub = ["pull"];
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
+  }
+  return buildComposeArgs(target, sub);
+}
+
+export function buildComposeBuildArgs(target, service = null) {
+  const sub = ["build"];
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
+  }
+  return buildComposeArgs(target, sub);
+}
+
+export function buildComposeRebuildArgs(target, service) {
+  if (!service) throw new Error("Service name is required for rebuild");
+  validateDockerIdentifier(service, "service name");
+  return buildComposeArgs(target, ["up", "-d", "--build", "--force-recreate", "--no-deps", service]);
+}
+
+export function buildComposeRecreateArgs(target, service) {
+  if (!service) throw new Error("Service name is required for recreate");
+  validateDockerIdentifier(service, "service name");
+  return buildComposeArgs(target, ["up", "-d", "--force-recreate", "--no-deps", service]);
+}
+
+export function buildComposeRmArgs(target, service) {
+  if (!service) throw new Error("Service name is required for rm");
+  validateDockerIdentifier(service, "service name");
+  return buildComposeArgs(target, ["rm", "-s", "-f", service]);
+}
+
+export function buildComposeLogsArgs(target, service = null, tail = 500) {
+  const sub = ["logs", "-f", "--tail", String(tail)];
+  if (service) {
+    validateDockerIdentifier(service, "service name");
+    sub.push(service);
+  }
+  return ["docker", ...buildComposeArgs(target, sub)];
+}
+
+export function buildContainerLogsArgs(containerId, tail = 500) {
+  validateDockerIdentifier(containerId, "container ID");
   return ["docker", "logs", "-f", "--tail", String(tail), containerId];
 }
 
-/**
- * Container shell argv (DM-81).
- */
-export function buildContainerShellArgs(containerId, shellCmd = "auto") {
-  if (shellCmd === "bash") {
+export function buildContainerShellArgs(containerId, shellType = "auto") {
+  validateDockerIdentifier(containerId, "container ID");
+  if (shellType === "bash") {
     return ["docker", "exec", "-it", containerId, "bash"];
   }
-  if (shellCmd === "sh") {
+  if (shellType === "sh") {
     return ["docker", "exec", "-it", containerId, "sh"];
   }
-  if (shellCmd !== "auto" && typeof shellCmd === "string") {
-    return ["docker", "exec", "-it", containerId, "sh", "-c", shellCmd];
-  }
+  // "auto": try bash, else fallback to sh
   return [
     "docker",
     "exec",
@@ -620,24 +308,32 @@ export function buildContainerShellArgs(containerId, shellCmd = "auto") {
   ];
 }
 
-/**
- * Container kill argv (DM-72).
- */
-export function buildContainerKillArgs(containerId) {
-  return ["kill", containerId];
+export function buildContainerActionArgs(action, containerId) {
+  validateDockerIdentifier(containerId, "container ID");
+  if (!["start", "stop", "restart", "pause", "unpause", "kill"].includes(action)) {
+    throw new Error(`Invalid container action: ${action}`);
+  }
+  return ["docker", action, containerId];
 }
 
-/**
- * Volume browse argv (DM-106).
- */
+export function buildContainerRmArgs(containerId, { force = false } = {}) {
+  validateDockerIdentifier(containerId, "container ID");
+  return ["docker", "rm", ...(force ? ["-f"] : []), containerId];
+}
+
+export function buildVolumeInspectArgs(volumeName) {
+  validateDockerIdentifier(volumeName, "volume name");
+  return ["volume", "inspect", "--format", "{{json .}}", volumeName];
+}
+
 export function buildVolumeBrowseArgs(volumeName, helperImage = "alpine:3") {
+  validateDockerIdentifier(volumeName, "volume name");
   return ["docker", "run", "--rm", "-it", "-v", `${volumeName}:/data:ro`, "-w", "/data", helperImage, "sh"];
 }
 
-/**
- * Volume backup argv (DM-107).
- */
 export function buildVolumeBackupArgs(volumeName, destDir, archiveName, helperImage = "alpine:3") {
+  validateDockerIdentifier(volumeName, "volume name");
+  validateDockerIdentifier(archiveName.replace(/\.tar\.gz$/, ""), "archive name");
   return [
     "run",
     "--rm",
@@ -655,10 +351,9 @@ export function buildVolumeBackupArgs(volumeName, destDir, archiveName, helperIm
   ];
 }
 
-/**
- * Volume restore argv (DM-108).
- */
 export function buildVolumeRestoreArgs(volumeName, srcDir, archiveName, helperImage = "alpine:3") {
+  validateDockerIdentifier(volumeName, "volume name");
+  validateDockerIdentifier(archiveName.replace(/\.tar\.gz$/, ""), "archive name");
   return [
     "run",
     "--rm",
@@ -673,353 +368,212 @@ export function buildVolumeRestoreArgs(volumeName, srcDir, archiveName, helperIm
   ];
 }
 
-/**
- * Volume clone argv (DM-109).
- */
 export function buildVolumeCloneArgs(srcVolume, destVolume, helperImage = "alpine:3") {
-  const createArgs = ["volume", "create", destVolume];
-  const copyArgs = [
-    "run",
-    "--rm",
-    "-v",
-    `${srcVolume}:/from:ro`,
-    "-v",
-    `${destVolume}:/to`,
-    helperImage,
-    "sh",
-    "-c",
-    "cp -a /from/. /to/",
-  ];
+  validateDockerIdentifier(srcVolume, "source volume");
+  validateDockerIdentifier(destVolume, "dest volume");
   return {
-    createArgs,
-    copyArgs,
+    createArgs: ["volume", "create", destVolume],
+    copyArgs: [
+      "run",
+      "--rm",
+      "-v",
+      `${srcVolume}:/from:ro`,
+      "-v",
+      `${destVolume}:/to`,
+      helperImage,
+      "sh",
+      "-c",
+      "cp -a /from/. /to/",
+    ],
   };
 }
 
-/**
- * Image prune dangling argv (DM-102).
- */
-export function buildImagePruneDanglingArgs() {
-  return ["image", "prune", "-f"];
+export function buildVolumePruneArgs(all = false) {
+  return ["volume", "prune", "-f", ...(all ? ["--all"] : [])];
 }
 
-/**
- * Image prune unused argv (DM-102).
- */
-export function buildImagePruneUnusedArgs() {
-  return ["image", "prune", "-a", "-f"];
+export function buildImageHistoryArgs(imageId) {
+  validateDockerIdentifier(imageId, "image ID");
+  return ["image", "history", "--no-trunc", "--format", "{{json .}}", imageId];
 }
 
-/**
- * System disk usage fast argv (DM-120).
- */
-export function buildSystemDfArgs() {
-  return ["system", "df", "--format", "{{json .}}"];
+export function buildImagePruneArgs({ all = false } = {}) {
+  return ["image", "prune", "-f", ...(all ? ["-a"] : [])];
 }
 
-/**
- * System disk usage verbose argv (DM-121).
- */
-export function buildSystemDfVerboseArgs() {
-  return ["system", "df", "-v", "--format", "json"];
+export function buildImageRmArgs(imageId, { force = false } = {}) {
+  validateDockerIdentifier(imageId, "image ID");
+  return ["image", "rm", ...(force ? ["-f"] : []), imageId];
 }
 
-/**
- * Builder prune argv (DM-122).
- */
+export function buildNetworkInspectArgs(networkId) {
+  validateDockerIdentifier(networkId, "network ID");
+  return ["network", "inspect", "--format", "{{json .}}", networkId];
+}
+
+export function buildNetworkPruneArgs() {
+  return ["network", "prune", "-f"];
+}
+
+export function buildNetworkRmArgs(networkId) {
+  validateDockerIdentifier(networkId, "network ID");
+  return ["network", "rm", networkId];
+}
+
+export function buildSystemDfArgs({ verbose = false } = {}) {
+  return verbose ? ["system", "df", "-v", "--format", "json"] : ["system", "df", "--format", "{{json .}}"];
+}
+
 export function buildBuilderPruneArgs({ olderThan7d = false } = {}) {
-  if (olderThan7d) {
-    return ["builder", "prune", "-f", "--filter", "until=168h"];
-  }
-  return ["builder", "prune", "-f"];
+  return ["builder", "prune", "-f", ...(olderThan7d ? ["--filter", "until=168h"] : [])];
 }
 
-// -----------------------------------------------------------------------------
-// System Df Parsers (DM-120, DM-121)
-// -----------------------------------------------------------------------------
-
 /**
- * Parses `docker system df` output, supporting both 4-line NDJSON and single-object JSON.
+ * Normalizes raw `docker inspect` JSON output into a structured ContainerInspect object (DM-40..45).
  *
- * @param {string | any} stdout
- * @returns {{ images: any, containers: any, volumes: any, buildCache: any, items: any[] }}
+ * @param {object} raw
+ * @returns {object}
  */
-export function parseSystemDf(stdout) {
-  const emptyResult = {
-    images: { type: "Images", totalCount: 0, active: 0, size: "0B", reclaimable: "0B" },
-    containers: { type: "Containers", totalCount: 0, active: 0, size: "0B", reclaimable: "0B" },
-    volumes: { type: "Local Volumes", totalCount: 0, active: 0, size: "0B", reclaimable: "0B" },
-    buildCache: { type: "Build Cache", totalCount: 0, active: 0, size: "0B", reclaimable: "0B" },
-    items: [],
+export function normalizeContainerInspect(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const id = raw.Id || "";
+  const shortId = id.slice(0, 12);
+  const name = (raw.Name || "").replace(/^\//, "");
+  const labels = raw.Config?.Labels || {};
+
+  const project = labels["com.docker.compose.project"] || null;
+  const service = labels["com.docker.compose.service"] || null;
+  const containerNumber = labels["com.docker.compose.container-number"] || null;
+  const sourceFile = labels["herdr.docker-manager.source"] || null;
+
+  // Ports extraction
+  const ports = [];
+  const portSettings = raw.NetworkSettings?.Ports || raw.HostConfig?.PortBindings || {};
+  for (const [key, bindings] of Object.entries(portSettings)) {
+    const [portStr, proto = "tcp"] = key.split("/");
+    const containerPort = parseInt(portStr, 10);
+    if (Array.isArray(bindings) && bindings.length > 0) {
+      for (const b of bindings) {
+        ports.push({
+          hostIp: b.HostIp || "0.0.0.0",
+          hostPort: parseInt(b.HostPort, 10) || null,
+          containerPort,
+          proto,
+        });
+      }
+    } else {
+      ports.push({
+        hostIp: null,
+        hostPort: null,
+        containerPort,
+        proto,
+      });
+    }
+  }
+
+  // Mounts extraction
+  const mounts = (raw.Mounts || []).map((m) => ({
+    type: m.Type || "bind",
+    name: m.Name || null,
+    source: m.Source || "",
+    destination: m.Destination || "",
+    rw: m.RW !== false,
+    driver: m.Driver || null,
+  }));
+
+  // Networks extraction
+  const networks = Object.entries(raw.NetworkSettings?.Networks || {}).map(([netName, net]) => ({
+    name: netName,
+    ipAddress: net.IPAddress || "",
+    gateway: net.Gateway || "",
+    macAddress: net.MacAddress || "",
+    aliases: net.Aliases || [],
+    networkId: net.NetworkID ? net.NetworkID.slice(0, 12) : "",
+  }));
+
+  // Environment extraction with secret masking
+  const env = (raw.Config?.Env || []).map((entry) => {
+    const eqIdx = entry.indexOf("=");
+    if (eqIdx >= 0) {
+      const k = entry.slice(0, eqIdx);
+      const v = entry.slice(eqIdx + 1);
+      return { key: k, value: v, secret: isSecretEnvKey(k) };
+    }
+    return { key: entry, value: "", secret: isSecretEnvKey(entry) };
+  });
+
+  const entrypoint = Array.isArray(raw.Config?.Entrypoint)
+    ? raw.Config.Entrypoint.join(" ")
+    : raw.Config?.Entrypoint || "";
+  const cmd = Array.isArray(raw.Config?.Cmd)
+    ? raw.Config.Cmd.join(" ")
+    : raw.Config?.Cmd || "";
+
+  const composeFiles = labels["com.docker.compose.project.config_files"]
+    ? labels["com.docker.compose.project.config_files"].split(",")
+    : [];
+
+  return {
+    id,
+    shortId,
+    name,
+    project,
+    service,
+    containerNumber,
+    sourceFile,
+    image: raw.Config?.Image || "",
+    imageId: raw.Image ? raw.Image.replace(/^sha256:/, "").slice(0, 12) : "",
+    created: raw.Created || "",
+    startedAt: raw.State?.StartedAt || "",
+    finishedAt: raw.State?.FinishedAt || "",
+    state: {
+      status: raw.State?.Status || "unknown",
+      running: Boolean(raw.State?.Running),
+      paused: Boolean(raw.State?.Paused),
+      restarting: Boolean(raw.State?.Restarting),
+      oomKilled: Boolean(raw.State?.OOMKilled),
+      dead: Boolean(raw.State?.Dead),
+      exitCode: raw.State?.ExitCode ?? 0,
+      error: raw.State?.Error || "",
+    },
+    health: {
+      status: raw.State?.Health?.Status || null,
+      failingStreak: raw.State?.Health?.FailingStreak ?? 0,
+      lastLog:
+        raw.State?.Health?.Log && raw.State.Health.Log.length > 0
+          ? raw.State.Health.Log[raw.State.Health.Log.length - 1].Output || ""
+          : "",
+    },
+    restartPolicy: {
+      name: raw.HostConfig?.RestartPolicy?.Name || "no",
+      maximumRetryCount: raw.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0,
+    },
+    ports,
+    mounts,
+    networks,
+    env,
+    entrypoint,
+    cmd,
+    workingDir: raw.Config?.WorkingDir || "",
+    labels,
+    composeFiles,
+    dependsOn: labels["com.docker.compose.depends_on"] || "",
   };
-
-  if (!stdout) return emptyResult;
-
-  let rawList = [];
-
-  if (typeof stdout === "object") {
-    if (Array.isArray(stdout)) {
-      rawList = stdout;
-    } else {
-      // Single object mapping types
-      for (const [k, v] of Object.entries(stdout)) {
-        if (v && typeof v === "object") {
-          rawList.push({ Type: k, ...v });
-        }
-      }
-    }
-  } else if (typeof stdout === "string") {
-    const trimmed = stdout.trim();
-    if (!trimmed) return emptyResult;
-
-    // Try parsing as single JSON document first
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        rawList = parsed;
-      } else if (typeof parsed === "object" && parsed !== null) {
-        for (const [k, v] of Object.entries(parsed)) {
-          if (Array.isArray(v) && v.length > 0 && typeof v[0] === "object") {
-            rawList.push({ Type: k, ...v[0] });
-          } else if (v && typeof v === "object") {
-            rawList.push({ Type: k, ...v });
-          }
-        }
-      }
-    } catch {
-      // NDJSON fallback (one JSON object per line)
-      const lines = trimmed.split("\n");
-      for (const line of lines) {
-        const l = line.trim();
-        if (!l) continue;
-        try {
-          rawList.push(JSON.parse(l));
-        } catch {
-          // ignore corrupted lines
-        }
-      }
-    }
-  }
-
-  const result = { ...emptyResult, items: [] };
-
-  for (const item of rawList) {
-    const typeStr = String(item.Type || item.type || "").toLowerCase();
-    const entry = {
-      type: item.Type || item.type || "",
-      totalCount: Number(item.TotalCount ?? item.totalCount ?? 0),
-      active: Number(item.Active ?? item.active ?? 0),
-      size: String(item.Size ?? item.size ?? "0B"),
-      reclaimable: String(item.Reclaimable ?? item.reclaimable ?? "0B"),
-      raw: item,
-    };
-
-    result.items.push(entry);
-
-    if (typeStr.includes("image")) {
-      result.images = entry;
-    } else if (typeStr.includes("container")) {
-      result.containers = entry;
-    } else if (typeStr.includes("volume")) {
-      result.volumes = entry;
-    } else if (typeStr.includes("cache") || typeStr.includes("build")) {
-      result.buildCache = entry;
-    }
-  }
-
-  return result;
 }
 
 /**
- * Parses `docker system df -v` output, supporting both single-object JSON and NDJSON.
+ * Builds the hierarchical container tree according to DM-20..27, DM-35..36.
  *
- * @param {string | any} stdout
- * @returns {{ images: any[], containers: any[], volumes: any[], buildCache: any[] }}
- */
-export function parseSystemDfVerbose(stdout) {
-  const result = {
-    images: [],
-    containers: [],
-    volumes: [],
-    buildCache: [],
-  };
-
-  if (!stdout) return result;
-
-  let parsed = null;
-  if (typeof stdout === "object") {
-    parsed = stdout;
-  } else if (typeof stdout === "string") {
-    const trimmed = stdout.trim();
-    if (!trimmed) return result;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      // NDJSON fallback
-      const lines = trimmed.split("\n");
-      const list = [];
-      for (const line of lines) {
-        const l = line.trim();
-        if (l) {
-          try {
-            list.push(JSON.parse(l));
-          } catch {}
-        }
-      }
-      parsed = list;
-    }
-  }
-
-  if (!parsed) return result;
-
-  if (Array.isArray(parsed)) {
-    for (const item of parsed) {
-      if (item.Images) result.images.push(...item.Images);
-      if (item.Containers) result.containers.push(...item.Containers);
-      if (item.Volumes) result.volumes.push(...item.Volumes);
-      if (item.BuildCache) result.buildCache.push(...item.BuildCache);
-    }
-  } else if (typeof parsed === "object") {
-    result.images = parsed.Images || parsed.images || [];
-    result.containers = parsed.Containers || parsed.containers || [];
-    result.volumes = parsed.Volumes || parsed.volumes || [];
-    result.buildCache = parsed.BuildCache || parsed.buildCache || [];
-  }
-
-  return result;
-}
-
-// -----------------------------------------------------------------------------
-// Context Menu Positioning (DM-14, DESIGN Section 5)
-// -----------------------------------------------------------------------------
-
-/**
- * Calculates clamped and flipped coordinates for an in-panel context menu overlay.
- *
- * Clamps within container bounds and flips upwards or to the left when near
- * right/bottom edges to prevent overflow.
- *
- * @param {any} options
- * @returns {{ x: number, y: number }}
- */
-export function contextMenuPosition(options) {
-  let x = 120;
-  let y = 120;
-  let menuWidth = 180;
-  let menuHeight = 200;
-  let maxW = 600;
-  let maxH = 600;
-  const margin = 10;
-
-  if (arguments.length >= 4 && typeof arguments[0] === "number") {
-    // Positional signature: (x, y, menuWidth, menuHeight, bounds)
-    x = arguments[0];
-    y = arguments[1];
-    menuWidth = arguments[2] || menuWidth;
-    menuHeight = arguments[3] || menuHeight;
-    const b = arguments[4];
-    if (b) {
-      maxW = b.width || maxW;
-      maxH = b.height || maxH;
-    }
-  } else if (options && typeof options === "object") {
-    const bounds = options.bounds;
-    maxW = options.width || bounds?.width || 600;
-    maxH = options.height || bounds?.height || 600;
-    menuWidth = options.menuWidth || menuWidth;
-    menuHeight = options.menuHeight || menuHeight;
-
-    if (typeof options.x === "number") {
-      x = options.x;
-    } else if (typeof options.overrideX === "number") {
-      x = options.overrideX;
-    } else if (typeof options.event?.position?.x === "number") {
-      const paneX = options.origin?.x ?? (bounds && bounds.x > 0 ? bounds.x : 0);
-      x = options.event.position.x - paneX;
-    } else if (typeof options.defaultX === "number") {
-      x = options.defaultX;
-    }
-
-    if (typeof options.y === "number") {
-      y = options.y;
-    } else if (typeof options.overrideY === "number") {
-      y = options.overrideY;
-    } else if (typeof options.event?.position?.y === "number") {
-      const paneY = options.origin?.y ?? (bounds && bounds.y > 0 ? bounds.y : 0);
-      y = options.event.position.y - paneY;
-    } else if (typeof options.defaultY === "number") {
-      y = options.defaultY;
-    }
-  }
-
-  // Horizontal placement: flip to left if overflowing right edge
-  if (x + menuWidth > maxW - margin) {
-    if (x - menuWidth >= margin) {
-      x = x - menuWidth;
-    } else {
-      x = Math.max(margin, maxW - menuWidth - margin);
-    }
-  }
-  if (x < margin) x = margin;
-
-  // Vertical placement: flip upwards if overflowing bottom edge
-  if (y + menuHeight > maxH - margin) {
-    if (y - menuHeight >= margin) {
-      y = y - menuHeight;
-    } else {
-      y = Math.max(margin, maxH - menuHeight - margin);
-    }
-  }
-  if (y < margin) y = margin;
-
-  return { x: Math.round(x), y: Math.round(y) };
-}
-
-// -----------------------------------------------------------------------------
-// Container Tree Construction (DM-20..27, DM-30..36, DESIGN Section 4.3)
-// -----------------------------------------------------------------------------
-
-/**
- * Checks whether childPath is equal to or inside parentDir.
- *
- * @param {string | null | undefined} childPath
- * @param {string | null | undefined} parentDir
- * @returns {boolean}
- */
-export function isPathEqualOrInside(childPath, parentDir) {
-  if (!childPath || !parentDir) return false;
-  const child = childPath.replace(/\/+$/, "");
-  const parent = parentDir.replace(/\/+$/, "");
-  if (child === parent) return true;
-  return child.startsWith(parent + "/");
-}
-
-/**
- * Builds the hierarchical container tree for Docker Manager (DM-20..27).
- *
- * Groups by:
- * 1. Compose projects (Project -> Service -> Container)
- * 2. Dockerfile targets (Dockerfile -> Containers with `herdr.docker-manager.source`)
- * 3. Standalone containers
- *
- * Merges declared services from `compose config` (synthesizing `not-created` services),
- * separates inactive profiles, computes `mixedSources` when `working_dir` differs,
- * sets `inSpace` flag, and applies `scope: "space"` vs `scope: "all"`.
- *
- * @param {{
- *   containers?: any[],
- *   composeLs?: any[],
- *   discoveredCompose?: any[],
- *   discoveredDockerfiles?: any[],
- *   spaceRoot?: string | null,
- *   scope?: "space" | "all",
- *   activeProfiles?: string[],
- * }} options
- * @returns {{
- *   projects: any[],
- *   dockerfiles: any[],
- *   standalone: any[],
- * }}
+ * @param {object} params
+ * @param {Array<object>} params.containers - Normalized containers from docker container ls -a
+ * @param {Array<object>} [params.composeLs] - Output from docker compose ls --all
+ * @param {Array<object>} [params.discoveredCompose] - Discovered compose files in workspace
+ * @param {Array<object>} [params.discoveredDockerfiles] - Discovered Dockerfiles in workspace
+ * @param {string} [params.spaceRoot] - Root directory of the space
+ * @param {"all" | "space"} [params.scope="all"] - Filtering scope
+ * @param {string} [params.filter=""] - Text search filter (DM-12)
+ * @returns {Array<object>}
  */
 export function buildContainerTree({
   containers = [],
@@ -1028,1238 +582,1200 @@ export function buildContainerTree({
   discoveredDockerfiles = [],
   spaceRoot = null,
   scope = "all",
-  activeProfiles = [],
+  filter = "",
 } = {}) {
-  const projectsMap = new Map();
+  const normFilter = (filter || "").trim().toLowerCase();
 
-  // Helper to ensure project node in map
-  function getOrCreateProject(name) {
-    if (!projectsMap.has(name)) {
-      projectsMap.set(name, {
+  // Helper: check if a container matches filter query
+  function containerMatchesFilter(c) {
+    if (!normFilter) return true;
+    const name = (c.name || c.Names || "").toLowerCase();
+    const image = (c.image || c.Image || "").toLowerCase();
+    const service = (c.service || "").toLowerCase();
+    const project = (c.project || "").toLowerCase();
+    const ports = (c.ports || c.Ports || "").toLowerCase();
+    return (
+      name.includes(normFilter) ||
+      image.includes(normFilter) ||
+      service.includes(normFilter) ||
+      project.includes(normFilter) ||
+      ports.includes(normFilter)
+    );
+  }
+
+  // Step 1: Normalize all container rows
+  const normalizedContainers = containers.map((c) => {
+    const rawLabels = c.Labels || c.labels || "";
+    const labels = typeof rawLabels === "string" ? parseContainerLabels(rawLabels) : { ...rawLabels };
+    const project = labels["com.docker.compose.project"] || null;
+    const service = labels["com.docker.compose.service"] || null;
+    const containerNumber = parseInt(labels["com.docker.compose.container-number"] || "1", 10);
+    const workingDir = labels["com.docker.compose.project.working_dir"] || null;
+    const configFilesStr = labels["com.docker.compose.project.config_files"] || "";
+    const configFiles = configFilesStr ? configFilesStr.split(",") : [];
+    const sourceLabel = labels["herdr.docker-manager.source"] || null;
+    const rawState = (c.State || c.state || "").toLowerCase();
+    const rawStatus = c.Status || c.status || "";
+    const running = rawState === "running" || rawStatus.toLowerCase().startsWith("up");
+    const id = c.ID || c.Id || c.id || "";
+    const name = (c.Names || c.names || c.Name || c.name || "").replace(/^\//, "");
+    const image = c.Image || c.image || "";
+    const ports = c.Ports || c.ports || "";
+
+    return {
+      id,
+      shortId: id.slice(0, 12),
+      name,
+      image,
+      ports,
+      project,
+      service,
+      containerNumber,
+      workingDir,
+      configFiles,
+      sourceLabel,
+      state: rawState || (running ? "running" : "exited"),
+      status: rawStatus,
+      running,
+      labels,
+    };
+  });
+
+  // Step 2: Assemble Compose Projects
+  const projectMap = new Map();
+
+  // Seed projects from compose ls
+  for (const item of composeLs) {
+    const name = item.Name || item.name;
+    if (name && !projectMap.has(name)) {
+      const configFiles = (item.ConfigFiles || item.configFiles || "").split(",").filter(Boolean);
+      projectMap.set(name, {
         name,
-        type: "compose",
-        status: "not-created",
-        runningCount: 0,
-        totalCount: 0,
+        containers: [],
+        configFiles,
         workingDirs: new Set(),
-        configFiles: new Set(),
-        servicesMap: new Map(),
-        inactiveProfiles: [],
         discoveredConfig: null,
-        mixedSources: false,
-        inSpace: false,
       });
     }
-    return projectsMap.get(name);
   }
 
-  // 1. Seed from `docker compose ls`
-  for (const row of composeLs) {
-    const name = row.Name || row.name;
-    if (!name) continue;
-    const proj = getOrCreateProject(name);
-    if (row.ConfigFiles || row.configFiles) {
-      const files = String(row.ConfigFiles || row.configFiles).split(",");
-      for (const f of files) {
-        if (f.trim()) proj.configFiles.add(f.trim());
-      }
-    }
-  }
-
-  // 2. Seed from discovered Compose configs
-  const discoveredList = Array.isArray(discoveredCompose)
-    ? discoveredCompose
-    : Object.values(discoveredCompose);
-
-  for (const disc of discoveredList) {
-    if (!disc) continue;
-    const name = disc.project || disc.name || (disc.config && disc.config.name);
-    if (!name) continue;
-    const proj = getOrCreateProject(name);
-    proj.discoveredConfig = disc;
-
-    if (disc.workingDir) {
-      proj.workingDirs.add(disc.workingDir);
-    }
-    if (disc.file) {
-      proj.configFiles.add(disc.file);
-    }
-    if (Array.isArray(disc.files)) {
-      for (const f of disc.files) proj.configFiles.add(f);
-    }
-  }
-
-  // 3. Process containers
-  const dockerfileContainers = [];
-  const standaloneContainers = [];
-
-  for (const rawCont of containers) {
-    const labels = parseContainerLabels(rawCont.Labels || rawCont.labels);
-    const projectName = labels["com.docker.compose.project"];
-    const serviceName = labels["com.docker.compose.service"];
-    const sourceDockerfile = labels["herdr.docker-manager.source"];
-
-    const id = rawCont.ID || rawCont.Id || rawCont.id || "";
-    const shortId = id.slice(0, 12);
-    const rawName = rawCont.Names || rawCont.Name || rawCont.name || "";
-    const name = rawName.replace(/^\//, "");
-    const state = String(rawCont.State || rawCont.state || "").toLowerCase();
-    const status = String(rawCont.Status || rawCont.status || "");
-    const isRunning = state === "running" || status.toLowerCase().startsWith("up");
-    const containerNumber = labels["com.docker.compose.container-number"] || "1";
-
-    const contNode = {
-      id,
-      shortId,
-      name,
-      state,
-      status,
-      isRunning,
-      containerNumber,
-      image: rawCont.Image || rawCont.image || "",
-      ports: rawCont.Ports || rawCont.ports || "",
-      labels,
-      raw: rawCont,
-    };
-
-    if (projectName) {
-      // Compose container
-      const proj = getOrCreateProject(projectName);
-      proj.totalCount += 1;
-      if (isRunning) proj.runningCount += 1;
-
-      const wd = labels["com.docker.compose.project.working_dir"];
-      if (wd) proj.workingDirs.add(wd);
-
-      const cf = labels["com.docker.compose.project.config_files"];
-      if (cf) {
-        for (const f of cf.split(",")) {
-          if (f.trim()) proj.configFiles.add(f.trim());
-        }
-      }
-
-      const svcKey = serviceName || name;
-      if (!proj.servicesMap.has(svcKey)) {
-        proj.servicesMap.set(svcKey, {
-          name: svcKey,
-          project: projectName,
-          status: status || state,
-          running: isRunning,
+  // Seed projects from discovered compose files
+  for (const disc of discoveredCompose) {
+    const name = disc.project;
+    if (name) {
+      if (!projectMap.has(name)) {
+        projectMap.set(name, {
+          name,
           containers: [],
-          declared: false,
-          config: null,
-          ports: contNode.ports,
+          configFiles: [disc.filePath],
+          workingDirs: new Set(disc.folder ? [disc.folder] : []),
+          discoveredConfig: disc,
+        });
+      } else {
+        const p = projectMap.get(name);
+        if (!p.discoveredConfig) p.discoveredConfig = disc;
+        if (disc.filePath && !p.configFiles.includes(disc.filePath)) {
+          p.configFiles.push(disc.filePath);
+        }
+        if (disc.folder) p.workingDirs.add(disc.folder);
+      }
+    }
+  }
+
+  // Add containers to their Compose projects
+  const nonComposeContainers = [];
+  for (const c of normalizedContainers) {
+    if (c.project) {
+      if (!projectMap.has(c.project)) {
+        projectMap.set(c.project, {
+          name: c.project,
+          containers: [],
+          configFiles: [...c.configFiles],
+          workingDirs: new Set(),
+          discoveredConfig: null,
         });
       }
-      const svcNode = proj.servicesMap.get(svcKey);
-      svcNode.containers.push(contNode);
-      if (isRunning) svcNode.running = true;
-    } else if (sourceDockerfile) {
-      // Container carrying `herdr.docker-manager.source`
-      dockerfileContainers.push({
-        source: sourceDockerfile,
-        container: contNode,
-      });
+      const p = projectMap.get(c.project);
+      p.containers.push(c);
+      if (c.workingDir) p.workingDirs.add(c.workingDir);
+      for (const cf of c.configFiles) {
+        if (!p.configFiles.includes(cf)) p.configFiles.push(cf);
+      }
     } else {
-      // Standalone container
-      standaloneContainers.push(contNode);
+      nonComposeContainers.push(c);
     }
   }
 
-  // 4. Finalize Compose projects
-  const projects = [];
+  // Build Compose Project Nodes
+  const projectNodes = [];
+  for (const [projName, projData] of projectMap.entries()) {
+    const workingDirsList = Array.from(projData.workingDirs);
+    const mixedSources = workingDirsList.length > 1; // DM-25
 
-  for (const proj of projectsMap.values()) {
-    // Check mixedSources (DM-25)
-    proj.mixedSources = proj.workingDirs.size > 1;
-
-    // Check inSpace (DM-21)
+    // inSpace determination
+    let inSpace = false;
     if (spaceRoot) {
-      let matchedSpace = false;
-      for (const wd of proj.workingDirs) {
-        if (isPathEqualOrInside(wd, spaceRoot)) {
-          matchedSpace = true;
-          break;
-        }
-      }
-      if (!matchedSpace) {
-        for (const cf of proj.configFiles) {
-          if (isPathEqualOrInside(cf, spaceRoot)) {
-            matchedSpace = true;
-            break;
-          }
-        }
-      }
-      proj.inSpace = matchedSpace;
-    } else {
-      proj.inSpace = false;
+      inSpace =
+        workingDirsList.some((dir) => isPathInside(spaceRoot, dir)) ||
+        projData.configFiles.some((f) => isPathInside(spaceRoot, f)) ||
+        Boolean(projData.discoveredConfig && isPathInside(spaceRoot, projData.discoveredConfig.filePath));
     }
 
-    // Merge declared services from compose config
-    const declaredServices =
-      proj.discoveredConfig?.config?.services ||
-      proj.discoveredConfig?.services ||
-      null;
+    // Scope filtering (DM-36)
+    if (scope === "space" && !inSpace) {
+      continue;
+    }
 
-    const declaredOrder = new Map();
+    // Assemble services
+    const serviceMap = new Map();
+    for (const c of projData.containers) {
+      const sName = c.service || "default";
+      if (!serviceMap.has(sName)) {
+        serviceMap.set(sName, []);
+      }
+      serviceMap.get(sName).push(c);
+    }
 
-    if (declaredServices && typeof declaredServices === "object") {
-      let orderIdx = 0;
-      for (const [svcName, svcConfig] of Object.entries(declaredServices)) {
-        declaredOrder.set(svcName, orderIdx++);
-        const svcProfiles = Array.isArray(svcConfig?.profiles) ? svcConfig.profiles : [];
-        const isInactiveProfile =
-          svcProfiles.length > 0 &&
-          !svcProfiles.some((p) => activeProfiles.includes(p));
+    // Include declared services from discovered compose config (DM-24, DM-33)
+    const declaredServices = projData.discoveredConfig?.config?.services || {};
+    const inactiveProfilesList = [];
+    const activeProfiles = projData.discoveredConfig?.activeProfiles || [];
 
-        if (proj.servicesMap.has(svcName)) {
-          const existing = proj.servicesMap.get(svcName);
-          existing.declared = true;
-          existing.config = svcConfig;
-          existing.declaredOrder = orderIdx;
+    for (const [sName, sCfg] of Object.entries(declaredServices)) {
+      const sProfiles = sCfg.profiles || [];
+      const isInactive = sProfiles.length > 0 && !sProfiles.some((p) => activeProfiles.includes(p));
+
+      if (isInactive) {
+        inactiveProfilesList.push({
+          name: sName,
+          profiles: sProfiles,
+          image: sCfg.image || sCfg.build || "",
+          ports: sCfg.ports || [],
+        });
+        continue;
+      }
+
+      if (!serviceMap.has(sName)) {
+        serviceMap.set(sName, []); // Service declared but not created (0 containers)
+      }
+    }
+
+    // Construct service nodes
+    const serviceNodes = [];
+    for (const [sName, svcContainers] of serviceMap.entries()) {
+      svcContainers.sort((a, b) => a.containerNumber - b.containerNumber);
+
+      const notCreated = svcContainers.length === 0;
+      const runningCount = svcContainers.filter((c) => c.running).length;
+      const totalCount = svcContainers.length;
+
+      let statusText = "not created";
+      let statusColor = "dim";
+      let portsText = "";
+
+      if (!notCreated) {
+        if (runningCount === totalCount && totalCount > 0) {
+          statusText = svcContainers[0].status || "running";
+          statusColor = "done";
+        } else if (runningCount > 0) {
+          statusText = `${runningCount}/${totalCount} running`;
+          statusColor = "working";
         } else {
-          // Service present in compose config with 0 containers
-          if (isInactiveProfile) {
-            // Inactive profile service (DM-33)
-            proj.inactiveProfiles.push({
-              name: svcName,
-              project: proj.name,
-              status: "not-created",
-              created: false,
-              running: false,
-              profiles: svcProfiles,
-              config: svcConfig,
-              declaredOrder: orderIdx,
-              containers: [],
-            });
-          } else {
-            // Synthetic not-created service (DM-24)
-            proj.servicesMap.set(svcName, {
-              name: svcName,
-              project: proj.name,
-              status: "not-created",
-              created: false,
-              running: false,
-              declared: true,
-              config: svcConfig,
-              declaredOrder: orderIdx,
-              containers: [],
-              ports: "",
-            });
-          }
+          statusText = svcContainers[0].status || "stopped";
+          statusColor = "muted";
+        }
+        portsText = svcContainers.map((c) => c.ports).filter(Boolean).join(", ");
+      } else {
+        const declared = declaredServices[sName];
+        if (declared && declared.ports) {
+          portsText = Array.isArray(declared.ports)
+            ? declared.ports.map((p) => (typeof p === "string" ? p : `${p.published}→${p.target}`)).join(", ")
+            : "";
         }
       }
+
+      serviceNodes.push({
+        kind: "service",
+        project: projName,
+        name: sName,
+        containers: svcContainers,
+        notCreated,
+        runningCount,
+        totalCount,
+        statusText,
+        statusColor,
+        portsText,
+      });
     }
 
-    // Sort services and replicas
-    const services = Array.from(proj.servicesMap.values());
-    services.sort((a, b) => {
-      const idxA = declaredOrder.has(a.name) ? declaredOrder.get(a.name) : 9999;
-      const idxB = declaredOrder.has(b.name) ? declaredOrder.get(b.name) : 9999;
-      if (idxA !== idxB) return idxA - idxB;
+    // Sort services: declaration order if known, then alphabetical
+    const declaredKeys = Object.keys(declaredServices);
+    serviceNodes.sort((a, b) => {
+      const idxA = declaredKeys.indexOf(a.name);
+      const idxB = declaredKeys.indexOf(b.name);
+      if (idxA >= 0 && idxB >= 0) return idxA - idxB;
+      if (idxA >= 0) return -1;
+      if (idxB >= 0) return 1;
       return a.name.localeCompare(b.name);
     });
 
-    for (const svc of services) {
-      svc.containers.sort((a, b) => {
-        const numA = parseInt(a.containerNumber || "1", 10) || 1;
-        const numB = parseInt(b.containerNumber || "1", 10) || 1;
-        if (numA !== numB) return numA - numB;
-        return a.name.localeCompare(b.name);
-      });
+    // Project aggregate status
+    const allContainers = projData.containers;
+    const runningContainersCount = allContainers.filter((c) => c.running).length;
+    const totalContainersCount = allContainers.length;
+    const isProjectNotCreated = totalContainersCount === 0;
+
+    let aggregateStatus = "stopped";
+    let aggregateColor = "muted";
+
+    if (isProjectNotCreated) {
+      aggregateStatus = "not-created";
+      aggregateColor = "dim";
+    } else if (runningContainersCount === totalContainersCount) {
+      aggregateStatus = "running";
+      aggregateColor = "done";
+    } else if (runningContainersCount > 0) {
+      aggregateStatus = "partial";
+      aggregateColor = "working";
     }
 
-    // Aggregate status
-    if (proj.totalCount === 0) {
-      proj.status = "not-created";
-    } else {
-      proj.status = aggregateProjectStatus(services);
-    }
+    // Basenames of compose files
+    const composeBasenames = projData.configFiles
+      .map((f) => f.split("/").pop())
+      .filter(Boolean)
+      .join(", ");
 
-    proj.services = services;
-    proj.workingDir = proj.workingDirs.values().next().value || "";
-    proj.configFilesList = Array.from(proj.configFiles);
-
-    // Apply scope filter
-    if (scope === "space") {
-      if (proj.inSpace) {
-        projects.push(proj);
-      }
-    } else {
-      projects.push(proj);
-    }
+    projectNodes.push({
+      kind: "project",
+      name: projName,
+      inSpace,
+      mixedSources,
+      workingDirs: workingDirsList,
+      configFiles: projData.configFiles,
+      composeBasenames,
+      runningCount: runningContainersCount,
+      totalCount: totalContainersCount,
+      notCreated: isProjectNotCreated,
+      status: aggregateStatus,
+      statusColor: aggregateColor,
+      services: serviceNodes,
+      inactiveProfiles: inactiveProfilesList,
+    });
   }
 
-  // Stable sort projects (DM-27): inSpace first, then alphabetical
-  projects.sort((a, b) => {
+  // Sort projects: inSpace first, then alphabetical (DM-20, DM-27)
+  projectNodes.sort((a, b) => {
     if (a.inSpace !== b.inSpace) return a.inSpace ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
 
-  // 5. Finalize Dockerfiles
-  const dockerfilesMap = new Map();
-  const discDfList = Array.isArray(discoveredDockerfiles)
-    ? discoveredDockerfiles
-    : Object.values(discoveredDockerfiles);
+  // Step 3: Dockerfile projects (DM-34)
+  const dockerfileContainers = [];
+  const standaloneContainers = [];
 
-  for (const item of discDfList) {
-    const p = typeof item === "string" ? item : item.path || item.absPath;
-    if (!p) continue;
-    dockerfilesMap.set(p, {
-      path: p,
-      absPath: typeof item === "object" ? item.absPath || p : p,
-      inSpace: spaceRoot ? isPathEqualOrInside(p, spaceRoot) : false,
+  for (const c of nonComposeContainers) {
+    if (c.sourceLabel) {
+      dockerfileContainers.push(c);
+    } else {
+      standaloneContainers.push(c);
+    }
+  }
+
+  const dockerfileMap = new Map();
+  // Seed with discovered Dockerfiles
+  for (const df of discoveredDockerfiles) {
+    const rel = df.relativePath || (spaceRoot && df.filePath.startsWith(spaceRoot) ? df.filePath.slice(spaceRoot.length).replace(/^\//, "") : df.filePath);
+    dockerfileMap.set(df.filePath, {
+      filePath: df.filePath,
+      relativePath: rel,
       containers: [],
     });
   }
 
-  for (const { source, container } of dockerfileContainers) {
-    if (!dockerfilesMap.has(source)) {
-      dockerfilesMap.set(source, {
-        path: source,
-        absPath: source,
-        inSpace: spaceRoot ? isPathEqualOrInside(source, spaceRoot) : false,
+  // Add matching containers
+  for (const c of dockerfileContainers) {
+    if (!dockerfileMap.has(c.sourceLabel)) {
+      const rel = spaceRoot && c.sourceLabel.startsWith(spaceRoot)
+        ? c.sourceLabel.slice(spaceRoot.length).replace(/^\//, "")
+        : c.sourceLabel;
+      dockerfileMap.set(c.sourceLabel, {
+        filePath: c.sourceLabel,
+        relativePath: rel,
         containers: [],
       });
     }
-    dockerfilesMap.get(source).containers.push(container);
+    dockerfileMap.get(c.sourceLabel).containers.push(c);
   }
 
-  let dockerfiles = Array.from(dockerfilesMap.values());
-  if (scope === "space") {
-    dockerfiles = dockerfiles.filter((df) => df.inSpace);
-  }
+  const dockerfileNodes = [];
+  for (const [fPath, dfData] of dockerfileMap.entries()) {
+    const inSpace = spaceRoot ? isPathInside(spaceRoot, fPath) : false;
+    if (scope === "space" && !inSpace) continue;
 
-  // 6. Finalize Standalone Containers (DM-36)
-  // Standalone containers are hidden when scope === "space"
-  const standalone = scope === "space" ? [] : standaloneContainers;
-
-  return {
-    projects,
-    dockerfiles,
-    standalone,
-  };
-}
-
-/**
- * Resolves the space root directory and remote machine identifier (DESIGN Section 3).
- *
- * Follows the workspace standard:
- * 1. props.folder || props.cwd and props.on
- * 2. Active space pinned location -> focused cwd -> space.folder
- *
- * @param {any} context
- * @returns {{ root: string | null, machine: string | null }}
- */
-export function resolveDockerContext({
-  props: getProps = {},
-  spaces: getSpaces = () => [],
-  panes: _getPanes = () => [],
-  terminals: _getTerminals = () => [],
-  focused: getFocused = () => null,
-  shared: getShared = () => null,
-  currentRoot = null,
-} = {}) {
-  const rawP = typeof getProps === "function" ? getProps() : getProps;
-  const p = rawP || {};
-  if (p.folder || p.cwd) {
-    return {
-      root: p.folder || p.cwd,
-      machine: p.on ?? null,
-    };
-  }
-
-  const rawSpaces = typeof getSpaces === "function" ? getSpaces() : getSpaces;
-  const spaceList = Array.isArray(rawSpaces) ? rawSpaces : [];
-  const activeSpace = spaceList.find((s) => s && s.active) || spaceList[0];
-  if (activeSpace) {
-    const machine = activeSpace.machine ?? null;
-    const pinnedMap = typeof getShared === "function" ? getShared("spaces.pinned_locations") : null;
-    const pinned = pinnedMap && activeSpace.id ? pinnedMap[activeSpace.id] : null;
-    if (pinned) {
-      return { root: pinned, machine };
-    }
-    const foc = typeof getFocused === "function" ? getFocused() : null;
-    if (foc && foc.space === activeSpace.id && foc.cwd) {
-      return { root: foc.cwd, machine };
-    }
-    return { root: activeSpace.folder || currentRoot || null, machine };
-  }
-
-  return { root: currentRoot || null, machine: null };
-}
-
-/**
- * Determines whether a layout node is visible in the current window tree.
- *
- * @param {any} root
- * @param {string | ((node: any) => boolean)} targetOrPredicate
- * @returns {boolean}
- */
-export function isLayoutNodeVisible(root, targetOrPredicate) {
-  if (!root) return true;
-  const match =
-    typeof targetOrPredicate === "function"
-      ? targetOrPredicate
-      : (node) => node?.id === targetOrPredicate || node?.content?.mod === targetOrPredicate;
-
-  function findPath(node, path) {
-    if (match(node)) return [...path, node];
-    for (const child of node?.children ?? []) {
-      const res = findPath(child, [...path, node]);
-      if (res) return res;
-    }
-    return null;
-  }
-
-  const path = findPath(root, []);
-  if (!path) return true;
-
-  for (let i = 0; i < path.length; i++) {
-    const node = path[i];
-    if (node.hidden) return false;
-    if (node.type === "stack" && i + 1 < path.length) {
-      const activeId = node.active ?? node.children?.[0]?.id;
-      if (activeId && activeId !== path[i + 1].id) return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Parses `docker compose ls --all --format json` output.
- *
- * @param {string | any[]} stdout
- * @returns {Array<{ name: string, status: string, configFiles: string, Name: string, Status: string, ConfigFiles: string, raw: any }>}
- */
-export function parseComposeLs(stdout) {
-  if (!stdout) return [];
-  if (Array.isArray(stdout)) {
-    return stdout.map((item) => {
-      const name = item.Name || item.name || "";
-      const status = item.Status || item.status || "";
-      const configFiles = item.ConfigFiles || item.configFiles || "";
-      return {
-        name,
-        status,
-        configFiles,
-        Name: name,
-        Status: status,
-        ConfigFiles: configFiles,
-        raw: item,
-      };
+    dockerfileNodes.push({
+      kind: "dockerfile",
+      filePath: fPath,
+      relativePath: dfData.relativePath,
+      inSpace,
+      containers: dfData.containers,
+      runningCount: dfData.containers.filter((c) => c.running).length,
+      totalCount: dfData.containers.length,
     });
   }
-  if (typeof stdout !== "string") return [];
-  const text = stdout.trim();
-  if (!text) return [];
 
-  let items = [];
-  if (text.startsWith("[")) {
-    try {
-      items = JSON.parse(text);
-    } catch {
-      items = [];
-    }
-  } else {
-    for (const line of text.split("\n")) {
-      const l = line.trim();
-      if (!l) continue;
-      try {
-        items.push(JSON.parse(l));
-      } catch {}
-    }
+  // Step 4: Standalone Containers (DM-20, DM-36)
+  let visibleStandalone = [];
+  if (scope !== "space") {
+    visibleStandalone = standaloneContainers.map((c) => ({
+      kind: "standalone",
+      id: c.id,
+      shortId: c.shortId,
+      name: c.name,
+      image: c.image,
+      ports: c.ports,
+      status: c.status,
+      running: c.running,
+      statusColor: c.running ? "done" : "muted",
+    }));
   }
 
-  if (!Array.isArray(items)) {
-    if (typeof items === "object" && items !== null) items = [items];
-    else return [];
-  }
+  // Step 5: Filter handling (DM-12)
+  let filteredProjects = projectNodes;
+  let filteredDockerfiles = dockerfileNodes;
+  let filteredStandalone = visibleStandalone;
 
-  return items.map((item) => {
-    const name = item.Name || item.name || "";
-    const status = item.Status || item.status || "";
-    const configFiles = item.ConfigFiles || item.configFiles || "";
-    return {
-      name,
-      status,
-      configFiles,
-      Name: name,
-      Status: status,
-      ConfigFiles: configFiles,
-      raw: item,
-    };
-  });
-}
-
-/**
- * Parses `docker info --format '{{json .}}'` output.
- *
- * @param {string | any} stdout
- * @returns {any}
- */
-export function parseEngineInfo(stdout) {
-  if (!stdout) return null;
-  let info = null;
-  if (typeof stdout === "object") {
-    info = stdout;
-  } else if (typeof stdout === "string") {
-    const text = stdout.trim();
-    if (!text) return null;
-    try {
-      info = JSON.parse(text);
-    } catch {
-      return null;
-    }
-  }
-  if (!info || typeof info !== "object") return null;
-
-  return {
-    serverVersion: info.ServerVersion || info.Server?.Version || "",
-    ServerVersion: info.ServerVersion || info.Server?.Version || "",
-    containers: typeof info.Containers === "number" ? info.Containers : 0,
-    containersRunning: typeof info.ContainersRunning === "number" ? info.ContainersRunning : 0,
-    containersPaused: typeof info.ContainersPaused === "number" ? info.ContainersPaused : 0,
-    containersStopped: typeof info.ContainersStopped === "number" ? info.ContainersStopped : 0,
-    images: typeof info.Images === "number" ? info.Images : 0,
-    operatingSystem: info.OperatingSystem || "",
-    architecture: info.Architecture || "",
-    raw: info,
-  };
-}
-
-/**
- * Determines Docker engine reachable / daemon-down / cli-missing state from probe results.
- *
- * @param {{ info?: any, versionProbe?: any }} options
- * @returns {{ status: "reachable" | "daemon-down" | "cli-missing", version: string | null, reachable: boolean, error: string | null }}
- */
-export function engineStateFromResults({ info = null, versionProbe = null } = {}) {
-  // 1. Check CLI missing
-  const vErr = versionProbe?.error || (versionProbe?.code === 127 ? "not found" : null);
-  const iErr = info?.error || (info?.code === 127 ? "not found" : null);
-  const vStderr = String(versionProbe?.stderr || "").toLowerCase();
-  const iStderr = String(info?.stderr || "").toLowerCase();
-
-  const isCliMissing =
-    (vErr && /enoent|not found|not recognized|not installed/i.test(String(vErr))) ||
-    (iErr && /enoent|not found|not recognized|not installed/i.test(String(iErr))) ||
-    vStderr.includes("command not found") ||
-    iStderr.includes("command not found") ||
-    versionProbe?.code === 127 ||
-    info?.code === 127 ||
-    (!info && !versionProbe);
-
-  if (isCliMissing) {
-    return {
-      status: "cli-missing",
-      version: null,
-      reachable: false,
-      error: "Docker CLI not found",
-    };
-  }
-
-  // 2. Extract potential version string
-  let version = null;
-  if (typeof versionProbe === "string") {
-    const m = versionProbe.match(/(?:version\s+)?([0-9]+\.[0-9]+(?:\.[0-9]+[a-z0-9.-]*)?)/i);
-    if (m) version = m[1];
-  } else if (versionProbe && typeof versionProbe === "object") {
-    if (versionProbe.Server?.Version) {
-      version = versionProbe.Server.Version;
-    } else if (versionProbe.stdout) {
-      try {
-        const parsed = JSON.parse(versionProbe.stdout);
-        version = parsed.Server?.Version || parsed.Client?.Version || null;
-      } catch {
-        const m = versionProbe.stdout.match(/(?:version\s+)?([0-9]+\.[0-9]+(?:\.[0-9]+[a-z0-9.-]*)?)/i);
-        if (m) version = m[1];
+  if (normFilter) {
+    filteredProjects = [];
+    for (const p of projectNodes) {
+      const pMatches = p.name.toLowerCase().includes(normFilter) || p.composeBasenames.toLowerCase().includes(normFilter);
+      const matchingServices = [];
+      for (const s of p.services) {
+        const sMatches = s.name.toLowerCase().includes(normFilter) || s.portsText.toLowerCase().includes(normFilter);
+        const matchingContainers = s.containers.filter(containerMatchesFilter);
+        if (pMatches || sMatches || matchingContainers.length > 0) {
+          matchingServices.push({
+            ...s,
+            containers: pMatches || sMatches ? s.containers : matchingContainers,
+          });
+        }
+      }
+      if (pMatches || matchingServices.length > 0) {
+        filteredProjects.push({
+          ...p,
+          services: pMatches ? p.services : matchingServices,
+        });
       }
     }
+
+    filteredDockerfiles = dockerfileNodes.filter((df) => {
+      const dfMatches = df.relativePath.toLowerCase().includes(normFilter);
+      const cMatches = df.containers.some(containerMatchesFilter);
+      return dfMatches || cMatches;
+    });
+
+    filteredStandalone = visibleStandalone.filter(containerMatchesFilter);
   }
 
-  if (!version && info) {
-    const parsed = typeof info === "string" ? parseEngineInfo(info) : info.stdout ? parseEngineInfo(info.stdout) : info;
-    if (parsed?.serverVersion || parsed?.ServerVersion) {
-      version = parsed.serverVersion || parsed.ServerVersion;
-    }
-  }
-
-  // 3. Check daemon down
-  const isDaemonDown =
-    vStderr.includes("cannot connect to the docker daemon") ||
-    iStderr.includes("cannot connect to the docker daemon") ||
-    vStderr.includes("is the docker daemon running") ||
-    iStderr.includes("is the docker daemon running") ||
-    vStderr.includes("daemon is not running") ||
-    iStderr.includes("daemon is not running") ||
-    vStderr.includes("connection refused") ||
-    iStderr.includes("connection refused") ||
-    (info && info.code !== 0 && !info.serverVersion && !info.ServerVersion) ||
-    (versionProbe && versionProbe.code !== 0 && !versionProbe.Server?.Version);
-
-  if (isDaemonDown && (!info || info.code !== 0) && (!versionProbe || !versionProbe.Server?.Version)) {
-    return {
-      status: "daemon-down",
-      version: null,
-      reachable: false,
-      error: (info?.stderr || versionProbe?.stderr || "Docker daemon is not reachable").trim(),
-    };
-  }
-
-  return {
-    status: "reachable",
-    version: version || "Docker",
-    reachable: true,
-    error: null,
-  };
-}
-
-/**
- * Parses `docker compose config --format json` output.
- *
- * @param {string | any} stdout
- * @returns {{ name: string, services: Record<string, any>, raw: any }}
- */
-export function parseComposeConfig(stdout) {
-  if (!stdout) return { name: "", services: {}, raw: null };
-  let data = null;
-  if (typeof stdout === "object") {
-    data = stdout;
-  } else if (typeof stdout === "string") {
-    const text = stdout.trim();
-    if (!text) return { name: "", services: {}, raw: null };
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return { name: "", services: {}, raw: null };
-    }
-  }
-  if (!data || typeof data !== "object") return { name: "", services: {}, raw: null };
-
-  const services = {};
-  for (const [svcName, svcDef] of Object.entries(data.services || {})) {
-    if (!svcDef) continue;
-    services[svcName] = {
-      name: svcName,
-      image: svcDef.image || null,
-      build: svcDef.build || null,
-      ports: Array.isArray(svcDef.ports) ? svcDef.ports : [],
-      profiles: Array.isArray(svcDef.profiles) ? svcDef.profiles : [],
-      volumes: Array.isArray(svcDef.volumes) ? svcDef.volumes : [],
-      networks: svcDef.networks || null,
-      environment: svcDef.environment || {},
-      dependsOn: svcDef.depends_on || svcDef.dependsOn || [],
-      raw: svcDef,
-    };
-  }
-
-  return {
-    name: data.name || "",
-    services,
-    raw: data,
-  };
-}
-
-/**
- * Groups discovered Compose file paths by directory and pairs base files with overrides (DM-32).
- *
- * @param {string[]} paths
- * @returns {Array<{ dir: string, file: string, files: string[], isOverride: boolean, override?: string | null, variant?: string }>}
- */
-export function discoverComposeGroups(paths = []) {
-  if (!Array.isArray(paths)) return [];
-
-  const byDir = new Map();
-  for (const p of paths) {
-    if (!p || typeof p !== "string") continue;
-    const slashIdx = p.lastIndexOf("/");
-    const dir = slashIdx === -1 ? "." : p.slice(0, slashIdx);
-    if (!byDir.has(dir)) byDir.set(dir, []);
-    byDir.get(dir).push(p);
-  }
-
+  // Return root groups (empty groups hidden per DM-20)
   const result = [];
-
-  for (const [dir, fileList] of byDir.entries()) {
-    const baseFiles = [];
-    const overrideFiles = [];
-    const variantFiles = [];
-
-    for (const filePath of fileList) {
-      const cls = classifyDockerFile(filePath);
-      if (!cls || !cls.isCompose) continue;
-      if (cls.isOverride) {
-        overrideFiles.push(filePath);
-      } else if (cls.variant) {
-        variantFiles.push({ path: filePath, variant: cls.variant });
-      } else {
-        baseFiles.push(filePath);
-      }
-    }
-
-    const pairedOverrides = new Set();
-
-    for (const base of baseFiles) {
-      const baseName = base.slice(base.lastIndexOf("/") + 1).toLowerCase();
-      let matchedOverride = null;
-      for (const ov of overrideFiles) {
-        if (pairedOverrides.has(ov)) continue;
-        const ovName = ov.slice(ov.lastIndexOf("/") + 1).toLowerCase();
-        if (
-          (baseName.startsWith("docker-compose") && ovName.startsWith("docker-compose.override")) ||
-          (baseName.startsWith("compose") && !baseName.startsWith("docker-compose") && ovName.startsWith("compose.override"))
-        ) {
-          matchedOverride = ov;
-          break;
-        }
-      }
-      if (!matchedOverride) {
-        for (const ov of overrideFiles) {
-          if (!pairedOverrides.has(ov)) {
-            matchedOverride = ov;
-            break;
-          }
-        }
-      }
-
-      if (matchedOverride) {
-        pairedOverrides.add(matchedOverride);
-        result.push({
-          dir,
-          file: base,
-          files: [base, matchedOverride],
-          isOverride: false,
-          override: matchedOverride,
-        });
-      } else {
-        result.push({
-          dir,
-          file: base,
-          files: [base],
-          isOverride: false,
-          override: null,
-        });
-      }
-    }
-
-    for (const ov of overrideFiles) {
-      if (!pairedOverrides.has(ov)) {
-        result.push({
-          dir,
-          file: ov,
-          files: [ov],
-          isOverride: true,
-          override: ov,
-        });
-      }
-    }
-
-    for (const v of variantFiles) {
-      result.push({
-        dir,
-        file: v.path,
-        files: [v.path],
-        isOverride: false,
-        variant: v.variant,
-      });
-    }
+  if (filteredProjects.length > 0) {
+    result.push({
+      kind: "group",
+      id: "projects",
+      title: "Compose Projects",
+      items: filteredProjects,
+    });
+  }
+  if (filteredDockerfiles.length > 0) {
+    result.push({
+      kind: "group",
+      id: "dockerfiles",
+      title: "Dockerfiles",
+      items: filteredDockerfiles,
+    });
+  }
+  if (filteredStandalone.length > 0) {
+    result.push({
+      kind: "group",
+      id: "standalone",
+      title: "Standalone",
+      items: filteredStandalone,
+    });
   }
 
   return result;
 }
 
 /**
- * Aggregates service statuses into an overall Compose project status (DM-21).
+ * Returns the ordered list of context menu items for a Compose project (DM-50..59).
+ * Each item has: { id, label, icon, enabled, disabledReason, destructive, requiresTypedConfirm }
  *
- * Rules:
- * - any unhealthy, restarting, or dead -> "error"
- * - all running -> "ok"
- * - mixed -> "warning"
- * - none -> "muted"
- *
- * @param {any[]} services
- * @returns {"ok" | "warning" | "muted" | "error"}
+ * @param {object} project
+ * @returns {Array<object>}
  */
-export function aggregateProjectStatus(services = []) {
-  if (!Array.isArray(services) || services.length === 0) return "muted";
+export function getProjectMenuItems(project) {
+  if (!project) return [];
+  const hasConfigFiles = Array.isArray(project.configFiles) && project.configFiles.length > 0;
+  const hasWorkingDir = Array.isArray(project.workingDirs) && project.workingDirs.length > 0;
+  const isRunning = (project.runningCount ?? 0) > 0;
+  const isAllRunning = project.totalCount > 0 && project.runningCount === project.totalCount;
+  const isNotCreated = Boolean(project.notCreated) || project.totalCount === 0;
 
-  for (const svc of services) {
-    const sStatus = String(svc.status || "").toLowerCase();
-    const sState = String(svc.state || "").toLowerCase();
-    const sHealth = String(svc.health?.status || svc.health || "").toLowerCase();
+  return [
+    {
+      id: "up",
+      label: "Up",
+      icon: "play.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "up-build",
+      label: "Up (build)",
+      icon: "rebuild.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "start",
+      label: "Start",
+      icon: "play.svg",
+      enabled: !isNotCreated && !isAllRunning,
+      disabledReason: isNotCreated ? "no containers created" : isAllRunning ? "already running" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "stop",
+      label: "Stop",
+      icon: "stop.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "already stopped",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "restart",
+      label: "Restart",
+      icon: "restart.svg",
+      enabled: !isNotCreated,
+      disabledReason: isNotCreated ? "no containers created" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "pull",
+      label: "Pull images",
+      icon: "refresh.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "build",
+      label: "Build",
+      icon: "rebuild.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "logs",
+      label: "Logs (all services)",
+      icon: "logs.svg",
+      enabled: !isNotCreated,
+      disabledReason: isNotCreated ? "no containers created" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "open-compose",
+      label: "Open compose file(s)",
+      icon: "folder.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "copy-name",
+      label: "Copy project name",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "reveal-folder",
+      label: "Reveal folder in Files",
+      icon: "folder.svg",
+      enabled: hasWorkingDir,
+      disabledReason: hasWorkingDir ? null : "working directory not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "down",
+      label: "Down",
+      icon: "stop.svg",
+      enabled: !isNotCreated,
+      disabledReason: isNotCreated ? "no containers created" : null,
+      destructive: true,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "down-volumes",
+      label: "Down + remove volumes",
+      icon: "trash.svg",
+      enabled: !isNotCreated,
+      disabledReason: isNotCreated ? "no containers created" : null,
+      destructive: true,
+      requiresTypedConfirm: true,
+    },
+  ];
+}
 
-    if (
-      sHealth === "unhealthy" ||
-      sStatus.includes("unhealthy") ||
-      sState === "restarting" ||
-      sStatus.includes("restarting") ||
-      sState === "dead" ||
-      sStatus.includes("dead")
-    ) {
-      return "error";
-    }
+/**
+ * Returns the ordered list of context menu items for a service (DM-60..69).
+ *
+ * @param {object} service
+ * @param {object} [project]
+ * @returns {Array<object>}
+ */
+export function getServiceMenuItems(service, project = null) {
+  if (!service) return [];
+  const hasConfigFiles = project ? Array.isArray(project.configFiles) && project.configFiles.length > 0 : true;
+  const isRunning = (service.runningCount ?? 0) > 0;
+  const isAllRunning = service.totalCount > 0 && service.runningCount === service.totalCount;
+  const notCreated = Boolean(service.notCreated);
+  const containerId = service.containers && service.containers.length > 0 ? service.containers[0].id : service.id;
 
-    if (Array.isArray(svc.containers)) {
-      for (const c of svc.containers) {
-        const cStatus = String(c.status || "").toLowerCase();
-        const cState = String(c.state || "").toLowerCase();
-        const cHealth = String(c.health?.status || c.health || "").toLowerCase();
-        if (
-          cHealth === "unhealthy" ||
-          cStatus.includes("unhealthy") ||
-          cState === "restarting" ||
-          cStatus.includes("restarting") ||
-          cState === "dead" ||
-          cStatus.includes("dead")
-        ) {
-          return "error";
+  const items = [
+    {
+      id: "start",
+      label: "Start",
+      icon: "play.svg",
+      enabled: !notCreated && !isAllRunning,
+      disabledReason: notCreated ? "not created" : isAllRunning ? "already running" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "stop",
+      label: "Stop",
+      icon: "stop.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "already stopped",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "restart",
+      label: "Restart",
+      icon: "restart.svg",
+      enabled: !notCreated,
+      disabledReason: notCreated ? "not created" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "up",
+      label: "Up (this service)",
+      icon: "play.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "rebuild",
+      label: "Rebuild",
+      icon: "rebuild.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "recreate",
+      label: "Recreate (no build)",
+      icon: "restart.svg",
+      enabled: hasConfigFiles,
+      disabledReason: hasConfigFiles ? null : "compose file not found",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "logs",
+      label: "Logs",
+      icon: "logs.svg",
+      enabled: !notCreated,
+      disabledReason: notCreated ? "not created" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "shell",
+      label: "Shell",
+      icon: "terminal.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "container not running",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "inspect",
+      label: "Inspect",
+      icon: "search.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "inspect-tab",
+      label: "Open in Inspector Tab",
+      icon: "expand.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+  ];
+
+  // Published ports
+  const portsList = [];
+  if (service.containers && service.containers.length > 0) {
+    for (const c of service.containers) {
+      if (c.ports) {
+        const matches = c.ports.matchAll(/(?:(?:\d{1,3}\.){3}\d{1,3}|::|\[::\])?:(\d+)->/g);
+        for (const m of matches) {
+          const port = parseInt(m[1], 10);
+          if (port && !portsList.includes(port)) portsList.push(port);
         }
       }
     }
   }
-
-  let runningCount = 0;
-  let partialServiceFound = false;
-
-  for (const svc of services) {
-    if (Array.isArray(svc.containers) && svc.containers.length > 0) {
-      const runningInSvc = svc.containers.filter(
-        (c) =>
-          c.isRunning ||
-          c.running ||
-          String(c.state || "").toLowerCase() === "running" ||
-          String(c.status || "").toLowerCase().startsWith("up")
-      ).length;
-
-      if (runningInSvc === svc.containers.length) {
-        runningCount++;
-      } else if (runningInSvc > 0) {
-        partialServiceFound = true;
-      }
-    } else {
-      const sStatus = String(svc.status || "").toLowerCase();
-      const sState = String(svc.state || "").toLowerCase();
-      if (svc.running === true || sState === "running" || sStatus.startsWith("up")) {
-        runningCount++;
-      }
-    }
-  }
-
-  if (partialServiceFound) return "warning";
-  if (runningCount === services.length && services.length > 0) return "ok";
-  if (runningCount > 0) return "warning";
-  return "muted";
-}
-
-/**
- * Matches a row against a search query string across name, image, service, project, and ports (DM-12).
- * Empty query matches everything. Case-insensitive substring match.
- *
- * @param {any} row
- * @param {string} query
- * @returns {boolean}
- */
-export function matchesFilter(row, query) {
-  if (!query || typeof query !== "string") return true;
-  const q = query.trim().toLowerCase();
-  if (!q) return true;
-  if (!row) return false;
-
-  const name = String(row.name || row.data?.name || "").toLowerCase();
-  if (name.includes(q)) return true;
-
-  const image = String(row.image || row.data?.image || "").toLowerCase();
-  if (image.includes(q)) return true;
-
-  const service = String(row.service || row.data?.service || "").toLowerCase();
-  if (service.includes(q)) return true;
-
-  const project = String(row.project || row.data?.project || "").toLowerCase();
-  if (project.includes(q)) return true;
-
-  const ports = String(row.ports || row.publishedPorts || row.port || row.data?.ports || "");
-  if (ports.toLowerCase().includes(q)) return true;
-
-  if (Array.isArray(row.ports)) {
-    if (JSON.stringify(row.ports).toLowerCase().includes(q)) return true;
-  }
-  if (Array.isArray(row.data?.ports)) {
-    if (JSON.stringify(row.data.ports).toLowerCase().includes(q)) return true;
-  }
-
-  return false;
-}
-
-/**
- * Flattens a project -> service -> replica tree into a linear list of render rows (DM-20..27).
- *
- * Ordering:
- * 1. Projects: inSpace first, then alphabetical by name.
- * 2. Services: declaration order from compose config, then alphabetical.
- * 3. Replicas: numerically by container number.
- * 4. Dockerfiles & Standalone containers.
- *
- * @param {{ projects?: any[], dockerfiles?: any[], standalone?: any[] }} tree
- * @param {any} expandState
- * @returns {any[]}
- */
-export function flattenContainerRows(tree = {}, expandState = null) {
-  const rows = [];
-  if (!tree) return rows;
-
-  const projects = Array.isArray(tree.projects) ? [...tree.projects] : [];
-  projects.sort((a, b) => {
-    const aInSpace = Boolean(a.inSpace);
-    const bInSpace = Boolean(b.inSpace);
-    if (aInSpace !== bInSpace) return aInSpace ? -1 : 1;
-    return (a.name || "").localeCompare(b.name || "");
-  });
-
-  for (const proj of projects) {
-    let isProjExpanded = false;
-    if (expandState instanceof Set) {
-      isProjExpanded = expandState.has(proj.name) || expandState.has(`project:${proj.name}`);
-    } else if (typeof expandState === "function") {
-      isProjExpanded = Boolean(expandState(proj.name));
-    } else if (typeof expandState === "object" && expandState !== null) {
-      if (proj.name in expandState) isProjExpanded = Boolean(expandState[proj.name]);
-      else if (`project:${proj.name}` in expandState) isProjExpanded = Boolean(expandState[`project:${proj.name}`]);
-      else isProjExpanded = Boolean(proj.inSpace);
-    } else {
-      isProjExpanded = Boolean(proj.inSpace);
-    }
-
-    const services = Array.isArray(proj.services) ? [...proj.services] : [];
-    const projStatus = proj.status || aggregateProjectStatus(services);
-
-    rows.push({
-      type: "project",
-      kind: "project",
-      id: `project:${proj.name}`,
-      key: `project:${proj.name}`,
-      name: proj.name,
-      project: proj.name,
-      status: projStatus,
-      runningCount: proj.runningCount || 0,
-      totalCount: proj.totalCount || 0,
-      inSpace: Boolean(proj.inSpace),
-      mixedSources: Boolean(proj.mixedSources),
-      configFiles: proj.configFilesList || Array.from(proj.configFiles || []),
-      expanded: isProjExpanded,
-      depth: 0,
-      data: proj,
-    });
-
-    if (isProjExpanded) {
-      services.sort((a, b) => {
-        const orderA = typeof a.declaredOrder === "number" ? a.declaredOrder : 9999;
-        const orderB = typeof b.declaredOrder === "number" ? b.declaredOrder : 9999;
-        if (orderA !== orderB) return orderA - orderB;
-        return (a.name || "").localeCompare(b.name || "");
-      });
-
-      for (const svc of services) {
-        const isNotCreated =
-          svc.status === "not-created" ||
-          svc.created === false ||
-          (!svc.containers?.length && svc.declared);
-        const svcStatus = isNotCreated ? "not-created" : (svc.status || (svc.running ? "running" : "stopped"));
-
-        const containers = Array.isArray(svc.containers) ? [...svc.containers] : [];
-        const hasReplicas = containers.length > 1;
-
-        let isSvcExpanded = false;
-        if (hasReplicas) {
-          const k1 = `${proj.name}/${svc.name}`;
-          const k2 = `${proj.name}:${svc.name}`;
-          const k3 = svc.name;
-          if (expandState instanceof Set) {
-            isSvcExpanded = expandState.has(k1) || expandState.has(k2) || expandState.has(k3) || expandState.has(proj.name);
-          } else if (typeof expandState === "object" && expandState !== null) {
-            if (k1 in expandState) isSvcExpanded = Boolean(expandState[k1]);
-            else if (k2 in expandState) isSvcExpanded = Boolean(expandState[k2]);
-            else if (k3 in expandState) isSvcExpanded = Boolean(expandState[k3]);
-            else isSvcExpanded = true;
-          } else {
-            isSvcExpanded = true;
-          }
-        }
-
-        const targetCont = containers.length > 0 ? containers[0] : null;
-        const containerId = targetCont ? targetCont.id : "";
-        const shortId = targetCont ? (targetCont.shortId || targetCont.id?.slice(0, 12)) : "";
-        const image = targetCont ? targetCont.image : (svc.config?.image || "");
-        const ports = targetCont ? targetCont.ports : (svc.ports || "");
-
-        rows.push({
-          type: "service",
-          kind: "service",
-          id: `service:${proj.name}/${svc.name}`,
-          key: `service:${proj.name}/${svc.name}`,
-          name: svc.name,
-          service: svc.name,
-          project: proj.name,
-          status: svcStatus,
-          state: svc.state || (isNotCreated ? "not-created" : (svc.running ? "running" : "exited")),
-          running: Boolean(svc.running),
-          declared: Boolean(svc.declared),
-          created: !isNotCreated,
-          containerCount: containers.length,
-          hasReplicas,
-          containerId,
-          shortId,
-          image,
-          ports,
-          workingDir: proj.workingDir,
-          configFiles: proj.configFiles,
-          hasConfigFiles: proj.hasConfigFiles,
-          expanded: isSvcExpanded,
-          depth: 1,
-          data: svc,
-        });
-
-        if (hasReplicas && isSvcExpanded) {
-          containers.sort((a, b) => {
-            const numA = parseInt(a.containerNumber || "1", 10) || 1;
-            const numB = parseInt(b.containerNumber || "1", 10) || 1;
-            if (numA !== numB) return numA - numB;
-            return (a.name || "").localeCompare(b.name || "");
-          });
-
-          for (const c of containers) {
-            rows.push({
-              type: "container",
-              kind: "container",
-              id: `container:${c.id || c.name}`,
-              key: `container:${c.id || c.name}`,
-              name: c.name,
-              containerId: c.id,
-              shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
-              service: svc.name,
-              project: proj.name,
-              workingDir: proj.workingDir,
-              configFiles: proj.configFiles,
-              hasConfigFiles: proj.hasConfigFiles,
-              containerNumber: c.containerNumber || "1",
-              status: c.status || c.state || "",
-              state: c.state || "",
-              running: Boolean(c.isRunning || c.running || c.state === "running"),
-              image: c.image || "",
-              ports: c.ports || "",
-              depth: 2,
-              data: c,
-            });
-          }
-        }
-      }
-    }
-  }
-
-  // Dockerfiles
-  const dockerfiles = Array.isArray(tree.dockerfiles) ? [...tree.dockerfiles] : [];
-  for (const df of dockerfiles) {
-    let isDfExpanded = false;
-    if (expandState instanceof Set) {
-      isDfExpanded = expandState.has(df.path);
-    } else if (typeof expandState === "object" && expandState !== null && df.path in expandState) {
-      isDfExpanded = Boolean(expandState[df.path]);
-    } else {
-      isDfExpanded = Boolean(df.inSpace);
-    }
-
-    rows.push({
-      type: "dockerfile",
-      kind: "dockerfile",
-      id: `dockerfile:${df.path}`,
-      key: `dockerfile:${df.path}`,
-      name: df.path,
-      path: df.path,
-      inSpace: Boolean(df.inSpace),
-      containerCount: df.containers?.length || 0,
-      expanded: isDfExpanded,
-      depth: 0,
-      data: df,
-    });
-
-    if (isDfExpanded && Array.isArray(df.containers)) {
-      for (const c of df.containers) {
-        rows.push({
-          type: "container",
-          kind: "container",
-          id: `container:${c.id || c.name}`,
-          key: `container:${c.id || c.name}`,
-          name: c.name,
-          containerId: c.id,
-          shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
-          service: "",
-          project: "",
-          status: c.status || "",
-          state: c.state || "",
-          running: Boolean(c.isRunning || c.running),
-          image: c.image || "",
-          ports: c.ports || "",
-          depth: 1,
-          data: c,
-        });
-      }
-    }
-  }
-
-  // Standalone
-  const standalone = Array.isArray(tree.standalone) ? [...tree.standalone] : [];
-  standalone.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-  for (const c of standalone) {
-    rows.push({
-      type: "container",
-      kind: "container",
-      id: `standalone:${c.id || c.name}`,
-      key: `standalone:${c.id || c.name}`,
-      name: c.name,
-      containerId: c.id,
-      shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
-      service: "",
-      project: "",
-      isStandalone: true,
-      status: c.status || "",
-      state: c.state || "",
-      running: Boolean(c.isRunning || c.running || c.state === "running"),
-      image: c.image || "",
-      ports: c.ports || "",
-      depth: 0,
-      data: c,
+  for (const port of portsList) {
+    items.push({
+      id: `open-port:${port}`,
+      port,
+      label: `Open :${port} in browser`,
+      icon: "external-link.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "container not running",
+      destructive: false,
+      requiresTypedConfirm: false,
     });
   }
 
-  return rows;
+  items.push(
+    {
+      id: "copy-name",
+      label: "Copy service name",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "copy-id",
+      label: "Copy container ID",
+      icon: "copy.svg",
+      enabled: Boolean(containerId),
+      disabledReason: containerId ? null : "no container created",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "remove",
+      label: "Remove",
+      icon: "trash.svg",
+      enabled: !notCreated,
+      disabledReason: notCreated ? "not created" : null,
+      destructive: true,
+      requiresTypedConfirm: false,
+    }
+  );
+
+  return items;
 }
 
-// =============================================================================
-// Section 7 & Acceptance Criteria 2 Pure Functions (R3)
-// =============================================================================
+/**
+ * Returns the ordered list of context menu items for a container (DM-70..73).
+ *
+ * @param {object} container
+ * @returns {Array<object>}
+ */
+export function getContainerMenuItems(container) {
+  if (!container) return [];
+  const isRunning = Boolean(container.running);
+  const isPaused =
+    (container.state || "").toLowerCase() === "paused" ||
+    (container.status || "").toLowerCase().includes("paused");
+  const id = container.id || container.shortId;
+
+  const items = [
+    {
+      id: "start",
+      label: "Start",
+      icon: "play.svg",
+      enabled: !isRunning,
+      disabledReason: isRunning ? "already running" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "stop",
+      label: "Stop",
+      icon: "stop.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "already stopped",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "restart",
+      label: "Restart",
+      icon: "restart.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "pause",
+      label: "Pause",
+      icon: "stop.svg",
+      enabled: isRunning && !isPaused,
+      disabledReason: !isRunning ? "container not running" : isPaused ? "already paused" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "unpause",
+      label: "Unpause",
+      icon: "play.svg",
+      enabled: isRunning && isPaused,
+      disabledReason: !isRunning ? "container not running" : !isPaused ? "container not paused" : null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "logs",
+      label: "Logs",
+      icon: "logs.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "shell",
+      label: "Shell",
+      icon: "terminal.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "container not running",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "inspect",
+      label: "Inspect",
+      icon: "search.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "inspect-tab",
+      label: "Open in Inspector Tab",
+      icon: "expand.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+  ];
+
+  // Published ports
+  const portsList = [];
+  if (container.ports) {
+    const matches = container.ports.matchAll(/(?:(?:\d{1,3}\.){3}\d{1,3}|::|\[::\])?:(\d+)->/g);
+    for (const m of matches) {
+      const port = parseInt(m[1], 10);
+      if (port && !portsList.includes(port)) portsList.push(port);
+    }
+  }
+  for (const port of portsList) {
+    items.push({
+      id: `open-port:${port}`,
+      port,
+      label: `Open :${port} in browser`,
+      icon: "external-link.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "container not running",
+      destructive: false,
+      requiresTypedConfirm: false,
+    });
+  }
+
+  items.push(
+    {
+      id: "copy-name",
+      label: "Copy container name",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "copy-id",
+      label: "Copy container ID",
+      icon: "copy.svg",
+      enabled: Boolean(id),
+      disabledReason: id ? null : "no container ID",
+      destructive: false,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "kill",
+      label: "Kill",
+      icon: "stop.svg",
+      enabled: isRunning,
+      disabledReason: isRunning ? null : "container not running",
+      destructive: true,
+      requiresTypedConfirm: false,
+    },
+    {
+      id: "remove",
+      label: "Remove",
+      icon: "trash.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: true,
+      requiresTypedConfirm: false,
+    }
+  );
+
+  return items;
+}
 
 /**
- * Formats raw docker Ports string or inspect bindings into compact port pills (DM-22).
+ * Builds confirmation dialog spec for destructive actions (DM-85..86).
  *
- * Drops host IPs (`0.0.0.0:`, `[::]:`) and protocols (`/tcp`), formats published mappings as `host→container`,
- * deduplicates identical mappings (e.g. IPv4 + IPv6 pairs), and marks unmapped exposed ports (e.g. `9000-9001/tcp`)
- * as unpublished (`published: false`).
- *
- * @param {string | any[] | null | undefined} rawPorts
- * @returns {Array<{ text: string, published: boolean, hostPort: string | null, containerPort: string }>}
+ * @param {string} action
+ * @param {object} target
+ * @returns {{ title: string, message: string, confirmLabel: string, destructive: boolean, typedTarget: string | null }}
  */
-export function formatPortMappings(rawPorts) {
-  if (!rawPorts) return [];
+export function buildConfirmationSpec(action, target) {
+  if (!target) return null;
+  const targetName = target.name || target.shortId || target.id || "target";
+
+  if (action === "down") {
+    return {
+      title: "Down Project",
+      message: `Stops and removes all containers and networks for Compose project "${targetName}".`,
+      confirmLabel: "Down Project",
+      destructive: true,
+      typedTarget: null,
+    };
+  }
+
+  if (action === "down-volumes") {
+    return {
+      title: "Down and Remove Volumes",
+      message: `Permanently stops and removes all containers, networks, AND named volumes for project "${targetName}". All persisted data will be lost.`,
+      confirmLabel: "Remove Everything",
+      destructive: true,
+      typedTarget: targetName,
+    };
+  }
+
+  if (action === "remove") {
+    const isService = target.kind === "service" || (target.project && target.name);
+    return {
+      title: isService ? "Remove Service" : "Remove Container",
+      message: isService
+        ? `Stops and removes all containers for service "${targetName}".`
+        : `Permanently removes container "${targetName}".`,
+      confirmLabel: "Remove",
+      destructive: true,
+      typedTarget: null,
+    };
+  }
+
+  if (action === "kill") {
+    return {
+      title: "Kill Container",
+      message: `Forces immediate SIGKILL termination of container "${targetName}".`,
+      confirmLabel: "Kill",
+      destructive: true,
+      typedTarget: null,
+    };
+  }
+
+  if (action === "remove-image") {
+    return {
+      title: "Remove Image",
+      message: `Permanently removes Docker image "${targetName}".`,
+      confirmLabel: "Remove",
+      destructive: true,
+      typedTarget: null,
+    };
+  }
+
+  if (action === "remove-volume" || action === "volume-rm") {
+    return {
+      title: "Remove Volume",
+      message: `Permanently removes volume "${targetName}". All data stored in this volume will be permanently lost.`,
+      confirmLabel: "Remove Volume",
+      destructive: true,
+      typedTarget: targetName,
+    };
+  }
+
+  if (action === "restore-volume") {
+    return {
+      title: "Restore Volume",
+      message: `Restoring volume "${targetName}" will overwrite all existing data in this volume.`,
+      confirmLabel: "Restore Data",
+      destructive: true,
+      typedTarget: targetName,
+    };
+  }
+
+  if (action === "remove-network") {
+    return {
+      title: "Remove Network",
+      message: `Permanently removes Docker network "${targetName}".`,
+      confirmLabel: "Remove Network",
+      destructive: true,
+      typedTarget: null,
+    };
+  }
+
+  if (action === "prune-unused-images") {
+    return {
+      title: "Prune All Unused Images",
+      message: "Permanently removes ALL images not referenced by at least one existing container.",
+      confirmLabel: "Prune Images",
+      destructive: true,
+      typedTarget: "prune",
+    };
+  }
+
+  if (action === "prune-volumes") {
+    return {
+      title: "Prune Unused Volumes",
+      message: "Permanently removes ALL local volumes not used by at least one existing container.",
+      confirmLabel: "Prune Volumes",
+      destructive: true,
+      typedTarget: "prune",
+    };
+  }
+
+  if (action === "prune-granular") {
+    return {
+      title: "Prune Selected Resources",
+      message: target.message || "Permanently removes selected Docker resources according to your prune selection.",
+      confirmLabel: "Prune Selected",
+      destructive: true,
+      typedTarget: target.requiresTypedConfirm ? "prune" : null,
+    };
+  }
+
+  return {
+    title: "Confirm Action",
+    message: `Are you sure you want to proceed with "${action}" on ${targetName}?`,
+    confirmLabel: "Confirm",
+    destructive: true,
+    typedTarget: null,
+  };
+}
+
+/**
+ * Finds an existing live terminal in spaceId matching terminalName (DM-82).
+ *
+ * @param {Array<object> | Function} terminalsList
+ * @param {string | null} spaceId
+ * @param {string} terminalName
+ * @returns {object | null}
+ */
+export function findExistingActionTerminal(terminalsList, spaceId, terminalName) {
+  if (!terminalName) return null;
+  const list = typeof terminalsList === "function" ? terminalsList() : terminalsList || [];
+  return (
+    list.find((t) => {
+      if (spaceId && t.space && t.space !== spaceId) return false;
+      return t.name === terminalName || t.title === terminalName;
+    }) || null
+  );
+}
+
+/**
+ * Clamps context menu position inside panel dimensions (DESIGN §5.4).
+ *
+ * @param {number} x
+ * @param {number} y
+ * @param {number} [menuWidth=220]
+ * @param {number} [menuHeight=260]
+ * @param {number} [panelWidth=368]
+ * @param {number} [panelHeight=600]
+ * @returns {{ x: number, y: number }}
+ */
+export function clampMenuPosition(
+  x,
+  y,
+  menuWidth = 220,
+  menuHeight = 260,
+  panelWidth = 368,
+  panelHeight = 600
+) {
+  const pad = 8;
+  const maxW = Math.max(menuWidth + pad * 2, panelWidth || 368);
+  const maxH = Math.max(menuHeight + pad * 2, panelHeight || 600);
+
+  let posX = x;
+  if (posX + menuWidth > maxW - pad) {
+    if (posX - menuWidth >= pad) {
+      posX = posX - menuWidth;
+    } else {
+      posX = Math.max(pad, maxW - menuWidth - pad);
+    }
+  } else {
+    posX = Math.max(pad, posX);
+  }
+
+  let posY = y;
+  if (posY + menuHeight > maxH - pad) {
+    if (posY - menuHeight >= pad) {
+      posY = posY - menuHeight;
+    } else {
+      posY = Math.max(pad, maxH - menuHeight - pad);
+    }
+  } else {
+    posY = Math.max(pad, posY);
+  }
+
+  return { x: Math.round(posX), y: Math.round(posY) };
+}
+
+/**
+ * Groups discovered Compose files by folder and pairs overrides (DM-30..32, DESIGN §4.2).
+ *
+ * @param {string[]} filePaths
+ * @returns {Array<{ folder: string, files: string[], primaryFile: string, overrideFile: string | null, isOverride: boolean, isVariant: boolean, name: string }>}
+ */
+export function groupDiscoveredComposeFiles(filePaths = []) {
+  if (!Array.isArray(filePaths)) return [];
+
+  const byFolder = new Map();
+  for (const fp of filePaths) {
+    if (!fp || typeof fp !== "string") continue;
+    const cleanPath = fp.trim();
+    if (!cleanPath) continue;
+    const lastSlash = cleanPath.lastIndexOf("/");
+    const folder = lastSlash > 0 ? cleanPath.slice(0, lastSlash) : (lastSlash === 0 ? "/" : ".");
+    if (!byFolder.has(folder)) {
+      byFolder.set(folder, []);
+    }
+    byFolder.get(folder).push(cleanPath);
+  }
+
+  const PRIMARY_NAMES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
+  const OVERRIDE_NAMES = ["compose.override.yaml", "compose.override.yml", "docker-compose.override.yaml", "docker-compose.override.yml"];
 
   const results = [];
-  const seen = new Set();
 
-  if (typeof rawPorts === "string") {
-    const trimmed = rawPorts.trim();
-    if (!trimmed) return [];
+  for (const [folder, files] of byFolder.entries()) {
+    const folderBase = folder.split("/").pop() || "project";
 
-    const parts = trimmed.split(",").map((s) => s.trim()).filter(Boolean);
-    for (const part of parts) {
-      if (part.includes("->")) {
-        // Published mapping, e.g. "0.0.0.0:8080->8080/tcp" or "[::]:8080->8080/tcp"
-        const [left, right] = part.split("->").map((s) => s.trim());
-        let hostPort = left;
-        if (hostPort.includes("]:")) {
-          hostPort = hostPort.slice(hostPort.lastIndexOf("]:") + 2);
-        } else if (hostPort.includes(":")) {
-          hostPort = hostPort.slice(hostPort.lastIndexOf(":") + 1);
-        }
-
-        let containerPort = right;
-        if (containerPort.includes("/")) {
-          containerPort = containerPort.slice(0, containerPort.indexOf("/"));
-        }
-
-        const text = `${hostPort}→${containerPort}`;
-        const key = `pub:${text}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push({
-            text,
-            published: true,
-            hostPort,
-            containerPort,
-            toString() {
-              return this.text;
-            },
-          });
-        }
-      } else {
-        // Exposed port without host publish, e.g. "9000-9001/tcp" or "80/tcp"
-        let containerPort = part;
-        if (containerPort.includes("/")) {
-          containerPort = containerPort.slice(0, containerPort.indexOf("/"));
-        }
-        const text = containerPort;
-        const key = `unpub:${text}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push({
-            text,
-            published: false,
-            hostPort: null,
-            containerPort,
-            toString() {
-              return this.text;
-            },
-          });
-        }
+    let primary = null;
+    for (const pName of PRIMARY_NAMES) {
+      const match = files.find((f) => f.split("/").pop() === pName);
+      if (match) {
+        primary = match;
+        break;
       }
     }
-  } else if (Array.isArray(rawPorts)) {
-    for (const p of rawPorts) {
-      if (!p) continue;
-      if (typeof p === "string") {
-        const sub = formatPortMappings(p);
-        for (const s of sub) {
-          const key = `${s.published ? "pub" : "unpub"}:${s.text}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            results.push(s);
-          }
-        }
-      } else if (typeof p === "object") {
-        const hostPort = p.hostPort ? String(p.hostPort) : null;
-        const containerPort = String(p.containerPort || p.port || "");
-        if (!containerPort) continue;
 
-        if (hostPort) {
-          const text = `${hostPort}→${containerPort}`;
-          const key = `pub:${text}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            results.push({
-              text,
-              published: true,
-              hostPort,
-              containerPort,
-              toString() {
-                return this.text;
-              },
-            });
-          }
-        } else {
-          const text = containerPort;
-          const key = `unpub:${text}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            results.push({
-              text,
-              published: false,
-              hostPort: null,
-              containerPort,
-              toString() {
-                return this.text;
-              },
-            });
-          }
-        }
+    let override = null;
+    for (const oName of OVERRIDE_NAMES) {
+      const match = files.find((f) => f.split("/").pop() === oName);
+      if (match) {
+        override = match;
+        break;
       }
+    }
+
+    const handled = new Set();
+
+    if (primary && override) {
+      handled.add(primary);
+      handled.add(override);
+      results.push({
+        folder,
+        files: [primary, override],
+        primaryFile: primary,
+        overrideFile: override,
+        isOverride: true,
+        isVariant: false,
+        name: folderBase,
+      });
+    } else if (primary) {
+      handled.add(primary);
+      results.push({
+        folder,
+        files: [primary],
+        primaryFile: primary,
+        overrideFile: null,
+        isOverride: false,
+        isVariant: false,
+        name: folderBase,
+      });
+    } else if (override) {
+      handled.add(override);
+      results.push({
+        folder,
+        files: [override],
+        primaryFile: override,
+        overrideFile: null,
+        isOverride: true,
+        isVariant: false,
+        name: folderBase,
+      });
+    }
+
+    // Process remaining files (variants like compose.dev.yaml, or other compose files)
+    for (const f of files) {
+      if (handled.has(f)) continue;
+      handled.add(f);
+
+      const base = f.split("/").pop();
+      const isVariant = /^(?:docker-)?compose\.[^.]+\.ya?ml$/i.test(base);
+      const variantNameMatch = base.match(/^(?:docker-)?compose\.([^.]+)\.ya?ml$/i);
+      const variantSuffix = variantNameMatch ? ` (${variantNameMatch[1]})` : "";
+
+      results.push({
+        folder,
+        files: [f],
+        primaryFile: f,
+        overrideFile: null,
+        isOverride: false,
+        isVariant,
+        name: `${folderBase}${variantSuffix}`,
+      });
     }
   }
 
@@ -2267,103 +1783,282 @@ export function formatPortMappings(rawPorts) {
 }
 
 /**
- * Returns the confirmation mode for an action: "typed", "plain", or "none".
+ * Parses output of `docker compose config --format json` (DM-30..33).
  *
- * "typed" for `down -v`, `container.remove`, `volume.restore`, `prune.*`.
- * "plain" for `down`, `container.kill`, `service.remove`.
- * "none" otherwise.
- *
- * @param {string | { id?: string }} item
- * @returns {"typed" | "plain" | "none"}
+ * @param {string} stdout
+ * @returns {{ projectName: string, services: Record<string, { name: string, image: string | null, build: any, ports: any[], volumes: any[], networks: any, profiles: string[], environment: any, dependsOn: string[] }> }}
  */
-export function confirmKind(item) {
-  const id = typeof item === "string" ? item : (item?.id || "");
-  if (
-    id === "project.down_volumes" ||
-    id === "down -v" ||
-    id === "container.remove" ||
-    id === "container.rm" ||
-    id === "volume.restore" ||
-    id.startsWith("prune") ||
-    id.startsWith("image.prune_unused") ||
-    id.startsWith("system.prune")
-  ) {
-    return "typed";
+export function parseComposeConfigJson(stdout) {
+  if (!stdout || typeof stdout !== "string") {
+    return { projectName: "", services: {} };
   }
-  if (
-    id === "project.down" ||
-    id === "down" ||
-    id === "container.kill" ||
-    id === "service.remove" ||
-    id === "service.rm"
-  ) {
-    return "plain";
+
+  let data;
+  try {
+    data = JSON.parse(stdout);
+  } catch {
+    return { projectName: "", services: {} };
   }
-  return "none";
+
+  if (!data || typeof data !== "object") {
+    return { projectName: "", services: {} };
+  }
+
+  const projectName = typeof data.name === "string" ? data.name : "";
+  const rawServices = data.services && typeof data.services === "object" ? data.services : {};
+  const services = {};
+
+  for (const [sName, sDef] of Object.entries(rawServices)) {
+    if (!sDef || typeof sDef !== "object") continue;
+    services[sName] = {
+      name: sName,
+      image: sDef.image || null,
+      build: sDef.build || null,
+      ports: Array.isArray(sDef.ports) ? sDef.ports : [],
+      volumes: Array.isArray(sDef.volumes) ? sDef.volumes : [],
+      networks: sDef.networks || null,
+      profiles: Array.isArray(sDef.profiles) ? sDef.profiles : [],
+      environment: sDef.environment || {},
+      dependsOn: sDef.depends_on
+        ? (Array.isArray(sDef.depends_on) ? sDef.depends_on : Object.keys(sDef.depends_on))
+        : [],
+    };
+  }
+
+  return { projectName, services };
 }
 
 /**
- * Returns whether an action requires confirmation before execution (DM-85..87).
+ * Parses exposed ports from Dockerfile content (DM-76).
+ * E.g. "EXPOSE 8080 3000/tcp\nEXPOSE 4321/udp" -> ["8080", "3000", "4321"]
  *
- * @param {string | { id?: string }} item
- * @returns {boolean}
+ * @param {string} dockerfileText
+ * @returns {string[]}
  */
-export function requiresConfirm(item) {
-  return confirmKind(item) !== "none";
-}
+export function parseDockerfileExpose(dockerfileText) {
+  if (!dockerfileText || typeof dockerfileText !== "string") return [];
 
-/**
- * Validates typed confirmation input (DM-86).
- * Typed confirm only enables on exact match (case-sensitive) of project name or "prune".
- *
- * @param {"typed" | "plain" | "none"} kind
- * @param {string} typed
- * @param {string} expected
- * @returns {boolean}
- */
-export function validateConfirmInput(kind, typed, expected) {
-  if (kind !== "typed") return true;
-  if (typeof typed !== "string") return false;
-  return typed === expected;
-}
+  const lines = dockerfileText.split(/\r?\n/);
+  const ports = [];
 
-/**
- * Determines placement for opening a terminal ("tab" unless alt or preference === "down").
- *
- * @param {{ alt?: boolean, preference?: string }} [opts]
- * @returns {"tab" | "down"}
- */
-export function terminalPlacement({ alt = false, preference = "" } = {}) {
-  if (alt || preference === "down") {
-    return "down";
-  }
-  return "tab";
-}
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
 
-/**
- * Matches an existing terminal whose argv equals the requested argv in the active space.
- *
- * @param {any[]} terminals
- * @param {string[]} argv
- * @param {string} [spaceId]
- * @returns {any | null}
- */
-export function findReusableTerminal(terminals, argv, spaceId) {
-  if (!Array.isArray(terminals) || !Array.isArray(argv) || argv.length === 0) {
-    return null;
-  }
+    const match = trimmed.match(/^EXPOSE\s+(.+)$/i);
+    if (!match) continue;
 
-  for (const t of terminals) {
-    if (!t) continue;
-    if (spaceId && t.space && t.space !== spaceId && t.spaceId !== spaceId) {
-      continue;
-    }
-
-    const tArgv = Array.isArray(t.argv) ? t.argv : (Array.isArray(t.command) ? t.command : null);
-    if (tArgv) {
-      if (tArgv.length === argv.length && tArgv.every((arg, i) => arg === argv[i])) {
-        return t;
+    const tokens = match[1].split(/\s+/);
+    for (let token of tokens) {
+      token = token.trim();
+      if (!token || token.startsWith("#")) break;
+      const slashIdx = token.indexOf("/");
+      const portStr = slashIdx >= 0 ? token.slice(0, slashIdx) : token;
+      const portNum = parseInt(portStr, 10);
+      if (Number.isInteger(portNum) && portNum > 0 && portNum <= 65535) {
+        const strVal = String(portNum);
+        if (!ports.includes(strVal)) {
+          ports.push(strVal);
+        }
       }
+    }
+  }
+
+  return ports;
+}
+
+/**
+ * Returns context menu items for a Dockerfile row (DM-75..78).
+ *
+ * @param {object} dockerfileItem
+ * @param {object | null} lastRunConfig
+ * @returns {Array<{ id: string, label: string, icon: string, enabled: boolean, disabledReason?: string | null, destructive: boolean }>}
+ */
+export function getDockerfileMenuItems(dockerfileItem, lastRunConfig = null) {
+  const hasPriorRun = Boolean(lastRunConfig);
+  return [
+    { id: "build-image", label: "Build image…", icon: "hammer", enabled: true, destructive: false },
+    { id: "build-run", label: "Build & run…", icon: "play", enabled: true, destructive: false },
+    {
+      id: "rebuild-replace",
+      label: "Rebuild & replace",
+      icon: "refresh",
+      enabled: hasPriorRun,
+      disabledReason: hasPriorRun ? null : "no prior Build & run",
+      destructive: false,
+    },
+    { id: "open-dockerfile", label: "Open Dockerfile", icon: "folder", enabled: true, destructive: false },
+    { id: "copy-path", label: "Copy path", icon: "copy", enabled: true, destructive: false },
+  ];
+}
+
+/**
+ * Builds arguments for building a Dockerfile (DM-75).
+ * Returns ["build", "-t", tag, "-f", filePath, ...buildArgFlags, contextDir].
+ *
+ * @param {object} params
+ * @param {string} params.filePath
+ * @param {string} [params.contextDir]
+ * @param {string} params.tag
+ * @param {string[] | Record<string, string>} [params.buildArgs]
+ * @returns {string[]}
+ */
+export function buildDockerfileBuildArgs({ filePath, contextDir = null, tag, buildArgs = null } = {}) {
+  if (!filePath) throw new Error("filePath is required");
+  if (!tag) throw new Error("tag is required");
+
+  const lastSlash = filePath.lastIndexOf("/");
+  const defaultContext = lastSlash > 0 ? filePath.slice(0, lastSlash) : (lastSlash === 0 ? "/" : ".");
+  const ctx = contextDir || defaultContext;
+
+  const buildArgFlags = [];
+  if (Array.isArray(buildArgs)) {
+    for (const ba of buildArgs) {
+      if (ba) buildArgFlags.push("--build-arg", String(ba));
+    }
+  } else if (buildArgs && typeof buildArgs === "object") {
+    for (const [k, v] of Object.entries(buildArgs)) {
+      buildArgFlags.push("--build-arg", `${k}=${v}`);
+    }
+  }
+
+  return ["build", "-t", tag, "-f", filePath, ...buildArgFlags, ctx];
+}
+
+/**
+ * Builds arguments for running a container from a Dockerfile image (DM-76).
+ * Returns ["run", ...(detached ? ["-d"] : ["--rm"]), "--name", containerName, "--label", `herdr.docker-manager.source=${filePath}`, ...portFlags, ...envFileFlags, tag].
+ *
+ * @param {object} params
+ * @param {string} params.filePath
+ * @param {string} params.tag
+ * @param {string} params.containerName
+ * @param {string[] | string} [params.ports]
+ * @param {string} [params.envFile]
+ * @param {boolean} [params.detached=true]
+ * @returns {string[]}
+ */
+export function buildDockerfileRunArgs({ filePath, tag, containerName, ports = [], envFile = null, detached = true } = {}) {
+  if (!filePath) throw new Error("filePath is required");
+  if (!tag) throw new Error("tag is required");
+  if (!containerName) throw new Error("containerName is required");
+
+  validateDockerIdentifier(containerName, "container name");
+
+  const portFlags = [];
+  const portsList = Array.isArray(ports) ? ports : (ports ? [ports] : []);
+  for (const p of portsList) {
+    if (p) portFlags.push("-p", String(p));
+  }
+
+  const envFileFlags = [];
+  if (envFile) {
+    envFileFlags.push("--env-file", envFile);
+  }
+
+  return [
+    "run",
+    ...(detached ? ["-d"] : ["--rm"]),
+    "--name",
+    containerName,
+    "--label",
+    `herdr.docker-manager.source=${filePath}`,
+    ...portFlags,
+    ...envFileFlags,
+    tag,
+  ];
+}
+
+/**
+ * Re-resolves the latest container ID for (project, service) when containers recreate/rebuild (DM-46).
+ *
+ * @param {Array<object>} containers
+ * @param {string} project
+ * @param {string} service
+ * @param {string} fallbackId
+ * @returns {string}
+ */
+export function resolveServiceContainerId(containers = [], project, service, fallbackId) {
+  if (!Array.isArray(containers) || !project || !service) {
+    return fallbackId;
+  }
+
+  const matches = containers.filter((c) => {
+    const cProj = c.project || c.composeProject || c.labels?.["com.docker.compose.project"];
+    const cSvc = c.service || c.composeService || c.labels?.["com.docker.compose.service"];
+    return cProj === project && cSvc === service;
+  });
+
+  if (matches.length === 0) return fallbackId;
+
+  const running = matches.find((c) => {
+    const rawState = (c.State || c.state || "").toLowerCase();
+    const rawStatus = (c.Status || c.status || "").toLowerCase();
+    return c.running || rawState === "running" || rawStatus.startsWith("up");
+  });
+
+  const target = running || matches[0];
+  return target.id || target.Id || target.ID || fallbackId;
+}
+
+/**
+ * Matches cross-mod request { action, kind, file, folder } to the corresponding project or Dockerfile in the tree (DM-93, INTEGRATION §3.4).
+ *
+ * @param {{ action?: string, kind?: string, file?: string, folder?: string }} request
+ * @param {Array<object> | { composeProjects: object[], dockerfiles: object[] }} tree
+ * @returns {{ type: "project" | "dockerfile", target: object } | null}
+ */
+export function matchDockerRequestTarget(request, tree) {
+  if (!request || !tree) return null;
+
+  const projects = Array.isArray(tree)
+    ? tree.filter((n) => n.kind === "project")
+    : (tree.composeProjects || []);
+  const dockerfiles = Array.isArray(tree)
+    ? tree.filter((n) => n.kind === "dockerfile")
+    : (tree.dockerfiles || []);
+
+  const reqFile = request.file || "";
+  const reqFolder = request.folder || "";
+  const reqKind = request.kind || "";
+
+  if (reqKind === "compose" || classifyDockerFile(reqFile) === "compose") {
+    for (const p of projects) {
+      if (reqFile && p.configFiles && p.configFiles.includes(reqFile)) {
+        return { type: "project", target: p };
+      }
+      if (reqFolder && p.workingDirs && p.workingDirs.includes(reqFolder)) {
+        return { type: "project", target: p };
+      }
+      if (reqFolder && p.folder === reqFolder) {
+        return { type: "project", target: p };
+      }
+      // Only match basename if reqFile does not contain directory slashes
+      if (reqFile && !reqFile.includes("/") && p.composeBasenames && p.composeBasenames.includes(reqFile)) {
+        return { type: "project", target: p };
+      }
+    }
+  }
+
+  if (reqKind === "dockerfile" || classifyDockerFile(reqFile) === "dockerfile") {
+    for (const df of dockerfiles) {
+      if (reqFile && (df.filePath === reqFile || df.relativePath === reqFile)) {
+        return { type: "dockerfile", target: df };
+      }
+      if (reqFolder && df.filePath && df.filePath.startsWith(reqFolder)) {
+        return { type: "dockerfile", target: df };
+      }
+    }
+  }
+
+  for (const p of projects) {
+    if (reqFile && p.configFiles && p.configFiles.includes(reqFile)) {
+      return { type: "project", target: p };
+    }
+  }
+  for (const df of dockerfiles) {
+    if (reqFile && (df.filePath === reqFile || df.relativePath === reqFile)) {
+      return { type: "dockerfile", target: df };
     }
   }
 
@@ -2371,1037 +2066,883 @@ export function findReusableTerminal(terminals, argv, spaceId) {
 }
 
 /**
- * Builds the exact CLI argv for lifecycle actions across projects, services, and containers (DM-50..83).
- * Covers all 26 lifecycle actions in DESIGN.md §4.5.
+ * Parses Docker human-readable size strings (e.g. "1.24GB", "45.2MB", "812kB", "0B") into numeric bytes (DM-100, DM-120).
  *
- * @param {string | { id?: string }} item
- * @param {any} target
- * @returns {string[]}
+ * @param {string | number} sizeStr
+ * @returns {number}
  */
-export function buildActionArgs(item, target) {
-  const actionId = typeof item === "string" ? item : (item?.id || "");
-  const t = target || {};
-  const kind = t.kind || t.type || (t.service ? "service" : t.project ? "project" : t.id ? "container" : "");
-
-  // Project Actions (10)
-  if (actionId === "project.up" || (actionId === "up" && kind === "project")) {
-    return buildComposeArgs(t, ["up", "-d"]);
-  }
-  if (actionId === "project.up_build" || (actionId === "up-build" && kind === "project")) {
-    return buildComposeArgs(t, ["up", "-d", "--build"]);
-  }
-  if (actionId === "project.start" || (actionId === "start" && kind === "project")) {
-    return buildComposeArgs(t, ["start"]);
-  }
-  if (actionId === "project.stop" || (actionId === "stop" && kind === "project")) {
-    return buildComposeArgs(t, ["stop"]);
-  }
-  if (actionId === "project.restart" || (actionId === "restart" && kind === "project")) {
-    return buildComposeArgs(t, ["restart"]);
-  }
-  if (actionId === "project.pull" || (actionId === "pull" && kind === "project")) {
-    return buildComposeArgs(t, ["pull"]);
-  }
-  if (actionId === "project.build" || (actionId === "build" && kind === "project")) {
-    return buildComposeArgs(t, ["build"]);
-  }
-  if (actionId === "project.logs" || (actionId === "logs" && kind === "project")) {
-    const composeArgs = buildComposeArgs(t, []);
-    return ["docker", ...composeArgs, "logs", "-f", "--tail", "500"];
-  }
-  if (actionId === "project.down" || (actionId === "down" && kind === "project")) {
-    return buildProjectDownArgs(t, { removeVolumes: false });
-  }
-  if (
-    actionId === "project.down_volumes" ||
-    actionId === "down -v" ||
-    (actionId === "down-volume" && kind === "project")
-  ) {
-    return buildProjectDownVolumesArgs(t);
-  }
-
-  // Service Actions (9)
-  const serviceName = t.service || t.name || "";
-  if (actionId === "service.start" || (actionId === "start" && kind === "service")) {
-    return buildComposeArgs(t, ["start", serviceName]);
-  }
-  if (actionId === "service.stop" || (actionId === "stop" && kind === "service")) {
-    return buildComposeArgs(t, ["stop", serviceName]);
-  }
-  if (actionId === "service.restart" || (actionId === "restart" && kind === "service")) {
-    return buildComposeArgs(t, ["restart", serviceName]);
-  }
-  if (actionId === "service.up" || (actionId === "up" && kind === "service")) {
-    return buildComposeArgs(t, ["up", "-d", serviceName]);
-  }
-  if (actionId === "service.rebuild" || (actionId === "rebuild" && kind === "service")) {
-    return buildServiceRebuildArgs(t, serviceName);
-  }
-  if (actionId === "service.recreate" || (actionId === "recreate" && kind === "service")) {
-    return buildServiceRecreateArgs(t, serviceName);
-  }
-  if (actionId === "service.logs" || (actionId === "logs" && kind === "service")) {
-    return buildServiceLogsArgs(t, serviceName, { tail: 500 });
-  }
-  if (actionId === "service.shell" || (actionId === "shell" && kind === "service")) {
-    const contId = t.containerId || t.id || t.containers?.[0]?.id || "";
-    return buildContainerShellArgs(contId, "auto");
-  }
-  if (
-    actionId === "service.remove" ||
-    actionId === "service.rm" ||
-    (actionId === "rm" && kind === "service")
-  ) {
-    return buildServiceRmArgs(t, serviceName);
-  }
-
-  // Container Actions (9)
-  const containerId = t.id || t.containerId || t.shortId || "";
-  const isRunning = Boolean(
-    t.isRunning || t.running || t.state?.running || t.state === "running"
-  );
-
-  if (actionId === "container.start" || (actionId === "start" && kind === "container")) {
-    return ["start", containerId];
-  }
-  if (actionId === "container.stop" || (actionId === "stop" && kind === "container")) {
-    return ["stop", containerId];
-  }
-  if (actionId === "container.restart" || (actionId === "restart" && kind === "container")) {
-    return ["restart", containerId];
-  }
-  if (actionId === "container.pause" || (actionId === "pause" && kind === "container")) {
-    return ["pause", containerId];
-  }
-  if (actionId === "container.unpause" || (actionId === "unpause" && kind === "container")) {
-    return ["unpause", containerId];
-  }
-  if (actionId === "container.kill" || (actionId === "kill" && kind === "container")) {
-    return ["kill", containerId];
-  }
-  if (
-    actionId === "container.remove" ||
-    actionId === "container.rm" ||
-    (actionId === "rm" && kind === "container")
-  ) {
-    return isRunning ? ["rm", "-f", containerId] : ["rm", containerId];
-  }
-  if (actionId === "container.logs" || (actionId === "logs" && kind === "container")) {
-    return buildContainerLogsArgs(containerId, { tail: 500 });
-  }
-  if (actionId === "container.shell" || (actionId === "shell" && kind === "container")) {
-    return buildContainerShellArgs(containerId, "auto");
-  }
-
-  throw new Error(`Unknown action: ${actionId} for target kind: ${kind}`);
-}
-
-/**
- * Builds the exact ordered list of context menu items for a target resource (DM-50..78).
- *
- * Each item has `{ id, label, enabled, reason, ...(danger ? { danger: true } : {}) }`.
- * Destructive items are flagged `danger: true` and placed last.
- * Disabled items carry a human reason string (`compose file not found`, `container is not running`, `no published ports`).
- *
- * @param {any} target
- * @param {any} [state]
- * @returns {Array<{ id: string, label: string, enabled: boolean, reason: string | null, danger?: boolean }>}
- */
-export function buildContextMenuItems(target, state = {}) {
-  const t = target || {};
-  const kind =
-    t.kind ||
-    t.type ||
-    (t.service ? "service" : t.project ? "project" : t.id ? "container" : "project");
-
-  const hasFiles = hasUsableConfigFiles(t);
-  const isRunning = Boolean(
-    t.isRunning ||
-      t.running ||
-      t.state?.running ||
-      t.state === "running" ||
-      (typeof t.status === "string" && t.status.toLowerCase().startsWith("up"))
-  );
-  const isPaused = Boolean(
-    t.isPaused ||
-      t.paused ||
-      t.state?.paused ||
-      t.state === "paused" ||
-      (typeof t.status === "string" && t.status.toLowerCase().includes("paused"))
-  );
-  const portMappings = formatPortMappings(
-    t.ports || t.publishedPorts || t.data?.ports || []
-  );
-  const hasPublishedPorts = portMappings.some((p) => p.published);
-
-  if (kind === "project") {
-    const nonDestructive = [
-      {
-        id: "project.up",
-        label: "Up",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "project.up_build",
-        label: "Up (build)",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "project.start",
-        label: "Start",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "project.stop",
-        label: "Stop",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "project.restart",
-        label: "Restart",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "project.pull",
-        label: "Pull images",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "project.build",
-        label: "Build",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "project.logs",
-        label: "Logs",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "project.open_file",
-        label: "Open compose file",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "project.copy_name",
-        label: "Copy project name",
-        enabled: true,
-        reason: null,
-      },
-    ];
-
-    const destructive = [
-      {
-        id: "project.down",
-        label: "Down",
-        enabled: true,
-        reason: null,
-        danger: true,
-      },
-      {
-        id: "project.down_volumes",
-        label: "Down + remove volumes",
-        enabled: true,
-        reason: null,
-        danger: true,
-      },
-    ];
-
-    return [...nonDestructive, ...destructive];
-  }
-
-  if (kind === "service") {
-    const nonDestructive = [
-      {
-        id: "service.start",
-        label: "Start",
-        enabled: !isRunning,
-        reason: isRunning ? "container is already running" : null,
-      },
-      {
-        id: "service.stop",
-        label: "Stop",
-        enabled: isRunning,
-        reason: isRunning ? null : "container is not running",
-      },
-      {
-        id: "service.restart",
-        label: "Restart",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "service.up",
-        label: "Up",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "service.rebuild",
-        label: "Rebuild",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "service.recreate",
-        label: "Recreate",
-        enabled: hasFiles,
-        reason: hasFiles ? null : "compose file not found",
-      },
-      {
-        id: "service.logs",
-        label: "Logs",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "service.shell",
-        label: "Shell",
-        enabled: isRunning,
-        reason: isRunning ? null : "container is not running",
-      },
-      {
-        id: "service.inspect",
-        label: "Inspect",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "service.open_port",
-        label: "Open in browser",
-        enabled: hasPublishedPorts,
-        reason: hasPublishedPorts ? null : "no published ports",
-      },
-      {
-        id: "service.copy_name",
-        label: "Copy service name",
-        enabled: true,
-        reason: null,
-      },
-    ];
-
-    const destructive = [
-      {
-        id: "service.remove",
-        label: "Remove",
-        enabled: true,
-        reason: null,
-        danger: true,
-      },
-    ];
-
-    return [...nonDestructive, ...destructive];
-  }
-
-  if (kind === "container") {
-    const nonDestructive = [
-      {
-        id: "container.start",
-        label: "Start",
-        enabled: !isRunning,
-        reason: isRunning ? "container is already running" : null,
-      },
-      {
-        id: "container.stop",
-        label: "Stop",
-        enabled: isRunning,
-        reason: isRunning ? null : "container is not running",
-      },
-      {
-        id: "container.restart",
-        label: "Restart",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "container.pause",
-        label: "Pause",
-        enabled: isRunning && !isPaused,
-        reason: !isRunning
-          ? "container is not running"
-          : isPaused
-          ? "container is already paused"
-          : null,
-      },
-      {
-        id: "container.unpause",
-        label: "Unpause",
-        enabled: isPaused,
-        reason: isPaused ? null : "container is not paused",
-      },
-      {
-        id: "container.logs",
-        label: "Logs",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "container.shell",
-        label: "Shell",
-        enabled: isRunning,
-        reason: isRunning ? null : "container is not running",
-      },
-      {
-        id: "container.inspect",
-        label: "Inspect",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "container.open_port",
-        label: "Open in browser",
-        enabled: hasPublishedPorts,
-        reason: hasPublishedPorts ? null : "no published ports",
-      },
-      {
-        id: "container.copy_id",
-        label: "Copy ID",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "container.copy_name",
-        label: "Copy name",
-        enabled: true,
-        reason: null,
-      },
-    ];
-
-    const destructive = [
-      {
-        id: "container.kill",
-        label: "Kill",
-        enabled: isRunning,
-        reason: isRunning ? null : "container is not running",
-        danger: true,
-      },
-      {
-        id: "container.remove",
-        label: "Remove",
-        enabled: true,
-        reason: null,
-        danger: true,
-      },
-    ];
-
-    return [...nonDestructive, ...destructive];
-  }
-
-  if (kind === "dockerfile") {
-    const hasBuiltAndRun = Boolean(target.hasBuiltAndRun || state.hasBuiltAndRun);
-    const hasFile = Boolean(target.path || target.file);
-    return [
-      {
-        id: "dockerfile.build",
-        label: "Build image…",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "dockerfile.build_run",
-        label: "Build & run…",
-        enabled: true,
-        reason: null,
-      },
-      {
-        id: "dockerfile.rebuild_replace",
-        label: "Rebuild & replace",
-        enabled: hasBuiltAndRun,
-        reason: hasBuiltAndRun ? null : "no previous build & run",
-      },
-      {
-        id: "dockerfile.open_file",
-        label: "Open Dockerfile",
-        enabled: hasFile,
-        reason: hasFile ? null : "dockerfile not found",
-      },
-    ];
-  }
-
-  return [];
-}
-
-/**
- * Builds deterministic props for opening an inspector tab (DM-44).
- *
- * @param {any} target
- * @param {{ folder?: string | null, on?: string | null }} [options]
- * @returns {{ mod: string, props: { folder: string | null, on: string | null, inspect: { kind: string, id: string, project: string | null, service: string | null } } }}
- */
-export function buildInspectTabProps(target, options = {}) {
-  const t = target || {};
-  const kind =
-    t.kind ||
-    t.type ||
-    (t.service ? "service" : t.project ? "project" : t.id ? "container" : "container");
-  const id = t.id || t.containerId || t.name || "";
-  const project = t.project || null;
-  const service = t.service || null;
-  const folder = options.folder ?? t.folder ?? null;
-  const on = options.on ?? t.on ?? null;
-
-  return {
-    mod: "docker-manager",
-    props: {
-      folder,
-      on,
-      inspect: {
-        kind,
-        id,
-        project,
-        service,
-      },
-    },
+export function parseDockerSizeBytes(sizeStr) {
+  if (typeof sizeStr === "number") return sizeStr;
+  if (!sizeStr || typeof sizeStr !== "string") return 0;
+  const match = sizeStr.trim().match(/^([0-9.]+)\s*([a-zA-Z]+)?$/);
+  if (!match) return 0;
+  const num = parseFloat(match[1]);
+  if (isNaN(num)) return 0;
+  const unit = (match[2] || "B").toLowerCase();
+  const multipliers = {
+    b: 1,
+    k: 1000,
+    kb: 1000,
+    kib: 1024,
+    m: 1000 * 1000,
+    mb: 1000 * 1000,
+    mib: 1024 * 1024,
+    g: 1000 * 1000 * 1000,
+    gb: 1000 * 1000 * 1000,
+    gib: 1024 * 1024 * 1024,
+    t: 1000 * 1000 * 1000 * 1000,
+    tb: 1000 * 1000 * 1000 * 1000,
+    tib: 1024 * 1024 * 1024 * 1024,
+    p: 1000 * 1000 * 1000 * 1000 * 1000,
+    pb: 1000 * 1000 * 1000 * 1000 * 1000,
   };
+  return Math.round(num * (multipliers[unit] ?? 1));
 }
 
 /**
- * Returns a stable name for an inspector tab (DM-44).
+ * Returns true when volumeName is a 64-character lowercase/uppercase hex string (DM-105).
  *
- * @param {any} target
- * @returns {string}
+ * @param {string} volumeName
+ * @returns {boolean}
  */
-export function inspectTabName(target) {
-  const t = target?.inspect || target || {};
-  if (t.project && t.service) {
-    return `Inspect: ${t.project}/${t.service}`;
-  }
-  if (t.name) {
-    return `Inspect: ${t.name}`;
-  }
-  if (t.id) {
-    return `Inspect: ${t.id}`;
-  }
-  if (t.project) {
-    return `Inspect: ${t.project}`;
-  }
-  return `Inspect: ${t.kind || "docker"}`;
+export function isAnonymousVolume(volumeName) {
+  if (!volumeName || typeof volumeName !== "string") return false;
+  return /^[0-9a-f]{64}$/i.test(volumeName.trim());
 }
 
 /**
- * Re-resolves a Compose service across recreation by (project, service),
- * returning the new container ID, or null when the service no longer exists (DM-46).
+ * Builds the image tree view, cross-referencing containers to detect usage and separating dangling images (DM-100).
  *
- * @param {{ kind?: string, id?: string, project?: string | null, service?: string | null }} inspect
- * @param {any} containersTree
- * @returns {string | null}
+ * @param {Array<object>} imagesRaw
+ * @param {Array<object>} containersRaw
+ * @param {{ filter?: string, sortBy?: "name" | "size" | "created" }} options
+ * @returns {{ images: Array<object>, dangling: Array<object>, totalCount: number, inUseCount: number }}
  */
-export function resolveInspectorTarget(inspect, containersTree) {
-  if (!inspect) return null;
+export function buildImageTree(imagesRaw = [], containersRaw = [], { filter = "", sortBy = "name" } = {}) {
+  const imagesList = Array.isArray(imagesRaw) ? imagesRaw : [];
+  const containersList = Array.isArray(containersRaw) ? containersRaw : [];
 
-  // Compose service target: re-resolve by project + service
-  if (inspect.project && inspect.service) {
-    const projName = inspect.project;
-    const sName = inspect.service;
+  const processed = [];
 
-    // Structure 1: flat array of rows or containers
-    if (Array.isArray(containersTree)) {
-      const matchingRow = containersTree.find(
-        (r) =>
-          r &&
-          r.project === projName &&
-          r.service === sName &&
-          (r.containerId || r.id)
+  for (const img of imagesList) {
+    if (!img || typeof img !== "object") continue;
+    const repo = img.Repository || img.repository || img.repo || "";
+    const tag = img.Tag || img.tag || "";
+    const id = img.ID || img.Id || img.id || "";
+    const shortId = id.replace(/^sha256:/, "").slice(0, 12);
+    const size = img.Size || img.size || "0B";
+    const sizeBytes = parseDockerSizeBytes(size);
+    const created = img.CreatedAt || img.CreatedSince || img.created || "";
+    const isDangling = repo === "<none>" || tag === "<none>" || !repo || img.dangling === true;
+    const name = isDangling ? (repo === "<none>" ? `<none>:${tag}` : shortId) : `${repo}:${tag}`;
+
+    // Cross-reference containers
+    const using = [];
+    for (const c of containersList) {
+      if (!c || typeof c !== "object") continue;
+      const cName = (c.Names || c.Name || c.name || c.id || "").replace(/^\//, "");
+      const cRunning = Boolean(
+        c.running ||
+        (c.State || c.state || "").toLowerCase() === "running" ||
+        (c.Status || c.status || "").toLowerCase().startsWith("up")
       );
-      if (matchingRow) {
-        return matchingRow.containerId || matchingRow.id || null;
+      const cImg = c.Image || c.image || "";
+      const cImgId = c.ImageID || c.imageId || "";
+
+      let matched = false;
+      if (cImg && (cImg === name || cImg === repo || cImg === `${repo}:${tag}`)) {
+        matched = true;
+      } else if (id && cImgId && (cImgId === id || cImgId.startsWith(id) || id.startsWith(cImgId))) {
+        matched = true;
       }
 
-      const proj = containersTree.find(
-        (p) => p && (p.name === projName || p.project === projName)
-      );
-      if (!proj) return null;
-      const s = (proj.services || []).find(
-        (srv) => srv && (srv.name === sName || srv.service === sName)
-      );
-      if (!s) return null;
-      if (s.containers && s.containers.length > 0) {
-        if (inspect.id) {
-          const match = s.containers.find(
-            (c) => c.id === inspect.id || c.name === inspect.id
-          );
-          if (match) return match.id || null;
-        }
-        return s.containers[0].id || null;
-      }
-      return null;
-    }
-
-    // Structure 2: object with composeProjects / projects
-    if (containersTree && typeof containersTree === "object") {
-      const projects = containersTree.composeProjects || containersTree.projects || [];
-      const proj = projects.find(
-        (p) => p && (p.name === projName || p.project === projName)
-      );
-      if (!proj) return null;
-      const s = (proj.services || []).find(
-        (srv) => srv && (srv.name === sName || srv.service === sName)
-      );
-      if (!s) return null;
-      if (s.containers && s.containers.length > 0) {
-        if (inspect.id) {
-          const match = s.containers.find(
-            (c) => c.id === inspect.id || c.name === inspect.id
-          );
-          if (match) return match.id || null;
-        }
-        return s.containers[0].id || null;
-      }
-      return null;
-    }
-
-    return null;
-  }
-
-  // Standalone container target: resolve by id
-  const targetId = inspect.id;
-  if (!targetId) return null;
-
-  if (Array.isArray(containersTree)) {
-    const match = containersTree.find(
-      (c) => c && (c.id === targetId || c.containerId === targetId || c.name === targetId)
-    );
-    return match ? match.id || match.containerId || targetId : null;
-  }
-
-  if (containersTree && typeof containersTree === "object") {
-    const standalone = containersTree.standalone || [];
-    const match = standalone.find(
-      (c) => c && (c.id === targetId || c.name === targetId)
-    );
-    if (match) return match.id || targetId;
-
-    const projects = containersTree.composeProjects || containersTree.projects || [];
-    for (const p of projects) {
-      for (const s of p.services || []) {
-        for (const c of s.containers || []) {
-          if (c.id === targetId || c.name === targetId) return c.id;
-        }
-      }
-    }
-  }
-
-  return targetId || null;
-}
-
-/**
- * Processes environment entries, sorting alphabetically by key,
- * masking values of secret keys unless revealed (DM-45).
- *
- * @param {Array<string | { key: string, value: string }> | Record<string, string>} env
- * @param {boolean | Set<string> | Array<string>} [revealed=false]
- * @returns {Array<{ key: string, value: string, secret: boolean, masked: boolean }>}
- */
-export function maskEnvEntries(env, revealed = false) {
-  if (!env) return [];
-
-  const entries = [];
-  if (Array.isArray(env)) {
-    for (const item of env) {
-      if (typeof item === "string") {
-        const eq = item.indexOf("=");
-        if (eq >= 0) {
-          entries.push({ key: item.slice(0, eq), value: item.slice(eq + 1) });
-        } else {
-          entries.push({ key: item, value: "" });
-        }
-      } else if (item && typeof item === "object") {
-        entries.push({ key: item.key || item.name || "", value: item.value || "" });
-      }
-    }
-  } else if (typeof env === "object") {
-    for (const [key, value] of Object.entries(env)) {
-      entries.push({ key, value: String(value ?? "") });
-    }
-  }
-
-  entries.sort((a, b) => a.key.localeCompare(b.key));
-
-  return entries.map((e) => {
-    const isSecret = isSecretEnvKey(e.key);
-    let isRevealed = false;
-    if (revealed === true) {
-      isRevealed = true;
-    } else if (revealed instanceof Set) {
-      isRevealed = revealed.has(e.key);
-    } else if (Array.isArray(revealed)) {
-      isRevealed = revealed.includes(e.key);
-    }
-
-    const masked = isSecret && !isRevealed;
-    return {
-      key: e.key,
-      value: masked ? "••••••••" : e.value,
-      secret: isSecret,
-      masked,
-    };
-  });
-}
-
-/**
- * Parses stdout from `docker stats --no-stream --format '{{json .}}'` (DM-45).
- *
- * @param {string | object} stdout
- * @returns {{
- *   container: string,
- *   id: string,
- *   name: string,
- *   cpuPerc: string,
- *   memPerc: string,
- *   memUsage: string,
- *   memLimit: string,
- *   memUsageRaw: string,
- *   netIO: string,
- *   blockIO: string,
- *   pids: number,
- *   raw: any,
- * }}
- */
-export function parseDockerStats(stdout) {
-  if (!stdout) {
-    return {
-      container: "",
-      id: "",
-      name: "",
-      cpuPerc: "0.00%",
-      memPerc: "0.00%",
-      memUsage: "0B",
-      memLimit: "0B",
-      memUsageRaw: "0B / 0B",
-      netIO: "0B / 0B",
-      blockIO: "0B / 0B",
-      pids: 0,
-      raw: null,
-    };
-  }
-
-  let obj = stdout;
-  if (typeof stdout === "string") {
-    const trimmed = stdout.trim();
-    if (!trimmed) {
-      return parseDockerStats(null);
-    }
-    const firstLine = trimmed.split("\n")[0].trim();
-    try {
-      obj = JSON.parse(firstLine);
-    } catch {
-      return parseDockerStats(null);
-    }
-  }
-
-  const rawUsage = obj.MemUsage || "";
-  const parts = rawUsage.split("/").map((s) => s.trim());
-  const memUsage = parts[0] || "0B";
-  const memLimit = parts[1] || "0B";
-
-  return {
-    container: obj.Container || obj.ID || "",
-    id: obj.ID || "",
-    name: obj.Name || "",
-    cpuPerc: obj.CPUPerc || "0.00%",
-    memPerc: obj.MemPerc || "0.00%",
-    memUsage,
-    memLimit,
-    memUsageRaw: rawUsage || "0B / 0B",
-    netIO: obj.NetIO || "0B / 0B",
-    blockIO: obj.BlockIO || "0B / 0B",
-    pids: parseInt(obj.PIDs, 10) || 0,
-    raw: obj,
-  };
-}
-
-/**
- * Formats a byte number into a human-readable string (e.g. 0 B, 1.4 MB, 2.1 GB).
- *
- * @param {number | string} value
- * @returns {string}
- */
-export function formatBytes(value) {
-  const bytes = Number(value);
-  if (!bytes || isNaN(bytes) || bytes <= 0) return "0 B";
-
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  if (i <= 0) return `${bytes} B`;
-
-  const val = bytes / Math.pow(1024, i);
-  const rounded = val >= 10 || val % 1 === 0 ? val.toFixed(0) : val.toFixed(1);
-  return `${Number(rounded)} ${units[i]}`;
-}
-
-/**
- * Formats an ISO timestamp or date into relative time (e.g. 3 minutes ago).
- *
- * @param {string | number | Date} iso
- * @param {number} [now=Date.now()]
- * @returns {string}
- */
-export function formatRelativeTime(iso, now = Date.now()) {
-  if (!iso) return "";
-  const date = typeof iso === "object" && iso instanceof Date ? iso : new Date(iso);
-  const time = date.getTime();
-  if (isNaN(time)) return String(iso);
-
-  const diffSec = Math.max(0, Math.floor((now - time) / 1000));
-  if (diffSec < 5) return "just now";
-  if (diffSec < 60) return `${diffSec} seconds ago`;
-
-  const mins = Math.floor(diffSec / 60);
-  if (mins < 60) return `${mins} ${mins === 1 ? "minute" : "minutes"} ago`;
-
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours} ${hours === 1 ? "hour" : "hours"} ago`;
-
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} ${days === 1 ? "day" : "days"} ago`;
-
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months} ${months === 1 ? "month" : "months"} ago`;
-
-  const years = Math.floor(days / 365);
-  return `${years} ${years === 1 ? "year" : "years"} ago`;
-}
-
-/**
- * Formats uptime from a container's StartedAt timestamp (e.g. up 2 days).
- *
- * @param {string | number | Date} startedAt
- * @param {number} [now=Date.now()]
- * @returns {string}
- */
-export function formatUptime(startedAt, now = Date.now()) {
-  if (!startedAt) return "";
-  const date = typeof startedAt === "object" && startedAt instanceof Date ? startedAt : new Date(startedAt);
-  const time = date.getTime();
-  if (isNaN(time)) return "";
-
-  const diffSec = Math.max(0, Math.floor((now - time) / 1000));
-  if (diffSec < 60) return `up ${diffSec} seconds`;
-
-  const mins = Math.floor(diffSec / 60);
-  if (mins < 60) return `up ${mins} ${mins === 1 ? "minute" : "minutes"}`;
-
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `up ${hours} ${hours === 1 ? "hour" : "hours"}`;
-
-  const days = Math.floor(hours / 24);
-  return `up ${days} ${days === 1 ? "day" : "days"}`;
-}
-
-/**
- * Normalizes raw `docker image inspect` output (DM-100..101).
- *
- * @param {string | object | Array<any>} raw
- * @returns {{
- *   id: string,
- *   shortId: string,
- *   tags: string[],
- *   size: number,
- *   sizeFormatted: string,
- *   created: string,
- *   architecture: string,
- *   os: string,
- *   labels: Record<string, string>,
- *   env: string[],
- *   cmd: string[],
- *   entrypoint: string[],
- *   raw: any,
- * }}
- */
-export function normalizeImageInspect(raw) {
-  let obj = raw;
-  if (typeof raw === "string") {
-    try {
-      obj = JSON.parse(raw);
-    } catch {
-      obj = {};
-    }
-  }
-  if (Array.isArray(obj)) {
-    obj = obj[0] || {};
-  }
-  if (!obj || typeof obj !== "object") obj = {};
-
-  const id = obj.Id || "";
-  const shortId = id.replace(/^sha256:/, "").slice(0, 12);
-  const tags = Array.isArray(obj.RepoTags) ? obj.RepoTags : [];
-  const size = typeof obj.Size === "number" ? obj.Size : 0;
-  const config = obj.Config || {};
-
-  return {
-    id,
-    shortId,
-    tags,
-    size,
-    sizeFormatted: formatBytes(size),
-    created: obj.Created || "",
-    architecture: obj.Architecture || "",
-    os: obj.Os || "",
-    labels: config.Labels || obj.Labels || {},
-    env: Array.isArray(config.Env) ? config.Env : [],
-    cmd: Array.isArray(config.Cmd) ? config.Cmd : [],
-    entrypoint: Array.isArray(config.Entrypoint) ? config.Entrypoint : [],
-    raw: obj,
-  };
-}
-
-/**
- * Normalizes raw `docker volume inspect` output (DM-106).
- *
- * @param {string | object | Array<any>} raw
- * @returns {{
- *   name: string,
- *   driver: string,
- *   mountpoint: string,
- *   createdAt: string,
- *   labels: Record<string, string>,
- *   scope: string,
- *   options: Record<string, string> | null,
- *   raw: any,
- * }}
- */
-export function normalizeVolumeInspect(raw) {
-  let obj = raw;
-  if (typeof raw === "string") {
-    try {
-      obj = JSON.parse(raw);
-    } catch {
-      obj = {};
-    }
-  }
-  if (Array.isArray(obj)) {
-    obj = obj[0] || {};
-  }
-  if (!obj || typeof obj !== "object") obj = {};
-
-  return {
-    name: obj.Name || "",
-    driver: obj.Driver || "local",
-    mountpoint: obj.Mountpoint || "",
-    createdAt: obj.CreatedAt || "",
-    labels: obj.Labels || {},
-    scope: obj.Scope || "local",
-    options: obj.Options || null,
-    raw: obj,
-  };
-}
-
-/**
- * Normalizes raw `docker network inspect` output (DM-116).
- *
- * @param {string | object | Array<any>} raw
- * @returns {{
- *   id: string,
- *   shortId: string,
- *   name: string,
- *   driver: string,
- *   scope: string,
- *   subnet: string,
- *   gateway: string,
- *   internal: boolean,
- *   containers: Array<{ id: string, shortId: string, name: string, ip: string, macAddress: string }>,
- *   labels: Record<string, string>,
- *   raw: any,
- * }}
- */
-export function normalizeNetworkInspect(raw) {
-  let obj = raw;
-  if (typeof raw === "string") {
-    try {
-      obj = JSON.parse(raw);
-    } catch {
-      obj = {};
-    }
-  }
-  if (Array.isArray(obj)) {
-    obj = obj[0] || {};
-  }
-  if (!obj || typeof obj !== "object") obj = {};
-
-  const id = obj.Id || "";
-  const shortId = id.slice(0, 12);
-  const ipamConfig = obj.IPAM?.Config?.[0] || {};
-  const containers = [];
-
-  if (obj.Containers && typeof obj.Containers === "object") {
-    for (const [cid, cinfo] of Object.entries(obj.Containers)) {
-      if (cinfo && typeof cinfo === "object") {
-        const ip4 = cinfo.IPv4Address || "";
-        const ip = ip4.includes("/") ? ip4.split("/")[0] : ip4;
-        containers.push({
-          id: cid,
-          shortId: cid.slice(0, 12),
-          name: cinfo.Name || "",
-          ip,
-          macAddress: cinfo.MacAddress || "",
+      if (matched) {
+        using.push({
+          id: c.id || c.ID || cName,
+          name: cName,
+          running: cRunning,
         });
       }
     }
+
+    const inUse = using.length > 0;
+    const usedByRunningContainer = using.some((u) => u.running);
+
+    // Filter matching
+    if (filter) {
+      const q = filter.trim().toLowerCase();
+      const textMatch =
+        name.toLowerCase().includes(q) ||
+        repo.toLowerCase().includes(q) ||
+        tag.toLowerCase().includes(q) ||
+        id.toLowerCase().includes(q) ||
+        shortId.toLowerCase().includes(q);
+      if (!textMatch) continue;
+    }
+
+    processed.push({
+      id,
+      shortId,
+      repository: repo,
+      tag,
+      name,
+      size,
+      sizeBytes,
+      created,
+      dangling: isDangling,
+      inUse,
+      usedByRunningContainer,
+      usedByContainers: using,
+      labels: parseContainerLabels(img.Labels || img.labels),
+      raw: img,
+    });
   }
+
+  // Split into tagged vs dangling
+  const taggedList = processed.filter((i) => !i.dangling);
+  const danglingList = processed.filter((i) => i.dangling);
+
+  // Sort
+  const sortFn = (a, b) => {
+    if (sortBy === "size") {
+      return b.sizeBytes - a.sizeBytes;
+    }
+    if (sortBy === "created") {
+      return (b.created || "").localeCompare(a.created || "");
+    }
+    return (a.name || "").localeCompare(b.name || "");
+  };
+
+  taggedList.sort(sortFn);
+  danglingList.sort(sortFn);
+
+  const totalCount = taggedList.length + danglingList.length;
+  const inUseCount = taggedList.filter((i) => i.inUse).length + danglingList.filter((i) => i.inUse).length;
+
+  return {
+    images: taggedList,
+    dangling: danglingList,
+    totalCount,
+    inUseCount,
+  };
+}
+
+/**
+ * Returns context menu items for an image (DM-101).
+ *
+ * @param {object} image
+ * @returns {Array<object>}
+ */
+export function getImageMenuItems(image) {
+  if (!image) return [];
+  const isDangling = Boolean(image.dangling);
+  const usedByRunning = Boolean(image.usedByRunningContainer);
+
+  return [
+    {
+      id: "run-image",
+      label: "Run…",
+      icon: "play.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "inspect-image",
+      label: "Inspect",
+      icon: "layers.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "pull-image",
+      label: "Pull again",
+      icon: "refresh.svg",
+      enabled: !isDangling,
+      disabledReason: isDangling ? "Cannot pull dangling image" : null,
+      destructive: false,
+    },
+    {
+      id: "tag-image",
+      label: "Tag…",
+      icon: "folder.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "copy-id",
+      label: "Copy ID",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "copy-name",
+      label: "Copy Repository:Tag",
+      icon: "copy.svg",
+      enabled: !isDangling,
+      disabledReason: isDangling ? "Dangling image has no tag" : null,
+      destructive: false,
+    },
+    {
+      id: "remove-image",
+      label: "Remove",
+      icon: "trash.svg",
+      enabled: !usedByRunning,
+      disabledReason: usedByRunning ? "Used by running container" : null,
+      destructive: true,
+    },
+  ];
+}
+
+/**
+ * Builds the volume tree view, cross-referencing containers to detect mounts and separating anonymous volumes (DM-105).
+ *
+ * @param {Array<object>} volumesRaw
+ * @param {Array<object>} containersRaw
+ * @param {Record<string, string>} [volumeSizes={}]
+ * @param {{ scope?: "all" | "space", spaceProjects?: string[], filter?: string }} [options={}]
+ * @returns {{ volumes: Array<object>, anonymous: Array<object>, totalCount: number, inUseCount: number }}
+ */
+export function buildVolumeTree(
+  volumesRaw = [],
+  containersRaw = [],
+  volumeSizes = {},
+  { scope = "all", spaceProjects = [], filter = "" } = {}
+) {
+  const volumesList = Array.isArray(volumesRaw) ? volumesRaw : [];
+  const containersList = Array.isArray(containersRaw) ? containersRaw : [];
+
+  const processed = [];
+
+  for (const v of volumesList) {
+    if (!v || typeof v !== "object") continue;
+    const name = v.Name || v.name || "";
+    if (!name) continue;
+
+    const driver = v.Driver || v.driver || "local";
+    const volumeScope = v.Scope || v.scope || "local";
+    const labels = parseContainerLabels(v.Labels || v.labels);
+    const project = labels["com.docker.compose.project"] || null;
+    const composeVolume = labels["com.docker.compose.volume"] || null;
+    const isAnon = isAnonymousVolume(name);
+    const size = volumeSizes[name] || v.Size || null;
+    const sizeBytes = size ? parseDockerSizeBytes(size) : 0;
+
+    // Cross-reference containers
+    const using = [];
+    for (const c of containersList) {
+      if (!c || typeof c !== "object") continue;
+      const cName = (c.Names || c.Name || c.name || c.id || "").replace(/^\//, "");
+      const cRunning = Boolean(
+        c.running ||
+        (c.State || c.state || "").toLowerCase() === "running" ||
+        (c.Status || c.status || "").toLowerCase().startsWith("up")
+      );
+      const cProject = c.project || c.labels?.["com.docker.compose.project"] || null;
+
+      let matched = false;
+      const mounts = c.Mounts || c.mounts;
+      if (Array.isArray(mounts)) {
+        matched = mounts.some((m) => m && (m.Name === name || m.Source === name || m.destination === name));
+      } else if (typeof mounts === "string") {
+        const tokens = mounts.split(",").map((s) => s.trim().split(":")[0]);
+        matched = tokens.includes(name) || mounts.includes(name);
+      }
+
+      if (matched) {
+        using.push({
+          id: c.id || c.ID || cName,
+          name: cName,
+          running: cRunning,
+          project: cProject,
+        });
+      }
+    }
+
+    const inUse = using.length > 0;
+    const usedByRunningContainer = using.some((u) => u.running);
+
+    // Scope filter ("space" keeps volumes owning to space projects or used by space containers)
+    if (scope === "space" && Array.isArray(spaceProjects) && spaceProjects.length > 0) {
+      const matchesProject = project && spaceProjects.includes(project);
+      const matchesUsingContainer = using.some((u) => u.project && spaceProjects.includes(u.project));
+      if (!matchesProject && !matchesUsingContainer) {
+        continue;
+      }
+    }
+
+    // Text filter matching
+    if (filter) {
+      const q = filter.trim().toLowerCase();
+      const textMatch =
+        name.toLowerCase().includes(q) ||
+        (project && project.toLowerCase().includes(q)) ||
+        (composeVolume && composeVolume.toLowerCase().includes(q));
+      if (!textMatch) continue;
+    }
+
+    processed.push({
+      name,
+      driver,
+      scope: volumeScope,
+      project,
+      composeVolume,
+      isAnonymous: isAnon,
+      size,
+      sizeBytes,
+      inUse,
+      usedByRunningContainer,
+      usedByContainers: using,
+      labels,
+      raw: v,
+    });
+  }
+
+  // Split named vs anonymous
+  const namedList = processed.filter((v) => !v.isAnonymous);
+  const anonList = processed.filter((v) => v.isAnonymous);
+
+  namedList.sort((a, b) => a.name.localeCompare(b.name));
+  anonList.sort((a, b) => a.name.localeCompare(b.name));
+
+  const totalCount = namedList.length + anonList.length;
+  const inUseCount = namedList.filter((v) => v.inUse).length + anonList.filter((v) => v.inUse).length;
+
+  return {
+    volumes: namedList,
+    anonymous: anonList,
+    totalCount,
+    inUseCount,
+  };
+}
+
+/**
+ * Returns context menu items for a volume (DM-106).
+ *
+ * @param {object} volume
+ * @returns {Array<object>}
+ */
+export function getVolumeMenuItems(volume) {
+  if (!volume) return [];
+  const inUse = Boolean(volume.inUse);
+  const usedByRunning = Boolean(volume.usedByRunningContainer);
+
+  return [
+    {
+      id: "inspect-volume",
+      label: "Inspect",
+      icon: "volume.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "browse-volume",
+      label: "Browse (read-only shell)",
+      icon: "terminal.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "size-volume",
+      label: "Compute Size",
+      icon: "gauge.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "backup-volume",
+      label: "Backup to .tar.gz…",
+      icon: "folder.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "restore-volume",
+      label: "Restore from .tar.gz…",
+      icon: "refresh.svg",
+      enabled: !usedByRunning,
+      disabledReason: usedByRunning ? "Stop using containers first" : null,
+      destructive: true,
+    },
+    {
+      id: "clone-volume",
+      label: "Clone volume…",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "copy-name",
+      label: "Copy Name",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "remove-volume",
+      label: "Remove",
+      icon: "trash.svg",
+      enabled: !inUse,
+      disabledReason: inUse ? "Volume in use" : null,
+      destructive: true,
+    },
+  ];
+}
+
+/**
+ * Builds the network tree view, placing built-in networks at the bottom (DM-115).
+ *
+ * @param {Array<object>} networksRaw
+ * @param {Record<string, object>} [networkInspectMap={}]
+ * @param {{ filter?: string }} [options={}]
+ * @returns {{ networks: Array<object>, builtIn: Array<object>, all: Array<object>, totalCount: number }}
+ */
+export function buildNetworkTree(networksRaw = [], networkInspectMap = {}, { filter = "" } = {}) {
+  const networksList = Array.isArray(networksRaw) ? networksRaw : [];
+  const processed = [];
+
+  for (const n of networksList) {
+    if (!n || typeof n !== "object") continue;
+    const name = n.Name || n.name || "";
+    if (!name) continue;
+
+    const id = n.ID || n.id || "";
+    const shortId = id.slice(0, 12);
+    const driver = n.Driver || n.driver || "bridge";
+    const scope = n.Scope || n.scope || "local";
+    const labels = parseContainerLabels(n.Labels || n.labels);
+    const project = labels["com.docker.compose.project"] || null;
+    const composeNetwork = labels["com.docker.compose.network"] || null;
+    const isBuiltIn = name === "bridge" || name === "host" || name === "none";
+
+    // Connected containers from inspect cache
+    const insp = networkInspectMap[id] || networkInspectMap[name];
+    const containers = insp?.Containers
+      ? Object.entries(insp.Containers).map(([cId, cInfo]) => ({
+          id: cId,
+          shortId: cId.slice(0, 12),
+          name: (cInfo.Name || "").replace(/^\//, ""),
+          ipv4: cInfo.IPv4Address || "",
+          ipv6: cInfo.IPv6Address || "",
+          mac: cInfo.MacAddress || "",
+        }))
+      : [];
+
+    // Filter matching
+    if (filter) {
+      const q = filter.trim().toLowerCase();
+      const textMatch =
+        name.toLowerCase().includes(q) ||
+        driver.toLowerCase().includes(q) ||
+        id.toLowerCase().includes(q) ||
+        shortId.toLowerCase().includes(q) ||
+        (project && project.toLowerCase().includes(q)) ||
+        (composeNetwork && composeNetwork.toLowerCase().includes(q));
+      if (!textMatch) continue;
+    }
+
+    processed.push({
+      id,
+      shortId,
+      name,
+      driver,
+      scope,
+      project,
+      composeNetwork,
+      builtIn: isBuiltIn,
+      connectedContainers: containers,
+      connectedCount: containers.length,
+      labels,
+      raw: n,
+    });
+  }
+
+  const customList = processed.filter((n) => !n.builtIn);
+  const builtInList = processed.filter((n) => n.builtIn);
+
+  customList.sort((a, b) => a.name.localeCompare(b.name));
+  builtInList.sort((a, b) => a.name.localeCompare(b.name));
+
+  const all = [...customList, ...builtInList];
+
+  return {
+    networks: customList,
+    builtIn: builtInList,
+    all,
+    totalCount: all.length,
+  };
+}
+
+/**
+ * Returns context menu items for a network (DM-116).
+ *
+ * @param {object} network
+ * @returns {Array<object>}
+ */
+export function getNetworkMenuItems(network) {
+  if (!network) return [];
+  const isBuiltIn = Boolean(network.builtIn);
+  const connCount = network.connectedCount || 0;
+  const canRemove = !isBuiltIn && connCount === 0;
+  const disabledReason = isBuiltIn ? "Built-in network" : (connCount > 0 ? "Has connected containers" : null);
+
+  return [
+    {
+      id: "inspect-network",
+      label: "Inspect",
+      icon: "network.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "disconnect-network",
+      label: "Disconnect container…",
+      icon: "close.svg",
+      enabled: connCount > 0,
+      disabledReason: connCount > 0 ? null : "No containers connected",
+      destructive: false,
+    },
+    {
+      id: "copy-name",
+      label: "Copy Name",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "copy-id",
+      label: "Copy ID",
+      icon: "copy.svg",
+      enabled: true,
+      disabledReason: null,
+      destructive: false,
+    },
+    {
+      id: "remove-network",
+      label: "Remove",
+      icon: "trash.svg",
+      enabled: canRemove,
+      disabledReason: canRemove ? null : disabledReason,
+      destructive: true,
+    },
+  ];
+}
+
+/**
+ * Parses NDJSON lines from `docker system df --format '{{json .}}'` into a summary object (DM-120).
+ *
+ * @param {string} stdout
+ * @returns {{ images: object, containers: object, volumes: object, buildCache: object }}
+ */
+export function parseSystemDf(stdout) {
+  const result = {
+    images: { type: "Images", totalCount: 0, active: 0, size: "0B", sizeBytes: 0, reclaimable: "0B", reclaimableBytes: 0 },
+    containers: { type: "Containers", totalCount: 0, active: 0, size: "0B", sizeBytes: 0, reclaimable: "0B", reclaimableBytes: 0 },
+    volumes: { type: "Local Volumes", totalCount: 0, active: 0, size: "0B", sizeBytes: 0, reclaimable: "0B", reclaimableBytes: 0 },
+    buildCache: { type: "Build Cache", totalCount: 0, active: 0, size: "0B", sizeBytes: 0, reclaimable: "0B", reclaimableBytes: 0 },
+  };
+
+  if (!stdout || typeof stdout !== "string") return result;
+
+  const lines = stdout.trim().split(/\r?\n/);
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line.trim());
+      const type = (parsed.Type || "").toLowerCase();
+      const totalCount = parseInt(parsed.TotalCount, 10) || 0;
+      const active = parseInt(parsed.Active, 10) || 0;
+      const size = parsed.Size || "0B";
+      const sizeBytes = parseDockerSizeBytes(size);
+      const reclaimable = parsed.Reclaimable || "0B";
+      const reclaimableClean = reclaimable.replace(/\s*\(.*\)$/, "");
+      const reclaimableBytes = parseDockerSizeBytes(reclaimableClean);
+
+      const entry = {
+        type: parsed.Type || "Unknown",
+        totalCount,
+        active,
+        size,
+        sizeBytes,
+        reclaimable,
+        reclaimableBytes,
+      };
+
+      if (type.includes("image")) {
+        result.images = entry;
+      } else if (type.includes("container")) {
+        result.containers = entry;
+      } else if (type.includes("volume")) {
+        result.volumes = entry;
+      } else if (type.includes("cache")) {
+        result.buildCache = entry;
+      }
+    } catch {
+      // Ignore malformed lines
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Parses JSON output from `docker system df -v --format json` into top lists and volume sizes (DM-121).
+ *
+ * @param {string | object} stdout
+ * @returns {{ topImages: Array<object>, topVolumes: Array<object>, topContainers: Array<object>, volumeSizes: Record<string, string> }}
+ */
+export function parseSystemDfVerbose(stdout) {
+  const result = {
+    topImages: [],
+    topVolumes: [],
+    topContainers: [],
+    volumeSizes: {},
+  };
+
+  if (!stdout) return result;
+
+  let data = null;
+  if (typeof stdout === "object") {
+    data = stdout;
+  } else {
+    try {
+      data = JSON.parse(stdout);
+    } catch {
+      return result;
+    }
+  }
+
+  if (!data || typeof data !== "object") return result;
+
+  // Images
+  const images = Array.isArray(data.Images) ? data.Images : [];
+  result.topImages = images
+    .map((img) => {
+      const size = img.Size || img.UniqueSize || "0B";
+      return {
+        id: img.ID || "",
+        repository: img.Repository || "",
+        tag: img.Tag || "",
+        size,
+        sizeBytes: parseDockerSizeBytes(size),
+        containers: parseInt(img.Containers, 10) || 0,
+        created: img.CreatedAt || img.CreatedSince || "",
+      };
+    })
+    .sort((a, b) => b.sizeBytes - a.sizeBytes)
+    .slice(0, 10);
+
+  // Volumes
+  const volumes = Array.isArray(data.Volumes) ? data.Volumes : [];
+  result.topVolumes = volumes
+    .map((vol) => {
+      const name = vol.VolumeName || vol.Name || "";
+      const size = vol.Size || "0B";
+      if (name) {
+        result.volumeSizes[name] = size;
+      }
+      return {
+        name,
+        links: parseInt(vol.Links, 10) || 0,
+        size,
+        sizeBytes: parseDockerSizeBytes(size),
+      };
+    })
+    .sort((a, b) => b.sizeBytes - a.sizeBytes)
+    .slice(0, 10);
+
+  // Containers
+  const containers = Array.isArray(data.Containers) ? data.Containers : [];
+  result.topContainers = containers
+    .map((c) => {
+      const size = c.Size || "0B";
+      return {
+        id: c.ID || "",
+        names: c.Names || "",
+        image: c.Image || "",
+        status: c.Status || "",
+        size,
+        sizeBytes: parseDockerSizeBytes(size),
+      };
+    })
+    .sort((a, b) => b.sizeBytes - a.sizeBytes)
+    .slice(0, 10);
+
+  return result;
+}
+
+/**
+ * Builds a granular prune execution plan from user selections (DM-122).
+ *
+ * @param {{ containers?: boolean, danglingImages?: boolean, unusedImages?: boolean, networks?: boolean, volumes?: boolean, buildCache?: boolean, buildCacheOlderThan7d?: boolean }} selections
+ * @returns {{ commands: Array<{ label: string, argv: string[] }>, requiresTypedConfirm: boolean, highWarning: boolean }}
+ */
+export function buildGranularPrunePlan(selections = {}) {
+  const commands = [];
+  if (selections.containers) {
+    commands.push({ label: "Stopped containers", argv: ["container", "prune", "-f"] });
+  }
+  if (selections.unusedImages) {
+    commands.push({ label: "All unused images", argv: ["image", "prune", "-a", "-f"] });
+  } else if (selections.danglingImages) {
+    commands.push({ label: "Dangling images", argv: ["image", "prune", "-f"] });
+  }
+  if (selections.networks) {
+    commands.push({ label: "Unused networks", argv: ["network", "prune", "-f"] });
+  }
+  if (selections.volumes) {
+    commands.push({ label: "Unused volumes", argv: ["volume", "prune", "-f"] });
+  }
+  if (selections.buildCache) {
+    commands.push({
+      label: selections.buildCacheOlderThan7d ? "Build cache older than 7 days" : "All build cache",
+      argv: ["builder", "prune", "-f", ...(selections.buildCacheOlderThan7d ? ["--filter", "until=168h"] : [])],
+    });
+  }
+
+  const requiresTypedConfirm = Boolean(selections.volumes || selections.unusedImages);
+  const highWarning = Boolean(selections.volumes || selections.unusedImages);
+
+  return { commands, requiresTypedConfirm, highWarning };
+}
+
+/**
+ * Normalizes raw `docker image inspect` JSON output into a structured ImageInspect object (DM-44, DM-102).
+ *
+ * @param {object} raw
+ * @param {Array<object>} [historyRows=[]]
+ * @returns {object}
+ */
+export function normalizeImageInspect(raw, historyRows = []) {
+  if (!raw || typeof raw !== "object") return null;
+  const target = Array.isArray(raw) ? raw[0] : raw;
+  if (!target || typeof target !== "object") return null;
+
+  const id = target.Id || "";
+  const shortId = id.replace(/^sha256:/, "").slice(0, 12);
+  const repoTags = Array.isArray(target.RepoTags) ? target.RepoTags : [];
+  const repoDigests = Array.isArray(target.RepoDigests) ? target.RepoDigests : [];
+  const created = target.Created || "";
+  const sizeBytes = target.Size || 0;
+  const size = sizeBytes ? `${(sizeBytes / (1000 * 1000)).toFixed(1)}MB` : "0B";
+
+  const config = target.Config || {};
+  const env = Array.isArray(config.Env) ? config.Env : [];
+  const exposedPorts = Object.keys(config.ExposedPorts || {});
+  const cmd = Array.isArray(config.Cmd) ? config.Cmd : [];
+  const entrypoint = Array.isArray(config.Entrypoint) ? config.Entrypoint : [];
+  const labels = config.Labels || {};
 
   return {
     id,
     shortId,
-    name: obj.Name || "",
-    driver: obj.Driver || "bridge",
-    scope: obj.Scope || "local",
-    subnet: ipamConfig.Subnet || "",
-    gateway: ipamConfig.Gateway || "",
-    internal: Boolean(obj.Internal),
-    containers,
-    labels: obj.Labels || {},
-    raw: obj,
+    repoTags,
+    repoDigests,
+    created,
+    size,
+    sizeBytes,
+    architecture: target.Architecture || "",
+    os: target.Os || "",
+    author: target.Author || "",
+    dockerVersion: target.DockerVersion || "",
+    config: {
+      env,
+      exposedPorts,
+      cmd,
+      entrypoint,
+      workingDir: config.WorkingDir || "",
+      user: config.User || "",
+      labels,
+    },
+    history: Array.isArray(historyRows) ? historyRows : [],
+    raw: target,
   };
 }
 
 /**
- * Formats JSON with stable 2-space indentation that never throws on already-parsed objects (DM-45).
+ * Normalizes raw `docker volume inspect` JSON output into a structured VolumeInspect object (DM-44, DM-106).
  *
- * @param {any} raw
- * @returns {string}
+ * @param {object} raw
+ * @param {Array<object>} [usingContainers=[]]
+ * @returns {object}
  */
-export function prettyJson(raw) {
-  if (raw === null || raw === undefined) return "";
-  if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw);
-      return JSON.stringify(parsed, null, 2);
-    } catch {
-      return raw;
-    }
-  }
-  try {
-    return JSON.stringify(raw, null, 2);
-  } catch {
-    return String(raw);
-  }
-}
+export function normalizeVolumeInspect(raw, usingContainers = []) {
+  if (!raw || typeof raw !== "object") return null;
+  const target = Array.isArray(raw) ? raw[0] : raw;
+  if (!target || typeof target !== "object") return null;
 
-/**
- * Maps Herdr theme colors to EditorState syntax theme tokens.
- *
- * @param {Record<string, string>} [themeObj={}]
- * @returns {Record<string, string>}
- */
-export function buildSyntaxTheme(themeObj = {}) {
-  const t = themeObj || {};
   return {
-    keyword: t.ansi5 || "#b48ead",
-    string: t.ansi2 || "#a3be8c",
-    comment: t.dim || "#616e88",
-    function: t.ansi4 || "#81a1c1",
-    type: t.ansi3 || "#ebcb8b",
-    number: t.ansi1 || "#bf616a",
-    constant: t.ansi6 || "#88c0d0",
+    name: target.Name || "",
+    driver: target.Driver || "local",
+    mountpoint: target.Mountpoint || "",
+    createdAt: target.CreatedAt || "",
+    scope: target.Scope || "local",
+    labels: target.Labels || {},
+    options: target.Options || {},
+    usingContainers: Array.isArray(usingContainers) ? usingContainers : [],
+    size: target.Size || null,
+    raw: target,
   };
 }
 
+/**
+ * Normalizes raw `docker network inspect` JSON output into a structured NetworkInspect object (DM-44, DM-116).
+ *
+ * @param {object} raw
+ * @returns {object}
+ */
+export function normalizeNetworkInspect(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const target = Array.isArray(raw) ? raw[0] : raw;
+  if (!target || typeof target !== "object") return null;
 
+  const id = target.Id || "";
+  const shortId = id.slice(0, 12);
+  const name = target.Name || "";
+  const driver = target.Driver || "";
+  const scope = target.Scope || "local";
+
+  const containers = target.Containers
+    ? Object.entries(target.Containers).map(([cId, cInfo]) => ({
+        id: cId,
+        shortId: cId.slice(0, 12),
+        name: (cInfo.Name || "").replace(/^\//, ""),
+        ipv4: cInfo.IPv4Address || "",
+        ipv6: cInfo.IPv6Address || "",
+        mac: cInfo.MacAddress || "",
+      }))
+    : [];
+
+  return {
+    id,
+    shortId,
+    name,
+    driver,
+    scope,
+    internal: Boolean(target.Internal),
+    attachable: Boolean(target.Attachable),
+    ingress: Boolean(target.Ingress),
+    ipam: {
+      driver: target.IPAM?.Driver || "default",
+      configs: target.IPAM?.Config || [],
+      subnet: target.IPAM?.Config?.[0]?.Subnet || "",
+      gateway: target.IPAM?.Config?.[0]?.Gateway || "",
+    },
+    containers,
+    labels: target.Labels || {},
+    options: target.Options || {},
+    raw: target,
+  };
+}
