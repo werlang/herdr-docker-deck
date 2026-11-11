@@ -1,10 +1,10 @@
 {
   "ID": "00000000-0000-0000-0000-000000000000",
-  "Containers": 19,
+  "Containers": 20,
   "ContainersRunning": 16,
   "ContainersPaused": 0,
-  "ContainersStopped": 3,
-  "Images": 102,
+  "ContainersStopped": 4,
+  "Images": 106,
   "Driver": "overlayfs",
   "DriverStatus": [
     [
@@ -21,7 +21,7 @@
   "PidsLimit": true,
   "IPv4Forwarding": true,
   "OomKillDisable": false,
-  "SystemTime": "2026-11-11T13:38:20.179484833-03:00",
+  "SystemTime": "2026-11-11T15:36:37.476282828-03:00",
   "LoggingDriver": "json-file",
   "CgroupDriver": "systemd",
   "CgroupVersion": "2",
@@ -134,5 +134,6 @@
       }
     ],
     "Warnings": null
-  }
+  },
+  "Hostname": "host"
 }

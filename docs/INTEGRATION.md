@@ -1,6 +1,6 @@
 # docker-manager — Cross-Mod & Layout Integration Spec
 
-Status: **draft, not implemented**. Companion to [`SPEC.md`](SPEC.md) and [`DESIGN.md`](DESIGN.md).
+Status: **specified, not implemented** — the sibling changes (`tabs-ref`, `file-editor`) are out of scope for this repository.
 
 Following Herdr's mod independence rule, `docker-manager`, `tabs-ref`, and `file-editor` live in separate repositories and remain independently installable. Neither `tabs-ref` nor `file-editor` imports code or assets from `docker-manager`; instead, they detect `mods/docker-manager/mod.json` at runtime, keep their own local SVG icons, and coordinate through layout commands and `shared()` keys.
 

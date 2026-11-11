@@ -2,7 +2,9 @@
 
 A native GPUI **Docker & Compose Manager** mod for Herdr, inspired by Microsoft's [`vscode-containers`](https://github.com/microsoft/vscode-containers). Inspect and control Compose projects, individual services, standalone containers, Dockerfiles, images, volumes, networks, and system disk hygiene without leaving your workspace.
 
-> **Status**: Specification & Architecture phase. See [`docs/SPEC.md`](docs/SPEC.md), [`docs/DESIGN.md`](docs/DESIGN.md), and [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
+> **Status**: implemented. `mods/docker-manager/` runs in Herdr: the five sections, Compose/Dockerfile discovery, the lifecycle action matrix, logs/shell terminals, volume backup/restore/clone, system hygiene, inspector drawer and inspector tab.
+>
+> **Not in this repository**: the `tabs-ref` **Docker** top button and the `file-editor` compose/Dockerfile header actions. Both live in sibling mods (see [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) and each is a separate change, so every mod stays publishable alone. Until then, mount the panel from a layout block or `pane.split` (below).
 
 ---
 
@@ -61,3 +63,19 @@ Or open `docker-manager` directly in a split pane:
 ```sh
 herdr-app do pane.split --direction right --mod docker-manager
 ```
+
+---
+
+## Development
+
+```sh
+./sync.sh                                   # copy into ~/.config/herdr-app/mods and herdr-app check
+herdr-app check mods/docker-manager         # load the mod once and report what is wrong
+docker run --rm -v "$PWD":/w -w /w node:22-alpine node --test test/*.test.js
+```
+
+- Unit tests import `mods/docker-manager/docker-logic.js` only; that module is deliberately import-free (no `gpui-kit`, no `herdr`), so it runs under plain Node in a container. `node --test test/` does not expand a directory on Node 22, hence the explicit glob.
+- `test/fixtures/` holds real `docker` payloads captured on a Linux host and sanitized by `test/fixtures/sanitize.py` (environment values replaced by `REDACTED`, host identity and absolute project paths removed). Re-capture with the same redaction if you add fixtures.
+- `test/mod-safety.test.js` guards the failure mode `herdr-app check` cannot see: a chained element method that does not exist in `gpui-kit.d.ts` loads fine and crashes the frame at render time. It fails (rather than skipping) when the generated `gpui-kit.d.ts` is absent, so run `herdr-app check` first.
+- `herdr-app check` regenerates `gpui-kit.d.ts` and `jsconfig.json` inside the mod folder; both are gitignored and excluded by `sync.sh`.
+- Verified headlessly on Linux: `Xvfb :99` + `HERDR_APP_HOME=<throwaway dir> herdr-app`, then `herdr-app shot` / `herdr-app status` (its `errors` array reports mod runtime errors).

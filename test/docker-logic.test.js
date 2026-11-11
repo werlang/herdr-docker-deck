@@ -153,9 +153,18 @@ test("parseContainerLabels: correctly handles '=' inside values", () => {
 });
 
 test("parseContainerLabels: parses labels from fixture container", () => {
-  const labels = parseContainerLabels(containersRaw[0].Labels);
+  const row = containersRaw.find((c) => (c.Labels || "").includes("com.docker.compose.project="));
+  assert.ok(row, "the fixture must contain at least one Compose container");
+  const labels = parseContainerLabels(row.Labels);
   assert.ok(labels["com.docker.compose.project"]);
   assert.ok(labels["com.docker.compose.service"]);
+  // multi-file config labels stay intact (commas inside the value are not separators)
+  const multi = containersRaw.find((c) => (c.Labels || "").includes("config_files=") && (c.Labels || "").includes(","));
+  if (multi) {
+    const parsed = parseContainerLabels(multi.Labels);
+    const files = parsed["com.docker.compose.project.config_files"] || "";
+    assert.ok(files.length > 0);
+  }
 });
 
 test("validateDockerIdentifier: accepts valid docker identifiers", () => {
@@ -344,7 +353,7 @@ test("buildContainerTree: scope 'space' filters out projects outside spaceRoot",
     containers: containersRaw,
     composeLs,
     scope: "space",
-    spaceRoot: "/home/kuma",
+    spaceRoot: "/srv/kuma",
   });
   const spaceProjs = groupsSpace.find((g) => g.id === "projects")?.items || [];
   assert.equal(spaceProjs.length, 1);
@@ -940,7 +949,7 @@ test("normalizeContainerInspect: normalizes inspect-container.json fixture corre
   assert.equal(norm.health.status, "healthy");
   assert.equal(norm.restartPolicy.name, "unless-stopped");
   assert.equal(norm.workingDir, "/");
-  assert.deepEqual(norm.composeFiles, ["/home/cv-mapa/compose.yaml"]);
+  assert.deepEqual(norm.composeFiles, ["/srv/cv-mapa/compose.yaml"]);
   assert.ok(Array.isArray(norm.mounts));
   assert.ok(Array.isArray(norm.networks));
   assert.ok(Array.isArray(norm.ports));

@@ -23,6 +23,19 @@ export function validateDockerIdentifier(name, type = "identifier") {
   if (trimmed.includes("..")) {
     throw new Error(`Invalid Docker ${type}: "${trimmed}" contains path traversal`);
   }
+  // Docker names, ids and image refs start with an alphanumeric character. A leading "-"
+  // would be parsed as a CLI flag by docker and a leading "/" as an absolute path, so both
+  // must fail here rather than at the CLI (DM-87).
+  // Image references legitimately contain '/', ':' and '@' (registry/repo:tag@digest); container
+  // names, volume names, network ids and project names do not, so a path-like value is rejected
+  // there instead of being passed to docker as if it were a name.
+  const looksLikeImage = /image/i.test(type) || /[:@]/.test(trimmed);
+  const shape = looksLikeImage
+    ? /^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$/
+    : /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+  if (!shape.test(trimmed)) {
+    throw new Error(`Invalid Docker ${type}: "${trimmed}" is not a Docker identifier`);
+  }
   return true;
 }
 
@@ -56,7 +69,13 @@ export function classifyDockerFile(filePath) {
  */
 export function isSecretEnvKey(key) {
   if (!key || typeof key !== "string") return false;
-  return /(?:^|_)(?:PASS(?:WORD|PHRASE)?|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|AUTH|CREDENTIALS?|CLIENT_SECRET|DATABASE_URL|REDIS_URL|CONNECTION_STRING)(?:$|_)/i.test(key);
+  const k = String(key).toUpperCase();
+  // DM-45: PASS/PASSWORD/SECRET/TOKEN/KEY/PRIVATE/CREDENTIAL. Suffixes with no separator
+  // (PGPASSWORD, DBPASSWORD) and bare *_KEY (SSH_KEY, ENCRYPTION_KEY) must mask too: leaking a
+  // signing key in the Environment view is worse than masking a harmless value.
+  if (/(?:^|_)(?:PASS|PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|AUTH|CREDENTIAL|CREDENTIALS|PRIVATE)(?:$|_)/.test(k)) return true;
+  if (/(?:PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|CREDENTIAL|CREDENTIALS)$/.test(k)) return true;
+  return /API_?KEY|PRIVATE_?KEY|CLIENT_SECRET|DATABASE_URL|REDIS_URL|CONNECTION_STRING/.test(k);
 }
 
 /**
@@ -449,7 +468,12 @@ export function normalizeContainerInspect(raw) {
 
   // Ports extraction
   const ports = [];
-  const portSettings = raw.NetworkSettings?.Ports || raw.HostConfig?.PortBindings || {};
+  // `NetworkSettings.Ports` is `{}` for a created/stopped container (truthy!), so a plain
+  // `||` never reaches HostConfig.PortBindings and every stopped container lost its ports.
+  const networkPorts = raw.NetworkSettings?.Ports;
+  const hasPublishedPorts =
+    networkPorts && Object.values(networkPorts).some((b) => Array.isArray(b) && b.length > 0);
+  const portSettings = hasPublishedPorts ? networkPorts : (raw.HostConfig?.PortBindings || {});
   for (const [key, bindings] of Object.entries(portSettings)) {
     const [portStr, proto = "tcp"] = key.split("/");
     const containerPort = parseInt(portStr, 10);
@@ -744,7 +768,15 @@ export function buildContainerTree({
 
     for (const [sName, sCfg] of Object.entries(declaredServices)) {
       const sProfiles = sCfg.profiles || [];
-      const isInactive = sProfiles.length > 0 && !sProfiles.some((p) => activeProfiles.includes(p));
+      const existingContainers = serviceMap.get(sName);
+      const hasContainers = Array.isArray(existingContainers) && existingContainers.length > 0;
+      // DM-33: a profiled service that IS running belongs in the tree, not under "profiles".
+      // `activeProfiles` is not supplied by the caller, so the container check is what keeps
+      // the same service from appearing twice.
+      const isInactive =
+        sProfiles.length > 0 &&
+        !sProfiles.some((p) => activeProfiles.includes(p)) &&
+        !hasContainers;
 
       if (isInactive) {
         inactiveProfilesList.push({
@@ -885,7 +917,7 @@ export function buildContainerTree({
   const dockerfileMap = new Map();
   // Seed with discovered Dockerfiles
   for (const df of discoveredDockerfiles) {
-    const rel = df.relativePath || (spaceRoot && df.filePath.startsWith(spaceRoot) ? df.filePath.slice(spaceRoot.length).replace(/^\//, "") : df.filePath);
+    const rel = df.relativePath || (spaceRoot && isPathInside(spaceRoot, df.filePath) ? df.filePath.slice(spaceRoot.replace(/\/+$/, "").length).replace(/^\//, "") : df.filePath);
     dockerfileMap.set(df.filePath, {
       filePath: df.filePath,
       relativePath: rel,
@@ -896,8 +928,8 @@ export function buildContainerTree({
   // Add matching containers
   for (const c of dockerfileContainers) {
     if (!dockerfileMap.has(c.sourceLabel)) {
-      const rel = spaceRoot && c.sourceLabel.startsWith(spaceRoot)
-        ? c.sourceLabel.slice(spaceRoot.length).replace(/^\//, "")
+      const rel = spaceRoot && isPathInside(spaceRoot, c.sourceLabel)
+        ? c.sourceLabel.slice(spaceRoot.replace(/\/+$/, "").length).replace(/^\//, "")
         : c.sourceLabel;
       dockerfileMap.set(c.sourceLabel, {
         filePath: c.sourceLabel,
@@ -1480,7 +1512,20 @@ export function getContainerMenuItems(container) {
  * @returns {{ title: string, message: string, confirmLabel: string, destructive: boolean, typedTarget: string | null }}
  */
 export function buildConfirmationSpec(action, target) {
-  if (!target) return null;
+  // A destructive dialog with a null spec renders `undefined` title/message and leaves the
+  // confirm button live (no typed gate). Never return null: fall back to a generic target name.
+  const fallbackNames = {
+    "prune-networks": "all unused networks",
+    "prune-dangling-images": "dangling images",
+    "prune-unused-images": "all unused images",
+    "prune-volumes": "all unused volumes",
+    "prune-containers": "all stopped containers",
+    "prune-build-cache": "the build cache",
+    "prune-granular": "the selected resources",
+  };
+  if (!target) {
+    target = { name: fallbackNames[action] || "this resource" };
+  }
   const targetName = target.name || target.shortId || target.id || "target";
 
   if (action === "down") {
@@ -1878,18 +1923,18 @@ export function parseDockerfileExpose(dockerfileText) {
 export function getDockerfileMenuItems(dockerfileItem, lastRunConfig = null) {
   const hasPriorRun = Boolean(lastRunConfig);
   return [
-    { id: "build-image", label: "Build image…", icon: "hammer", enabled: true, destructive: false },
-    { id: "build-run", label: "Build & run…", icon: "play", enabled: true, destructive: false },
+    { id: "build-image", label: "Build image…", icon: "hammer.svg", enabled: true, destructive: false },
+    { id: "build-run", label: "Build & run…", icon: "play.svg", enabled: true, destructive: false },
     {
       id: "rebuild-replace",
       label: "Rebuild & replace",
-      icon: "refresh",
+      icon: "refresh.svg",
       enabled: hasPriorRun,
       disabledReason: hasPriorRun ? null : "no prior Build & run",
       destructive: false,
     },
-    { id: "open-dockerfile", label: "Open Dockerfile", icon: "folder", enabled: true, destructive: false },
-    { id: "copy-path", label: "Copy path", icon: "copy", enabled: true, destructive: false },
+    { id: "open-dockerfile", label: "Open Dockerfile", icon: "folder.svg", enabled: true, destructive: false },
+    { id: "copy-path", label: "Copy path", icon: "copy.svg", enabled: true, destructive: false },
   ];
 }
 
@@ -2012,12 +2057,15 @@ export function resolveServiceContainerId(containers = [], project, service, fal
 export function matchDockerRequestTarget(request, tree) {
   if (!request || !tree) return null;
 
-  const projects = Array.isArray(tree)
-    ? tree.filter((n) => n.kind === "project")
-    : (tree.composeProjects || []);
-  const dockerfiles = Array.isArray(tree)
-    ? tree.filter((n) => n.kind === "dockerfile")
-    : (tree.dockerfiles || []);
+  // buildContainerTree returns group nodes ({kind:"group", items:[...]}); accept both that and
+  // a flat array, otherwise every cross-mod reveal resolves to nothing (DM-93 / INTEGRATION §3.4).
+  const flat = Array.isArray(tree)
+    ? tree.flatMap((n) =>
+        n && n.kind === "group" && Array.isArray(n.items) ? n.items : (n ? [n] : [])
+      )
+    : [];
+  const projects = Array.isArray(tree) ? flat.filter((n) => n && n.kind === "project") : (tree.composeProjects || []);
+  const dockerfiles = Array.isArray(tree) ? flat.filter((n) => n && n.kind === "dockerfile") : (tree.dockerfiles || []);
 
   const reqFile = request.file || "";
   const reqFolder = request.folder || "";
@@ -2046,7 +2094,7 @@ export function matchDockerRequestTarget(request, tree) {
       if (reqFile && (df.filePath === reqFile || df.relativePath === reqFile)) {
         return { type: "dockerfile", target: df };
       }
-      if (reqFolder && df.filePath && df.filePath.startsWith(reqFolder)) {
+      if (reqFolder && df.filePath && isPathInside(reqFolder, df.filePath)) {
         return { type: "dockerfile", target: df };
       }
     }
@@ -2150,8 +2198,17 @@ export function buildImageTree(imagesRaw = [], containersRaw = [], { filter = ""
       const cImg = c.Image || c.image || "";
       const cImgId = c.ImageID || c.imageId || "";
 
+      // `docker container ls --format '{{json .}}'` has no ImageID, so the id branch alone never
+      // matched and Remove stayed enabled for images a container is using. Compare the plain sha
+      // as well, and treat a digest-pinned reference to the same repo as a match.
+      const idPlain = String(id).replace(/^sha256:/, "");
+      const cImgPlain = String(cImg).replace(/^sha256:/, "");
       let matched = false;
       if (cImg && (cImg === name || cImg === repo || cImg === `${repo}:${tag}`)) {
+        matched = true;
+      } else if (idPlain && cImgPlain && (cImgPlain === idPlain || cImgPlain.startsWith(idPlain.slice(0, 12)))) {
+        matched = true;
+      } else if (repo && cImg.includes(`${repo}@`)) {
         matched = true;
       } else if (id && cImgId && (cImgId === id || cImgId.startsWith(id) || id.startsWith(cImgId))) {
         matched = true;
@@ -2350,8 +2407,10 @@ export function buildVolumeTree(
       if (Array.isArray(mounts)) {
         matched = mounts.some((m) => m && (m.Name === name || m.Source === name || m.destination === name));
       } else if (typeof mounts === "string") {
+        // Exact mount-name comparison only: `mounts.includes(name)` marked `mysql` in use
+        // because `whatsbot_mysql` contains it, disabling Remove on unrelated volumes.
         const tokens = mounts.split(",").map((s) => s.trim().split(":")[0]);
-        matched = tokens.includes(name) || mounts.includes(name);
+        matched = tokens.includes(name);
       }
 
       if (matched) {

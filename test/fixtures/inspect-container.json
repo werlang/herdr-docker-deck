@@ -23,34 +23,34 @@
         "FailingStreak": 0,
         "Log": [
           {
-            "Start": "2026-11-11T13:37:14.506396994-03:00",
-            "End": "2026-11-11T13:37:14.564993965-03:00",
+            "Start": "2026-11-11T15:35:26.91269071-03:00",
+            "End": "2026-11-11T15:35:26.959199596-03:00",
             "ExitCode": 0,
-            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T16:37:14.562099Z[Etc/Unknown]\",\"version\":\"1.0.4\"}\r100    459 100    459   0      0 311.7k      0                              0\r100    459 100    459   0      0 306.8k      0                              0\r100    459 100    459   0      0 304.0k      0                              0\n"
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 513.2k      0                              0\r100    462 100    462   0      0 500.7k      0                              0\r100    462 100    462   0      0 492.5k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:35:26.956848208Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
           },
           {
-            "Start": "2026-11-11T13:37:29.566419744-03:00",
-            "End": "2026-11-11T13:37:29.611137987-03:00",
+            "Start": "2026-11-11T15:35:41.960844495-03:00",
+            "End": "2026-11-11T15:35:42.038676635-03:00",
             "ExitCode": 0,
-            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 648.2k      0                              0\r100    462 100    462   0      0 631.8k      0                              0\r100    462 100    462   0      0 617.1k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T16:37:29.609105232Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 659.6k      0                              0\r100    462 100    462   0      0 636.3k      0                              0\r100    462 100    462   0      0 624.8k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:35:42.036463878Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
           },
           {
-            "Start": "2026-11-11T13:37:44.612301986-03:00",
-            "End": "2026-11-11T13:37:44.660534791-03:00",
+            "Start": "2026-11-11T15:35:57.040310367-03:00",
+            "End": "2026-11-11T15:35:57.088156541-03:00",
             "ExitCode": 0,
-            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    461 100    461   0      0 777.5k      0                              0\r100    461 100    461   0      0 752.8k      0                              0\r100    461 100    461   0      0 733.2k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T16:37:44.65842235Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    461 100    461   0      0 619.2k      0                              0\r100    461 100    461   0      0 601.0k      0                              0\r100    461 100    461   0      0 587.7k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:35:57.08599147Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
           },
           {
-            "Start": "2026-11-11T13:37:59.662185238-03:00",
-            "End": "2026-11-11T13:37:59.710569174-03:00",
+            "Start": "2026-11-11T15:36:12.089420381-03:00",
+            "End": "2026-11-11T15:36:12.162168576-03:00",
             "ExitCode": 0,
-            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 732.4k      0                              0\r100    462 100    462   0      0 708.2k      0                              0\r100    462 100    462   0      0 693.0k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T16:37:59.708437363Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 613.8k      0                              0\r100    462 100    462   0      0 594.4k      0                              0\r100    462 100    462   0      0 580.6k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:36:12.159946874Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
           },
           {
-            "Start": "2026-11-11T13:38:14.711682573-03:00",
-            "End": "2026-11-11T13:38:14.815184863-03:00",
+            "Start": "2026-11-11T15:36:27.16323134-03:00",
+            "End": "2026-11-11T15:36:27.270802334-03:00",
             "ExitCode": 0,
-            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    462 100    462   0      0 339.2k      0                              0\r100    462 100    462   0      0 214.7k      0                              0\r100    462 100    462   0      0 186.4k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T16:38:14.809896103Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
+            "Output": "  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\n                                 Dload  Upload  Total   Spent   Left   Speed\n\r  0      0   0      0   0      0      0      0                              0\r100    461 100    461   0      0 344.9k      0                              0\r100    461 100    461   0      0 315.0k      0                              0\r100    461 100    461   0      0 310.9k      0                              0\n{\"degradedReasons\":[],\"details\":{\"iam\":{\"ready\":true,\"status\":\"connected\"},\"lock\":{\"ready\":true,\"status\":\"connected\"},\"poolMetadata\":{\"ready\":true,\"status\":\"writable\"},\"storage\":{\"readQuorum\":true,\"readinessScope\":\"read_quorum\",\"ready\":true,\"source\":\"local_runtime\",\"status\":\"connected\",\"unavailableDrives\":[],\"writeQuorum\":true}},\"ready\":true,\"service\":\"rustfs-endpoint\",\"status\":\"ok\",\"timestamp\":\"2026-11-11T18:36:27.26527983Z[Etc/Unknown]\",\"version\":\"1.0.4\"}"
           }
         ]
       }
@@ -243,8 +243,8 @@
         "com.docker.compose.image": "sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2",
         "com.docker.compose.oneoff": "False",
         "com.docker.compose.project": "cv-mapa",
-        "com.docker.compose.project.config_files": "/home/cv-mapa/compose.yaml",
-        "com.docker.compose.project.working_dir": "/home/cv-mapa",
+        "com.docker.compose.project.config_files": "/srv/cv-mapa/compose.yaml",
+        "com.docker.compose.project.working_dir": "/srv/cv-mapa",
         "com.docker.compose.replace": "rustfs-1",
         "com.docker.compose.service": "rustfs",
         "com.docker.compose.version": "5.1.4",
@@ -273,15 +273,16 @@
           "IPAMConfig": null,
           "Links": null,
           "Aliases": [
-            "fixture-container"
+            "cv-mapa-rustfs-1",
+            "rustfs"
           ],
           "DriverOpts": null,
           "GwPriority": 0,
-          "NetworkID": "2222222222222222222222222222222222222222222222222222222222222222",
+          "NetworkID": "812b27e78c29b4d0776b857c13087210c2b1f0c0b598dcd6431cb9c91ad4bfdd",
           "EndpointID": "51200572fae2f56a9ba4a0346457aeca32f92604751d02e43620c78a26e69f4e",
-          "Gateway": "172.18.0.1",
-          "IPAddress": "172.18.0.2",
-          "MacAddress": "02:42:ac:12:00:02",
+          "Gateway": "172.25.0.1",
+          "IPAddress": "172.25.0.3",
+          "MacAddress": "de:53:8c:e2:2b:cd",
           "IPPrefixLen": 16,
           "IPv6Gateway": "",
           "GlobalIPv6Address": "",

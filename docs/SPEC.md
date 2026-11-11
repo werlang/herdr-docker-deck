@@ -1,6 +1,6 @@
 # docker-manager — Functional Specification
 
-Status: **draft, not implemented**. This document says *what* the `docker-manager` mod does. [`DESIGN.md`](DESIGN.md) says *how* it is built, and [`INTEGRATION.md`](INTEGRATION.md) lists the changes it needs in sibling repos (`tabs-ref`, `file-editor`, the personal layout).
+Status: **implemented** — see `mods/docker-manager/`. Requirement ids stay stable; `partly` items are tracked in `RECIPE.md`.
 
 Requirement IDs (`DM-xx`) are stable: reference them from code comments, tests, and commits.
 
@@ -317,8 +317,8 @@ Menus are in-panel overlays clamped to the panel bounds, closed by any outside p
 
 ## 13. Acceptance checklist
 
-- [ ] `herdr-app check mods/docker-manager` passes; `herdr-app status` has no errors.
-- [ ] Unit tests pass (`docker run --rm -v "$PWD":/w -w /w node:22-alpine node --test test/`).
+- [x] `herdr-app check mods/docker-manager` passes; `herdr-app status` has no errors.
+- [x] Unit tests pass (`docker run --rm -v "$PWD":/w -w /w node:22-alpine node --test test/*.test.js`).
 - [ ] Containers appear grouped by project → service → container; standalone and Dockerfile groups are correct.
 - [ ] Each lifecycle action works for a whole project and a single service.
 - [ ] Logs and shell terminals open from the context menu for services and containers.

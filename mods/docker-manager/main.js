@@ -171,6 +171,7 @@ export default class DockerManager extends View {
     // inspectLoading and the render-scoped context drops the spawn. `propsData` is not reliable
     // here (it can arrive empty), so poll props() and pick the target up when it is there.
     cx.timer.every(1000, (cx) => {
+      if (this.inspectData) return; // loaded: stop costing a tick per second (DESIGN §5.1)
       this.ensureInspectorTarget(cx);
     });
     cx.spawn(async (cx) => {
@@ -289,7 +290,6 @@ export default class DockerManager extends View {
   /** Polling handler called every 3 seconds */
   poll(cx) {
     if (!this.isPanelVisible()) return;
-    this.checkCrossModRequest(cx);
     this.refresh(cx);
 
     // In inspector tab mode, poll live stats if stats sub-view is open
@@ -346,7 +346,26 @@ export default class DockerManager extends View {
     }
   }
 
-  async openDockerfileModal(df, action, cx) {
+  openDockerfileModal(df, action, cx) {
+    // Open with defaults immediately, then fill the EXPOSE-derived fields once the file is read.
+    // The read is an await, so it must not run on the event context (AGENTS.md).
+    this.buildDockerfileDialog(df, action, "");
+    cx.notify();
+    cx.spawn(async (cx) => {
+      let content = "";
+      try {
+        content = await readTextFile(df.filePath);
+      } catch {
+        content = "";
+      }
+      if (!this.dockerfileDialog || this.dockerfileDialog.filePath !== df.filePath) return;
+      this.buildDockerfileDialog(df, action, content);
+      cx.notify();
+    });
+  }
+
+  /** Builds the Dockerfile dialog state from the file text ("" when it could not be read). */
+  buildDockerfileDialog(df, action, content) {
     const folder = df.filePath.slice(0, df.filePath.lastIndexOf("/")) || ".";
     const folderName = folder.split("/").pop() || "app";
     const defaultTag = `${folderName}:dev`;
@@ -354,12 +373,9 @@ export default class DockerManager extends View {
 
     let prefilledPorts = "";
     try {
-      const content = await readTextFile(df.filePath);
-      if (content) {
-        const exposed = parseDockerfileExpose(content);
-        if (exposed.length > 0) {
-          prefilledPorts = exposed.map((p) => `${p}:${p}`).join(", ");
-        }
+      const exposed = parseDockerfileExpose(content || "");
+      if (exposed.length > 0) {
+        prefilledPorts = exposed.map((p) => `${p}:${p}`).join(", ");
       }
     } catch {}
 
@@ -385,7 +401,6 @@ export default class DockerManager extends View {
       defaultTag,
       defaultName,
     };
-    cx.notify();
   }
 
   submitDockerfileModal(cx) {
@@ -795,6 +810,10 @@ export default class DockerManager extends View {
     }
 
     this.inspectLoading = true;
+    // Sequence guard: switching rows while an inspect is in flight must drop the older reply,
+    // otherwise the drawer shows one container's data under another's name (DESIGN §5.2).
+    const seq = (this.inspectSeq || 0) + 1;
+    this.inspectSeq = seq;
     cx.notify();
 
     cx.spawn(async (cx) => {
@@ -803,6 +822,7 @@ export default class DockerManager extends View {
           on: ctx.on,
           timeout: 5000,
         });
+        if (this.inspectSeq !== seq) return;
         if ((res.code ?? res.exitCode) === 0) {
           const raw = JSON.parse(res.stdout.trim());
           this.inspectDataRaw = raw;
@@ -1127,6 +1147,28 @@ export default class DockerManager extends View {
                 }
               })
               .filter(Boolean);
+
+            // One bulk inspect: connected counts and container IPs live in the inspect payload,
+            // and inspecting only the selected network made every other network look empty, so
+            // Remove was offered on networks with live endpoints (DM-115/DM-116).
+            const netIds = this.networksRaw.map((n) => n.ID).filter(Boolean);
+            if (netIds.length > 0) {
+              const inspAll = await exec("docker", ["network", "inspect", ...netIds], {
+                on: ctx.on,
+                timeout: 12000,
+              });
+              if ((inspAll.code ?? inspAll.exitCode) === 0) {
+                try {
+                  const list = JSON.parse(inspAll.stdout.trim());
+                  const map = {};
+                  for (const raw of Array.isArray(list) ? list : []) {
+                    if (raw.Id) map[raw.Id] = raw;
+                    if (raw.Name) map[raw.Name] = raw;
+                  }
+                  this.networkInspectMap = map;
+                } catch {}
+              }
+            }
           }
         } else if (this.activeSection === "system") {
           const [dfRes, infoRes] = await Promise.all([
@@ -1395,7 +1437,9 @@ export default class DockerManager extends View {
       this.confirmInput.set_value("");
       this.confirmDialog = {
         ...spec,
-        onConfirm: () => this.runAction(item.id, row, isAlt, cx),
+        // Keep the data, never the event context: the confirm click happens in another call and
+        // a stashed cx is stale by then (gpui-kit: a cx is valid for the call that made it).
+        confirmAction: () => this.runAction(item.id, row, isAlt),
       };
       cx.notify();
       return;
@@ -1409,7 +1453,7 @@ export default class DockerManager extends View {
     this.confirmInput.set_value("");
     this.confirmDialog = {
       ...spec,
-      onConfirm: () => onConfirm(),
+      confirmAction: (cx) => onConfirm(cx),
     };
     cx.notify();
   }
@@ -1759,7 +1803,7 @@ export default class DockerManager extends View {
     });
     const now = new Date();
     const pad = (n) => String(n).padStart(2, "0");
-    const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
     const defaultArchive = `${vol.name}-${ts}.tar.gz`;
 
     this.volDestDirInput.set_value(ctx.cwd || "/tmp");
@@ -1800,6 +1844,19 @@ export default class DockerManager extends View {
       const srcDir = this.volSrcDirInput.value().trim() || "/tmp";
       const archiveName = this.volRestoreArchiveInput.value().trim();
       const typed = this.volTypedConfirmInput.value().trim();
+      const runningUsers = (vol.usedByContainers || []).filter((c) => c.running);
+      if (runningUsers.length > 0) {
+        notify({
+          title: "Restore refused",
+          body: `${vol.name} is mounted by ${runningUsers.length} running container(s): ${runningUsers
+            .map((c) => c.name)
+            .slice(0, 3)
+            .join(", ")}. Stop them first.`,
+          level: "error",
+          timeout: 6000,
+        });
+        return;
+      }
       if (typed !== vol.name) {
         notify({ title: "Name Confirmation", body: `Please type "${vol.name}" exactly to confirm restore.`, level: "warning" });
         return;
@@ -1970,6 +2027,12 @@ export default class DockerManager extends View {
     this.busyTargets.set(targetKey, actionLabel);
     cx.notify();
 
+    // Some builders return ["docker", ...] (they are shared with terminal.open, which needs the
+    // full command) and some return arguments only. Normalise here: exec() always adds "docker",
+    // so a builder that includes it produced `docker docker start <id>` for every container
+    // action (DM-70/72/73).
+    const dockerArgv = Array.isArray(argv) && argv[0] === "docker" ? argv.slice(1) : argv;
+
     const isLongOp = Array.isArray(argv) && argv.some((a) =>
       a === "build" || a === "--build" || a === "pull" || a === "prune" || a === "df"
     );
@@ -1977,7 +2040,7 @@ export default class DockerManager extends View {
 
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("docker", argv, { cwd: ctx?.cwd, on: ctx?.on, timeout });
+        const res = await exec("docker", dockerArgv, { cwd: ctx?.cwd, on: ctx?.on, timeout });
         if ((res.code ?? res.exitCode) !== 0) {
           const err = (res.stderr || res.stdout || "Command failed").trim();
           this.lastErrorText = err;
@@ -1989,10 +2052,11 @@ export default class DockerManager extends View {
             timeout: 4000,
           });
         } else {
+          const reclaimed = /Total reclaimed space:\s*([0-9.]+\s*[kMGT]?B)/i.exec(res.stdout || "");
           notify({
             title: "Docker",
-            body: `${actionLabel} finished`,
-            timeout: 2000,
+            body: reclaimed ? `${actionLabel} finished — reclaimed ${reclaimed[1]}` : `${actionLabel} finished`,
+            timeout: 2500,
           });
         }
       } catch (err) {
@@ -3410,9 +3474,10 @@ export default class DockerManager extends View {
                   ? `${data.restartPolicy.name}:${data.restartPolicy.maximumRetryCount}`
                   : data.restartPolicy.name)
               : "no";
-            const createdStartedStr = data.created && data.startedAt
+            const startedAtIsUnset = !data.startedAt || String(data.startedAt).startsWith("0001-01-01");
+            const createdStartedStr = data.created && !startedAtIsUnset
               ? `${data.created} / ${data.startedAt}`
-              : (data.created || data.startedAt || "");
+              : (data.created || (startedAtIsUnset ? "" : data.startedAt));
             const composeFilesStr = Array.isArray(data.composeFiles)
               ? data.composeFiles.join(", ")
               : (data.composeFiles || "");
@@ -3506,7 +3571,7 @@ export default class DockerManager extends View {
                                   .text_color(toColor(t.foreground))
                                   .cursor_pointer()
                                   .hover((s) => s.text_color(toColor(t.accent)))
-                                  .on_click(() => {
+                                  .on_click((_e, cx) => {
                                     const portLabel = pt.hostPort
                                       ? `${pt.hostPort}:${pt.containerPort}/${pt.proto}`
                                       : `${pt.containerPort}/${pt.proto}`;
@@ -3858,9 +3923,9 @@ export default class DockerManager extends View {
                       .text_color(toColor(dialog.destructive ? t.accent_foreground : t.solid_foreground))
                       .hover((s) => s.opacity(0.9))
                       .on_click((_e, cx) => {
-                        const onConfirm = dialog.onConfirm;
+                        const runConfirm = dialog.confirmAction;
                         this.confirmDialog = null;
-                        if (onConfirm) onConfirm();
+                        if (runConfirm) runConfirm(cx);
                         cx.notify();
                       })
                   )
@@ -4183,7 +4248,11 @@ export default class DockerManager extends View {
   /** Re-resolves the inspector target off the render path (tab timer): follows a Compose
    *  service across recreation and loads a target that was not ready at init. */
   ensureInspectorTarget(cx) {
-    if ((this.inspectRetries || 0) >= 4) return;
+    // No hard stop: a Docker Desktop cold start takes 20-40 s, which used to exhaust the budget
+    // and blank the tab permanently. Back off instead (1 s, 2 s, 4 s, then every 8 s).
+    const attempts = this.inspectRetries || 0;
+    const now = Date.now();
+    if (attempts > 0 && now < (this.inspectNextAttempt || 0)) return;
     const p = props();
     const kind = p?.inspect?.kind || "container";
     let targetId = p?.inspect?.id || p?.inspect?.name;
@@ -4197,7 +4266,14 @@ export default class DockerManager extends View {
     }
     if (!targetId) return;
     const loadKey = `${kind}:${targetId}`;
+    // A different target starts a fresh attempt budget.
+    if (this.inspectTargetKey !== loadKey) {
+      this.inspectTargetKey = loadKey;
+      this.inspectRetries = 0;
+      this.inspectNextAttempt = 0;
+    }
     if (this.inspectLoadKey === loadKey || this.inspectLoading) return;
+    this.inspectNextAttempt = now + Math.min(8000, 1000 * Math.pow(2, Math.max(0, attempts - 1)));
     this.loadInspectData(targetId, cx, kind);
   }
 
@@ -6823,6 +6899,8 @@ export default class DockerManager extends View {
 
   /** Main GPUI render description */
   render(cx) {
+    // checkCrossModRequest() is intentionally NOT called here: it mutates state and notifies, and
+    // notifying during render throws. poll() consumes requests off the render path.
     this.checkCrossModRequest(cx);
     const t = theme();
     const p = props();

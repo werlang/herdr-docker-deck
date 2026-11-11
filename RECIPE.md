@@ -47,7 +47,7 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 ## Done when
 
 - `herdr-app check mods/docker-manager` passes with zero errors.
-- `docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/` passes all unit tests, and `test/mod-safety.test.js` fails if a chained element method does not exist in `gpui-kit.d.ts`.
+- `docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/*.test.js` passes all unit tests; `test/mod-safety.test.js` fails on a chained element method that is not in `gpui-kit.d.ts` (it cannot judge a call on a receiver it cannot type, so the studio check is still the authority).
 - Running and stopped containers appear grouped under their Compose project and service, and uncreated services from workspace Compose files appear as `not created`.
 - Project and single-service lifecycle actions (`Up`, `Down`, `Start`, `Stop`, `Restart`, `Rebuild`, `Remove`) work from the right-click menu.
 - **Logs** and **Shell** open working Herdr terminals for the chosen service or container.
