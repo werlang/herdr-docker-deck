@@ -161,6 +161,8 @@ export default class DockerManager extends View {
     this.refreshSeq = 0;
     this.refreshing = false; // drives the toolbar refresh spinner
     this.busyTargets = new Map(); // targetKey -> actionLabel
+    this.busyCount = 0;
+    this.actionToast = null; // { label } while one or more actions run
 
     // Inspector Tab Mode state (DM-44..46)
     this.inspectTabSubView = propsData?.inspect?.subView || "overview"; // overview | env | mounts | network | labels | stats | raw
@@ -1508,21 +1510,22 @@ export default class DockerManager extends View {
         configFiles: rowData.configFiles || [],
       };
       const key = `proj:${rowData.name}`;
+      const projCtx = { ...ctx, cwd: projTarget.workingDir || ctx.cwd };
 
       if (actionId === "up") {
-        this.runDockerCmd(key, `Starting project ${rowData.name}`, buildComposeUpArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Starting project ${rowData.name}`, buildComposeUpArgs(projTarget), projCtx, cx);
       } else if (actionId === "up-build") {
-        this.runDockerCmd(key, `Rebuilding project ${rowData.name}`, buildComposeUpArgs(projTarget, { build: true }), ctx, cx);
+        this.runDockerCmd(key, `Rebuilding project ${rowData.name}`, buildComposeUpArgs(projTarget, { build: true }), projCtx, cx);
       } else if (actionId === "start") {
-        this.runDockerCmd(key, `Starting project ${rowData.name}`, buildComposeStartArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Starting project ${rowData.name}`, buildComposeStartArgs(projTarget), projCtx, cx);
       } else if (actionId === "stop") {
-        this.runDockerCmd(key, `Stopping project ${rowData.name}`, buildComposeStopArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Stopping project ${rowData.name}`, buildComposeStopArgs(projTarget), projCtx, cx);
       } else if (actionId === "restart") {
-        this.runDockerCmd(key, `Restarting project ${rowData.name}`, buildComposeRestartArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Restarting project ${rowData.name}`, buildComposeRestartArgs(projTarget), projCtx, cx);
       } else if (actionId === "pull") {
-        this.runDockerCmd(key, `Pulling images for ${rowData.name}`, buildComposePullArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Pulling images for ${rowData.name}`, buildComposePullArgs(projTarget), projCtx, cx);
       } else if (actionId === "build") {
-        this.runDockerCmd(key, `Building images for ${rowData.name}`, buildComposeBuildArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Building images for ${rowData.name}`, buildComposeBuildArgs(projTarget), projCtx, cx);
       } else if (actionId === "logs") {
         this.openLogs(rowData, isAlt);
       } else if (actionId === "open-compose") {
@@ -1544,9 +1547,9 @@ export default class DockerManager extends View {
           }
         }
       } else if (actionId === "down") {
-        this.runDockerCmd(key, `Stopping project ${rowData.name}`, buildComposeDownArgs(projTarget), ctx, cx);
+        this.runDockerCmd(key, `Stopping project ${rowData.name}`, buildComposeDownArgs(projTarget), projCtx, cx);
       } else if (actionId === "down-volumes") {
-        this.runDockerCmd(key, `Removing project & volumes ${rowData.name}`, buildComposeDownArgs(projTarget, { volumes: true }), ctx, cx);
+        this.runDockerCmd(key, `Removing project & volumes ${rowData.name}`, buildComposeDownArgs(projTarget, { volumes: true }), projCtx, cx);
       }
       return;
     }
@@ -1559,19 +1562,20 @@ export default class DockerManager extends View {
       };
       const key = `svc:${row.project}:${rowData.name}`;
       const containerId = rowData.containers?.[0]?.id;
+      const svcCtx = { ...ctx, cwd: projTarget.workingDir || ctx.cwd };
 
       if (actionId === "start") {
-        this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeStartArgs(projTarget, rowData.name), ctx, cx);
+        this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeStartArgs(projTarget, rowData.name), svcCtx, cx);
       } else if (actionId === "stop") {
-        this.runDockerCmd(key, `Stopping service ${rowData.name}`, buildComposeStopArgs(projTarget, rowData.name), ctx, cx);
+        this.runDockerCmd(key, `Stopping service ${rowData.name}`, buildComposeStopArgs(projTarget, rowData.name), svcCtx, cx);
       } else if (actionId === "restart") {
-        this.runDockerCmd(key, `Restarting service ${rowData.name}`, buildComposeRestartArgs(projTarget, rowData.name), ctx, cx);
+        this.runDockerCmd(key, `Restarting service ${rowData.name}`, buildComposeRestartArgs(projTarget, rowData.name), svcCtx, cx);
       } else if (actionId === "up") {
-        this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeUpArgs(projTarget, { service: rowData.name }), ctx, cx);
+        this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeUpArgs(projTarget, { service: rowData.name }), svcCtx, cx);
       } else if (actionId === "rebuild") {
-        this.runDockerCmd(key, `Rebuilding service ${rowData.name}`, buildComposeRebuildArgs(projTarget, rowData.name), ctx, cx);
+        this.runDockerCmd(key, `Rebuilding service ${rowData.name}`, buildComposeRebuildArgs(projTarget, rowData.name), svcCtx, cx);
       } else if (actionId === "recreate") {
-        this.runDockerCmd(key, `Recreating service ${rowData.name}`, buildComposeRecreateArgs(projTarget, rowData.name), ctx, cx);
+        this.runDockerCmd(key, `Recreating service ${rowData.name}`, buildComposeRecreateArgs(projTarget, rowData.name), svcCtx, cx);
       } else if (actionId === "logs") {
         this.openLogs(rowData, isAlt);
       } else if (actionId === "shell") {
@@ -1595,7 +1599,7 @@ export default class DockerManager extends View {
       } else if (actionId === "copy-id") {
         this.copyValue(containerId, "Container ID", cx);
       } else if (actionId === "remove") {
-        this.runDockerCmd(key, `Removing service ${rowData.name}`, buildComposeRmArgs(projTarget, rowData.name), ctx, cx);
+        this.runDockerCmd(key, `Removing service ${rowData.name}`, buildComposeRmArgs(projTarget, rowData.name), svcCtx, cx);
       }
       return;
     }
@@ -1792,6 +1796,7 @@ export default class DockerManager extends View {
       this.imageDialog = null;
       run("terminal.open", {
         name: `run: ${name || img.name}`,
+        folder: focused()?.cwd || spaces().find((candidate) => candidate.active)?.folder,
         argv: [
           "docker",
           "run",
@@ -1864,6 +1869,7 @@ export default class DockerManager extends View {
       const argv = ["docker", ...buildVolumeBackupArgs(vol.name, destDir, archiveName)];
       run("terminal.open", {
         name: `backup: ${vol.name}`,
+        folder: focused()?.cwd || spaces().find((candidate) => candidate.active)?.folder,
         argv,
       });
       cx.notify();
@@ -1895,6 +1901,7 @@ export default class DockerManager extends View {
       const argv = ["docker", ...buildVolumeRestoreArgs(vol.name, srcDir, archiveName)];
       run("terminal.open", {
         name: `restore: ${vol.name}`,
+        folder: focused()?.cwd || spaces().find((candidate) => candidate.active)?.folder,
         argv,
       });
       cx.notify();
@@ -1918,6 +1925,8 @@ export default class DockerManager extends View {
 
       const targetKey = `vol:${vol.name}`;
       this.busyTargets.set(targetKey, `Cloning to ${destVol}`);
+      this.busyCount += 1;
+      this.actionToast = { label: `Cloning ${vol.name} → ${destVol}` };
       cx.notify();
 
       cx.spawn(async (cx) => {
@@ -1965,6 +1974,10 @@ export default class DockerManager extends View {
           });
         } finally {
           this.busyTargets.delete(targetKey);
+          if (this.busyCount > 0) this.busyCount--;
+          if (this.busyCount === 0) this.actionToast = null;
+          this.refresh(cx);
+          this.reloadInspectorIfNeeded(cx);
           cx.notify();
         }
       });
@@ -2018,6 +2031,8 @@ export default class DockerManager extends View {
     if (plan.commands.length === 0) return;
 
     this.busyTargets.set("system:prune", "Pruning resources…");
+    this.busyCount += 1;
+    this.actionToast = { label: "Pruning selected resources…" };
     cx.notify();
 
     const ctx = resolveDockerContext({
@@ -2042,6 +2057,8 @@ export default class DockerManager extends View {
         }
       }
       this.busyTargets.delete("system:prune");
+      if (this.busyCount > 0) this.busyCount--;
+      if (this.busyCount === 0) this.actionToast = null;
       this.refresh(cx);
       notify({
         title: "Docker Prune Finished",
@@ -2055,6 +2072,8 @@ export default class DockerManager extends View {
   /** Runs docker CLI argv in the background with busy spinner and error toast (DM-16) */
   runDockerCmd(targetKey, actionLabel, argv, ctx, cx) {
     this.busyTargets.set(targetKey, actionLabel);
+    this.busyCount += 1;
+    this.actionToast = { label: actionLabel };
     cx.notify();
 
     // Some builders return ["docker", ...] (they are shared with terminal.open, which needs the
@@ -2099,9 +2118,26 @@ export default class DockerManager extends View {
         });
       } finally {
         this.busyTargets.delete(targetKey);
+        if (this.busyCount > 0) this.busyCount--;
+        if (this.busyCount === 0) this.actionToast = null;
         this.refresh(cx);
+        this.reloadInspectorIfNeeded(cx);
       }
     });
+  }
+
+  /** Reloads the inspector tab's target after an action (Stop -> Start, Tag, ...). */
+  reloadInspectorIfNeeded(cx) {
+    const p = props();
+    if (!p?.inspect) return;
+    const kind = p.inspect.kind || "container";
+    let id = p.inspect.id || p.inspect.name;
+    if (kind === "container" && p.inspect.project && p.inspect.service) {
+      id = resolveServiceContainerId(this.containersRaw, p.inspect.project, p.inspect.service, id);
+    }
+    if (!id) return;
+    this.inspectLoadKey = null;
+    this.loadInspectData(id, cx, kind);
   }
 
   /** Logs terminal opening with focus reuse and split-down support (DM-80, DM-82) */
@@ -2114,9 +2150,14 @@ export default class DockerManager extends View {
       return;
     }
 
-    const projTarget = target.project
-      ? { project: target.project, configFiles: target.configFiles || [], workingDir: target.workingDirs?.[0] }
-      : null;
+    // Project rows carry `name`, not `project`; without this branch the menu
+    // fell through to `buildContainerLogsArgs(undefined)` and opened nothing.
+    const projTarget =
+      target.kind === "project"
+        ? { project: target.name, configFiles: target.configFiles || [], workingDir: target.workingDirs?.[0] }
+        : target.project
+        ? { project: target.project, configFiles: target.configFiles || [], workingDir: target.workingDirs?.[0] }
+        : null;
 
     let argv;
     if (projTarget && target.kind === "service") {
@@ -2127,7 +2168,7 @@ export default class DockerManager extends View {
       argv = buildContainerLogsArgs(target.id, 500);
     }
 
-    const folder = target.workingDirs?.[0] || activeSpace?.folder || "/";
+    const folder = projTarget?.workingDir || target.workingDirs?.[0] || activeSpace?.folder || "/";
     run("terminal.open", {
       name: termName,
       folder,
@@ -2850,6 +2891,16 @@ export default class DockerManager extends View {
                 )
                 .child(div().text_size(10).text_color(toColor(t.dim)).child(busyLabel || ""))
             )
+        )
+        // Uptime/state stays visible, but the full status, health and ports
+        // detail remains in the drawer.
+        .child(
+          div()
+            .max_w(180)
+            .truncate()
+            .text_size(10)
+            .text_color(toColor(s.notCreated ? t.dim : t.muted))
+            .child(s.statusText || "")
         );
     }
 
@@ -3744,6 +3795,28 @@ export default class DockerManager extends View {
       );
   }
 
+  /** Floating progress toast: every async action shows a spinner and its label. */
+  renderActionToast(t) {
+    const toast = this.actionToast;
+    if (!toast) return div();
+    return h_flex()
+      .id("docker-action-toast")
+      .absolute()
+      .right(12)
+      .bottom(12)
+      .h(32)
+      .px(10)
+      .gap(8)
+      .items_center()
+      .rounded(6)
+      .bg(toColor(t.popover))
+      .border_1()
+      .border_color(toColor(t.border))
+      .shadow_md()
+      .child(svg("mods/docker-manager/icons/spinner.svg").size(14).text_color(toColor(t.accent)).spin(900))
+      .child(div().text_size(11).text_color(toColor(t.foreground)).child(toast.label || "Working…"));
+  }
+
   /** In-panel context menu overlay (DM-14, DM-50..73, DESIGN §5.4) */
   renderContextMenu(t, cx) {
     const menu = this.contextMenu;
@@ -3788,10 +3861,7 @@ export default class DockerManager extends View {
               return v_flex()
                 .w_full()
                 .when(needsDivider, (el) =>
-                  el
-                    .my(2)
-                    .h(1)
-                    .bg(toColor(t.border))
+                  el.child(div().my(2).h(1).bg(toColor(t.border)))
                 )
                 .child(
                   h_flex()
@@ -4394,6 +4464,7 @@ export default class DockerManager extends View {
 
     return v_flex()
       .size_full()
+      .relative()
       .bg(toColor(t.background))
       // Full tab header bar with lifecycle actions (DM-46)
       .child(
@@ -4795,7 +4866,13 @@ export default class DockerManager extends View {
               )
           )
           .when(!this.inspectLoading, (el) => this.renderInspectSubView(kind, targetId, t, cx, el))
-      );
+      )
+      // The inspector tab has its own root, so the panel-mode dialog overlays
+      // must be mounted here too; otherwise Run/Tag/Backup/Restore/Clone set
+      // state but no modal is ever drawn.
+      .when(Boolean(this.imageDialog), (el) => el.child(this.renderImageDialog(t, cx)))
+      .when(Boolean(this.volumeDialog), (el) => el.child(this.renderVolumeDialog(t, cx)))
+      .when(Boolean(this.actionToast), (el) => el.child(this.renderActionToast(t)));
   }
 
   renderInspectSubView(kind, targetId, t, cx, el) {
@@ -6960,6 +7037,7 @@ export default class DockerManager extends View {
     return v_flex()
       .id("docker-manager-root")
       .size_full()
+      .relative()
       .bg(toColor(t.surface))
       .track_focus(this.handle)
       .on_size_change((size, cx) => {
@@ -7045,6 +7123,7 @@ export default class DockerManager extends View {
       .when(Boolean(this.dockerfileDialog), (el) => el.child(this.renderDockerfileDialog(t, cx)))
       .when(Boolean(this.imageDialog), (el) => el.child(this.renderImageDialog(t, cx)))
       .when(Boolean(this.volumeDialog), (el) => el.child(this.renderVolumeDialog(t, cx)))
-      .when(Boolean(this.toolbarMenuOpen), (el) => el.child(this.renderToolbarMenu(t, cx)));
+      .when(Boolean(this.toolbarMenuOpen), (el) => el.child(this.renderToolbarMenu(t, cx)))
+      .when(Boolean(this.actionToast), (el) => el.child(this.renderActionToast(t)));
   }
 }
