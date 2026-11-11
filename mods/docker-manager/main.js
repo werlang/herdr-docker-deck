@@ -166,6 +166,17 @@ export default class DockerManager extends View {
     this.revealedSecrets = new Set();
     this.liveStats = null;
     this.inspectDataRaw = null;
+    this.inspectLoadKey = null;
+    // The inspector tab loads off the render path: calling loadInspectData from render() sets
+    // inspectLoading and the render-scoped context drops the spawn. `propsData` is not reliable
+    // here (it can arrive empty), so poll props() and pick the target up when it is there.
+    cx.timer.every(1000, (cx) => {
+      this.ensureInspectorTarget(cx);
+    });
+    cx.spawn(async (cx) => {
+      await null;
+      this.ensureInspectorTarget(cx);
+    });
     if (this.inspectTabSubView === "stats" && propsData?.inspect?.id) {
       this.pollStats(propsData.inspect.id, cx);
     }
@@ -3325,7 +3336,7 @@ export default class DockerManager extends View {
                         h_flex()
                           .flex_1()
                           .gap(6)
-                          .wrap()
+                          .flex_wrap()
                           .children(
                             usingCtrs.map((c) =>
                               div()
@@ -3368,7 +3379,7 @@ export default class DockerManager extends View {
                         h_flex()
                           .flex_1()
                           .gap(6)
-                          .wrap()
+                          .flex_wrap()
                           .children(
                             connected.map((c) =>
                               h_flex()
@@ -3394,15 +3405,62 @@ export default class DockerManager extends View {
                 );
             }
 
+            const restartPolicyStr = data.restartPolicy?.name
+              ? (data.restartPolicy.maximumRetryCount > 0
+                  ? `${data.restartPolicy.name}:${data.restartPolicy.maximumRetryCount}`
+                  : data.restartPolicy.name)
+              : "no";
+            const createdStartedStr = data.created && data.startedAt
+              ? `${data.created} / ${data.startedAt}`
+              : (data.created || data.startedAt || "");
+            const composeFilesStr = Array.isArray(data.composeFiles)
+              ? data.composeFiles.join(", ")
+              : (data.composeFiles || "");
+            const dependsOnStr = Array.isArray(data.dependsOn)
+              ? data.dependsOn.join(", ")
+              : (data.dependsOn || "");
+            const isUnhealthy = Boolean(
+              data.health?.status &&
+              data.health.status !== "healthy" &&
+              data.health?.lastLog
+            );
+
             return el
-              .child(this.renderDrawerRow("Container ID", data.shortId, t, cx, true))
+              .child(this.renderDrawerRow("Name", data.name, t, cx, true))
+              .child(this.renderDrawerRow("Container ID", data.shortId, t, cx, true, data.id || data.shortId))
               .child(this.renderDrawerRow("Image", data.image, t, cx, true))
               .child(
                 this.renderDrawerRow(
                   "Status",
                   `${data.state.status}${data.health.status ? ` (${data.health.status})` : ""}`,
                   t,
-                  cx
+                  cx,
+                  true
+                )
+              )
+              .when(isUnhealthy, (hEl) =>
+                hEl.child(
+                  this.renderDrawerRow(
+                    "Health Check",
+                    data.health.lastLog.trim().replace(/\s+/g, " "),
+                    t,
+                    cx,
+                    true,
+                    data.health.lastLog
+                  )
+                )
+              )
+              .child(this.renderDrawerRow("Restart Policy", restartPolicyStr, t, cx, true))
+              .child(
+                this.renderDrawerRow(
+                  "Created / Started",
+                  createdStartedStr,
+                  t,
+                  cx,
+                  true,
+                  data.created && data.startedAt
+                    ? `Created: ${data.created}, Started: ${data.startedAt}`
+                    : createdStartedStr
                 )
               )
               .when(Boolean(data.ports && data.ports.length > 0), (pEl) =>
@@ -3446,6 +3504,14 @@ export default class DockerManager extends View {
                               .child(
                                 div()
                                   .text_color(toColor(t.foreground))
+                                  .cursor_pointer()
+                                  .hover((s) => s.text_color(toColor(t.accent)))
+                                  .on_click(() => {
+                                    const portLabel = pt.hostPort
+                                      ? `${pt.hostPort}:${pt.containerPort}/${pt.proto}`
+                                      : `${pt.containerPort}/${pt.proto}`;
+                                    this.copyValue(portLabel, "Port", cx);
+                                  })
                                   .child(`${pt.containerPort}/${pt.proto}`)
                               )
                           )
@@ -3459,7 +3525,8 @@ export default class DockerManager extends View {
                     "Mounts",
                     data.mounts.map((m) => `${m.destination} (${m.type})`).join(", "),
                     t,
-                    cx
+                    cx,
+                    true
                   )
                 )
               )
@@ -3469,11 +3536,21 @@ export default class DockerManager extends View {
                     "Networks",
                     data.networks.map((n) => `${n.name} (${n.ipAddress || "no IP"})`).join(", "),
                     t,
-                    cx
+                    cx,
+                    true
                   )
                 )
               )
-              .child(this.renderDrawerRow("Command", data.cmd || data.entrypoint, t, cx, true));
+              .child(this.renderDrawerRow("Command", data.cmd || data.entrypoint, t, cx, true))
+              .when(Boolean(data.workingDir), (wEl) =>
+                wEl.child(this.renderDrawerRow("Working Dir", data.workingDir, t, cx, true))
+              )
+              .when(Boolean(composeFilesStr), (cEl) =>
+                cEl.child(this.renderDrawerRow("Compose Files", composeFilesStr, t, cx, true))
+              )
+              .when(Boolean(dependsOnStr), (dEl) =>
+                dEl.child(this.renderDrawerRow("Depends On", dependsOnStr, t, cx, true))
+              );
           })
           .when(!this.inspectLoading && !this.inspectData && Boolean(sel.notCreated), (el) => {
             const disc = this.discoveredCompose.find((d) => d.project === sel.project);
@@ -3542,8 +3619,10 @@ export default class DockerManager extends View {
   }
 
   /** Key-value row in Inspector Drawer with copy-on-click (DM-43) */
-  renderDrawerRow(label, value, t, cx, copyable = false) {
+  renderDrawerRow(label, value, t, cx, copyable = true, copyVal = null) {
     if (!value) return div();
+    const str = String(value);
+    const toCopy = copyVal !== null && copyVal !== undefined ? String(copyVal) : str;
     return h_flex()
       .gap(8)
       .text_size(11)
@@ -3559,9 +3638,12 @@ export default class DockerManager extends View {
           .text_color(toColor(t.foreground))
           .truncate()
           .when(copyable, (el) =>
-            el.hover((s) => s.text_color(toColor(t.accent))).on_click(() => this.copyValue(value, label, cx))
+            el
+              .cursor_pointer()
+              .hover((s) => s.text_color(toColor(t.accent)))
+              .on_click(() => this.copyValue(toCopy, label, cx))
           )
-          .child(value)
+          .child(str)
       );
   }
 
@@ -3978,6 +4060,8 @@ export default class DockerManager extends View {
   loadInspectData(id, cx, kind = "container") {
     if (!id) return;
     this.inspectLoading = true;
+    this.inspectLoadKey = `${kind}:${id}`;
+    this.inspectError = null;
     cx.notify();
 
     const ctx = resolveDockerContext({
@@ -4074,16 +4158,47 @@ export default class DockerManager extends View {
           } else {
             this.inspectDataRaw = null;
             this.inspectData = null;
+            this.inspectError = `docker inspect failed (exit ${res.code}): ${String(res.stderr || "").trim().slice(0, 300)}`;
           }
         }
-      } catch {
+      } catch (err) {
         this.inspectDataRaw = null;
         this.inspectData = null;
+        this.inspectError = String(err && err.message ? err.message : err);
       } finally {
         this.inspectLoading = false;
+        // A load that produced nothing must stay retryable: the init-time load can run before
+        // the app can exec, and the tab timer then retries it a bounded number of times.
+        if (!this.inspectData) {
+          this.inspectLoadKey = null;
+          this.inspectRetries = (this.inspectRetries || 0) + 1;
+        } else {
+          this.inspectRetries = 0;
+        }
         cx.notify();
       }
     });
+  }
+
+  /** Re-resolves the inspector target off the render path (tab timer): follows a Compose
+   *  service across recreation and loads a target that was not ready at init. */
+  ensureInspectorTarget(cx) {
+    if ((this.inspectRetries || 0) >= 4) return;
+    const p = props();
+    const kind = p?.inspect?.kind || "container";
+    let targetId = p?.inspect?.id || p?.inspect?.name;
+    if (kind === "container" && p?.inspect?.project && p?.inspect?.service) {
+      targetId = resolveServiceContainerId(
+        this.containersRaw,
+        p.inspect.project,
+        p.inspect.service,
+        targetId
+      );
+    }
+    if (!targetId) return;
+    const loadKey = `${kind}:${targetId}`;
+    if (this.inspectLoadKey === loadKey || this.inspectLoading) return;
+    this.loadInspectData(targetId, cx, kind);
   }
 
   /** Inspector Tab Mode (full-page inspection tab, DM-44..46) */
@@ -4099,10 +4214,6 @@ export default class DockerManager extends View {
         p.inspect.service,
         targetId
       );
-    }
-
-    if (targetId && (!this.inspectData || this.inspectData.id !== targetId || this.inspectData.kind !== kind) && !this.inspectLoading) {
-      this.loadInspectData(targetId, cx, kind);
     }
 
     const targetTitle = p?.inspect?.service
@@ -4548,10 +4659,14 @@ export default class DockerManager extends View {
   renderInspectSubView(kind, targetId, t, cx, el) {
     const data = this.inspectData;
     if (!data) {
+      const errText = this.inspectError ? String(this.inspectError) : "";
       return el
         .items_center()
         .justify_center()
-        .child(div().text_size(12).text_color(toColor(t.dim)).child("No inspect data available."));
+        .child(div().text_size(12).text_color(toColor(t.dim)).child("No inspect data available."))
+        .when(Boolean(errText), (e) =>
+          e.child(div().mt(6).px(16).text_size(11).text_color(toColor(t.blocked)).child(errText))
+        );
     }
 
     // 1. Raw JSON sub-view (common to all kinds)
@@ -4747,7 +4862,7 @@ export default class DockerManager extends View {
               .child(
                 h_flex()
                   .gap(6)
-                  .wrap()
+                  .flex_wrap()
                   .children(
                     usingCtrs.map((c) =>
                       div()

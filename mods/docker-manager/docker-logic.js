@@ -2830,7 +2830,7 @@ export function normalizeImageInspect(raw, historyRows = []) {
   const target = Array.isArray(raw) ? raw[0] : raw;
   if (!target || typeof target !== "object") return null;
 
-  const id = target.Id || "";
+  const id = target.Id || target.ID || "";
   const shortId = id.replace(/^sha256:/, "").slice(0, 12);
   const repoTags = Array.isArray(target.RepoTags) ? target.RepoTags : [];
   const repoDigests = Array.isArray(target.RepoDigests) ? target.RepoDigests : [];
@@ -2908,7 +2908,7 @@ export function normalizeNetworkInspect(raw) {
   const target = Array.isArray(raw) ? raw[0] : raw;
   if (!target || typeof target !== "object") return null;
 
-  const id = target.Id || "";
+  const id = target.Id || target.ID || "";
   const shortId = id.slice(0, 12);
   const name = target.Name || "";
   const driver = target.Driver || "";
