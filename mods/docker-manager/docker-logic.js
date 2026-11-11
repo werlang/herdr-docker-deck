@@ -1878,6 +1878,9 @@ export function flattenContainerRows(tree = {}, expandState = null) {
           shortId,
           image,
           ports,
+          workingDir: proj.workingDir,
+          configFiles: proj.configFiles,
+          hasConfigFiles: proj.hasConfigFiles,
           expanded: isSvcExpanded,
           depth: 1,
           data: svc,
@@ -1902,6 +1905,9 @@ export function flattenContainerRows(tree = {}, expandState = null) {
               shortId: c.shortId || (c.id ? c.id.slice(0, 12) : ""),
               service: svc.name,
               project: proj.name,
+              workingDir: proj.workingDir,
+              configFiles: proj.configFiles,
+              hasConfigFiles: proj.hasConfigFiles,
               containerNumber: c.containerNumber || "1",
               status: c.status || c.state || "",
               state: c.state || "",
@@ -1994,3 +2000,1275 @@ export function flattenContainerRows(tree = {}, expandState = null) {
 
   return rows;
 }
+
+// =============================================================================
+// Section 7 & Acceptance Criteria 2 Pure Functions (R3)
+// =============================================================================
+
+/**
+ * Formats raw docker Ports string or inspect bindings into compact port pills (DM-22).
+ *
+ * Drops host IPs (`0.0.0.0:`, `[::]:`) and protocols (`/tcp`), formats published mappings as `host→container`,
+ * deduplicates identical mappings (e.g. IPv4 + IPv6 pairs), and marks unmapped exposed ports (e.g. `9000-9001/tcp`)
+ * as unpublished (`published: false`).
+ *
+ * @param {string | any[] | null | undefined} rawPorts
+ * @returns {Array<{ text: string, published: boolean, hostPort: string | null, containerPort: string }>}
+ */
+export function formatPortMappings(rawPorts) {
+  if (!rawPorts) return [];
+
+  const results = [];
+  const seen = new Set();
+
+  if (typeof rawPorts === "string") {
+    const trimmed = rawPorts.trim();
+    if (!trimmed) return [];
+
+    const parts = trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+    for (const part of parts) {
+      if (part.includes("->")) {
+        // Published mapping, e.g. "0.0.0.0:8080->8080/tcp" or "[::]:8080->8080/tcp"
+        const [left, right] = part.split("->").map((s) => s.trim());
+        let hostPort = left;
+        if (hostPort.includes("]:")) {
+          hostPort = hostPort.slice(hostPort.lastIndexOf("]:") + 2);
+        } else if (hostPort.includes(":")) {
+          hostPort = hostPort.slice(hostPort.lastIndexOf(":") + 1);
+        }
+
+        let containerPort = right;
+        if (containerPort.includes("/")) {
+          containerPort = containerPort.slice(0, containerPort.indexOf("/"));
+        }
+
+        const text = `${hostPort}→${containerPort}`;
+        const key = `pub:${text}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({
+            text,
+            published: true,
+            hostPort,
+            containerPort,
+            toString() {
+              return this.text;
+            },
+          });
+        }
+      } else {
+        // Exposed port without host publish, e.g. "9000-9001/tcp" or "80/tcp"
+        let containerPort = part;
+        if (containerPort.includes("/")) {
+          containerPort = containerPort.slice(0, containerPort.indexOf("/"));
+        }
+        const text = containerPort;
+        const key = `unpub:${text}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({
+            text,
+            published: false,
+            hostPort: null,
+            containerPort,
+            toString() {
+              return this.text;
+            },
+          });
+        }
+      }
+    }
+  } else if (Array.isArray(rawPorts)) {
+    for (const p of rawPorts) {
+      if (!p) continue;
+      if (typeof p === "string") {
+        const sub = formatPortMappings(p);
+        for (const s of sub) {
+          const key = `${s.published ? "pub" : "unpub"}:${s.text}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push(s);
+          }
+        }
+      } else if (typeof p === "object") {
+        const hostPort = p.hostPort ? String(p.hostPort) : null;
+        const containerPort = String(p.containerPort || p.port || "");
+        if (!containerPort) continue;
+
+        if (hostPort) {
+          const text = `${hostPort}→${containerPort}`;
+          const key = `pub:${text}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push({
+              text,
+              published: true,
+              hostPort,
+              containerPort,
+              toString() {
+                return this.text;
+              },
+            });
+          }
+        } else {
+          const text = containerPort;
+          const key = `unpub:${text}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push({
+              text,
+              published: false,
+              hostPort: null,
+              containerPort,
+              toString() {
+                return this.text;
+              },
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Returns the confirmation mode for an action: "typed", "plain", or "none".
+ *
+ * "typed" for `down -v`, `container.remove`, `volume.restore`, `prune.*`.
+ * "plain" for `down`, `container.kill`, `service.remove`.
+ * "none" otherwise.
+ *
+ * @param {string | { id?: string }} item
+ * @returns {"typed" | "plain" | "none"}
+ */
+export function confirmKind(item) {
+  const id = typeof item === "string" ? item : (item?.id || "");
+  if (
+    id === "project.down_volumes" ||
+    id === "down -v" ||
+    id === "container.remove" ||
+    id === "container.rm" ||
+    id === "volume.restore" ||
+    id.startsWith("prune") ||
+    id.startsWith("image.prune_unused") ||
+    id.startsWith("system.prune")
+  ) {
+    return "typed";
+  }
+  if (
+    id === "project.down" ||
+    id === "down" ||
+    id === "container.kill" ||
+    id === "service.remove" ||
+    id === "service.rm"
+  ) {
+    return "plain";
+  }
+  return "none";
+}
+
+/**
+ * Returns whether an action requires confirmation before execution (DM-85..87).
+ *
+ * @param {string | { id?: string }} item
+ * @returns {boolean}
+ */
+export function requiresConfirm(item) {
+  return confirmKind(item) !== "none";
+}
+
+/**
+ * Validates typed confirmation input (DM-86).
+ * Typed confirm only enables on exact match (case-sensitive) of project name or "prune".
+ *
+ * @param {"typed" | "plain" | "none"} kind
+ * @param {string} typed
+ * @param {string} expected
+ * @returns {boolean}
+ */
+export function validateConfirmInput(kind, typed, expected) {
+  if (kind !== "typed") return true;
+  if (typeof typed !== "string") return false;
+  return typed === expected;
+}
+
+/**
+ * Determines placement for opening a terminal ("tab" unless alt or preference === "down").
+ *
+ * @param {{ alt?: boolean, preference?: string }} [opts]
+ * @returns {"tab" | "down"}
+ */
+export function terminalPlacement({ alt = false, preference = "" } = {}) {
+  if (alt || preference === "down") {
+    return "down";
+  }
+  return "tab";
+}
+
+/**
+ * Matches an existing terminal whose argv equals the requested argv in the active space.
+ *
+ * @param {any[]} terminals
+ * @param {string[]} argv
+ * @param {string} [spaceId]
+ * @returns {any | null}
+ */
+export function findReusableTerminal(terminals, argv, spaceId) {
+  if (!Array.isArray(terminals) || !Array.isArray(argv) || argv.length === 0) {
+    return null;
+  }
+
+  for (const t of terminals) {
+    if (!t) continue;
+    if (spaceId && t.space && t.space !== spaceId && t.spaceId !== spaceId) {
+      continue;
+    }
+
+    const tArgv = Array.isArray(t.argv) ? t.argv : (Array.isArray(t.command) ? t.command : null);
+    if (tArgv) {
+      if (tArgv.length === argv.length && tArgv.every((arg, i) => arg === argv[i])) {
+        return t;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Builds the exact CLI argv for lifecycle actions across projects, services, and containers (DM-50..83).
+ * Covers all 26 lifecycle actions in DESIGN.md §4.5.
+ *
+ * @param {string | { id?: string }} item
+ * @param {any} target
+ * @returns {string[]}
+ */
+export function buildActionArgs(item, target) {
+  const actionId = typeof item === "string" ? item : (item?.id || "");
+  const t = target || {};
+  const kind = t.kind || t.type || (t.service ? "service" : t.project ? "project" : t.id ? "container" : "");
+
+  // Project Actions (10)
+  if (actionId === "project.up" || (actionId === "up" && kind === "project")) {
+    return buildComposeArgs(t, ["up", "-d"]);
+  }
+  if (actionId === "project.up_build" || (actionId === "up-build" && kind === "project")) {
+    return buildComposeArgs(t, ["up", "-d", "--build"]);
+  }
+  if (actionId === "project.start" || (actionId === "start" && kind === "project")) {
+    return buildComposeArgs(t, ["start"]);
+  }
+  if (actionId === "project.stop" || (actionId === "stop" && kind === "project")) {
+    return buildComposeArgs(t, ["stop"]);
+  }
+  if (actionId === "project.restart" || (actionId === "restart" && kind === "project")) {
+    return buildComposeArgs(t, ["restart"]);
+  }
+  if (actionId === "project.pull" || (actionId === "pull" && kind === "project")) {
+    return buildComposeArgs(t, ["pull"]);
+  }
+  if (actionId === "project.build" || (actionId === "build" && kind === "project")) {
+    return buildComposeArgs(t, ["build"]);
+  }
+  if (actionId === "project.logs" || (actionId === "logs" && kind === "project")) {
+    const composeArgs = buildComposeArgs(t, []);
+    return ["docker", ...composeArgs, "logs", "-f", "--tail", "500"];
+  }
+  if (actionId === "project.down" || (actionId === "down" && kind === "project")) {
+    return buildProjectDownArgs(t, { removeVolumes: false });
+  }
+  if (
+    actionId === "project.down_volumes" ||
+    actionId === "down -v" ||
+    (actionId === "down-volume" && kind === "project")
+  ) {
+    return buildProjectDownVolumesArgs(t);
+  }
+
+  // Service Actions (9)
+  const serviceName = t.service || t.name || "";
+  if (actionId === "service.start" || (actionId === "start" && kind === "service")) {
+    return buildComposeArgs(t, ["start", serviceName]);
+  }
+  if (actionId === "service.stop" || (actionId === "stop" && kind === "service")) {
+    return buildComposeArgs(t, ["stop", serviceName]);
+  }
+  if (actionId === "service.restart" || (actionId === "restart" && kind === "service")) {
+    return buildComposeArgs(t, ["restart", serviceName]);
+  }
+  if (actionId === "service.up" || (actionId === "up" && kind === "service")) {
+    return buildComposeArgs(t, ["up", "-d", serviceName]);
+  }
+  if (actionId === "service.rebuild" || (actionId === "rebuild" && kind === "service")) {
+    return buildServiceRebuildArgs(t, serviceName);
+  }
+  if (actionId === "service.recreate" || (actionId === "recreate" && kind === "service")) {
+    return buildServiceRecreateArgs(t, serviceName);
+  }
+  if (actionId === "service.logs" || (actionId === "logs" && kind === "service")) {
+    return buildServiceLogsArgs(t, serviceName, { tail: 500 });
+  }
+  if (actionId === "service.shell" || (actionId === "shell" && kind === "service")) {
+    const contId = t.containerId || t.id || t.containers?.[0]?.id || "";
+    return buildContainerShellArgs(contId, "auto");
+  }
+  if (
+    actionId === "service.remove" ||
+    actionId === "service.rm" ||
+    (actionId === "rm" && kind === "service")
+  ) {
+    return buildServiceRmArgs(t, serviceName);
+  }
+
+  // Container Actions (9)
+  const containerId = t.id || t.containerId || t.shortId || "";
+  const isRunning = Boolean(
+    t.isRunning || t.running || t.state?.running || t.state === "running"
+  );
+
+  if (actionId === "container.start" || (actionId === "start" && kind === "container")) {
+    return ["start", containerId];
+  }
+  if (actionId === "container.stop" || (actionId === "stop" && kind === "container")) {
+    return ["stop", containerId];
+  }
+  if (actionId === "container.restart" || (actionId === "restart" && kind === "container")) {
+    return ["restart", containerId];
+  }
+  if (actionId === "container.pause" || (actionId === "pause" && kind === "container")) {
+    return ["pause", containerId];
+  }
+  if (actionId === "container.unpause" || (actionId === "unpause" && kind === "container")) {
+    return ["unpause", containerId];
+  }
+  if (actionId === "container.kill" || (actionId === "kill" && kind === "container")) {
+    return ["kill", containerId];
+  }
+  if (
+    actionId === "container.remove" ||
+    actionId === "container.rm" ||
+    (actionId === "rm" && kind === "container")
+  ) {
+    return isRunning ? ["rm", "-f", containerId] : ["rm", containerId];
+  }
+  if (actionId === "container.logs" || (actionId === "logs" && kind === "container")) {
+    return buildContainerLogsArgs(containerId, { tail: 500 });
+  }
+  if (actionId === "container.shell" || (actionId === "shell" && kind === "container")) {
+    return buildContainerShellArgs(containerId, "auto");
+  }
+
+  throw new Error(`Unknown action: ${actionId} for target kind: ${kind}`);
+}
+
+/**
+ * Builds the exact ordered list of context menu items for a target resource (DM-50..78).
+ *
+ * Each item has `{ id, label, enabled, reason, ...(danger ? { danger: true } : {}) }`.
+ * Destructive items are flagged `danger: true` and placed last.
+ * Disabled items carry a human reason string (`compose file not found`, `container is not running`, `no published ports`).
+ *
+ * @param {any} target
+ * @param {any} [state]
+ * @returns {Array<{ id: string, label: string, enabled: boolean, reason: string | null, danger?: boolean }>}
+ */
+export function buildContextMenuItems(target, state = {}) {
+  const t = target || {};
+  const kind =
+    t.kind ||
+    t.type ||
+    (t.service ? "service" : t.project ? "project" : t.id ? "container" : "project");
+
+  const hasFiles = hasUsableConfigFiles(t);
+  const isRunning = Boolean(
+    t.isRunning ||
+      t.running ||
+      t.state?.running ||
+      t.state === "running" ||
+      (typeof t.status === "string" && t.status.toLowerCase().startsWith("up"))
+  );
+  const isPaused = Boolean(
+    t.isPaused ||
+      t.paused ||
+      t.state?.paused ||
+      t.state === "paused" ||
+      (typeof t.status === "string" && t.status.toLowerCase().includes("paused"))
+  );
+  const portMappings = formatPortMappings(
+    t.ports || t.publishedPorts || t.data?.ports || []
+  );
+  const hasPublishedPorts = portMappings.some((p) => p.published);
+
+  if (kind === "project") {
+    const nonDestructive = [
+      {
+        id: "project.up",
+        label: "Up",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "project.up_build",
+        label: "Up (build)",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "project.start",
+        label: "Start",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "project.stop",
+        label: "Stop",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "project.restart",
+        label: "Restart",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "project.pull",
+        label: "Pull images",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "project.build",
+        label: "Build",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "project.logs",
+        label: "Logs",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "project.open_file",
+        label: "Open compose file",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "project.copy_name",
+        label: "Copy project name",
+        enabled: true,
+        reason: null,
+      },
+    ];
+
+    const destructive = [
+      {
+        id: "project.down",
+        label: "Down",
+        enabled: true,
+        reason: null,
+        danger: true,
+      },
+      {
+        id: "project.down_volumes",
+        label: "Down + remove volumes",
+        enabled: true,
+        reason: null,
+        danger: true,
+      },
+    ];
+
+    return [...nonDestructive, ...destructive];
+  }
+
+  if (kind === "service") {
+    const nonDestructive = [
+      {
+        id: "service.start",
+        label: "Start",
+        enabled: !isRunning,
+        reason: isRunning ? "container is already running" : null,
+      },
+      {
+        id: "service.stop",
+        label: "Stop",
+        enabled: isRunning,
+        reason: isRunning ? null : "container is not running",
+      },
+      {
+        id: "service.restart",
+        label: "Restart",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "service.up",
+        label: "Up",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "service.rebuild",
+        label: "Rebuild",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "service.recreate",
+        label: "Recreate",
+        enabled: hasFiles,
+        reason: hasFiles ? null : "compose file not found",
+      },
+      {
+        id: "service.logs",
+        label: "Logs",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "service.shell",
+        label: "Shell",
+        enabled: isRunning,
+        reason: isRunning ? null : "container is not running",
+      },
+      {
+        id: "service.inspect",
+        label: "Inspect",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "service.open_port",
+        label: "Open in browser",
+        enabled: hasPublishedPorts,
+        reason: hasPublishedPorts ? null : "no published ports",
+      },
+      {
+        id: "service.copy_name",
+        label: "Copy service name",
+        enabled: true,
+        reason: null,
+      },
+    ];
+
+    const destructive = [
+      {
+        id: "service.remove",
+        label: "Remove",
+        enabled: true,
+        reason: null,
+        danger: true,
+      },
+    ];
+
+    return [...nonDestructive, ...destructive];
+  }
+
+  if (kind === "container") {
+    const nonDestructive = [
+      {
+        id: "container.start",
+        label: "Start",
+        enabled: !isRunning,
+        reason: isRunning ? "container is already running" : null,
+      },
+      {
+        id: "container.stop",
+        label: "Stop",
+        enabled: isRunning,
+        reason: isRunning ? null : "container is not running",
+      },
+      {
+        id: "container.restart",
+        label: "Restart",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "container.pause",
+        label: "Pause",
+        enabled: isRunning && !isPaused,
+        reason: !isRunning
+          ? "container is not running"
+          : isPaused
+          ? "container is already paused"
+          : null,
+      },
+      {
+        id: "container.unpause",
+        label: "Unpause",
+        enabled: isPaused,
+        reason: isPaused ? null : "container is not paused",
+      },
+      {
+        id: "container.logs",
+        label: "Logs",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "container.shell",
+        label: "Shell",
+        enabled: isRunning,
+        reason: isRunning ? null : "container is not running",
+      },
+      {
+        id: "container.inspect",
+        label: "Inspect",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "container.open_port",
+        label: "Open in browser",
+        enabled: hasPublishedPorts,
+        reason: hasPublishedPorts ? null : "no published ports",
+      },
+      {
+        id: "container.copy_id",
+        label: "Copy ID",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "container.copy_name",
+        label: "Copy name",
+        enabled: true,
+        reason: null,
+      },
+    ];
+
+    const destructive = [
+      {
+        id: "container.kill",
+        label: "Kill",
+        enabled: isRunning,
+        reason: isRunning ? null : "container is not running",
+        danger: true,
+      },
+      {
+        id: "container.remove",
+        label: "Remove",
+        enabled: true,
+        reason: null,
+        danger: true,
+      },
+    ];
+
+    return [...nonDestructive, ...destructive];
+  }
+
+  if (kind === "dockerfile") {
+    const hasBuiltAndRun = Boolean(target.hasBuiltAndRun || state.hasBuiltAndRun);
+    const hasFile = Boolean(target.path || target.file);
+    return [
+      {
+        id: "dockerfile.build",
+        label: "Build image…",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "dockerfile.build_run",
+        label: "Build & run…",
+        enabled: true,
+        reason: null,
+      },
+      {
+        id: "dockerfile.rebuild_replace",
+        label: "Rebuild & replace",
+        enabled: hasBuiltAndRun,
+        reason: hasBuiltAndRun ? null : "no previous build & run",
+      },
+      {
+        id: "dockerfile.open_file",
+        label: "Open Dockerfile",
+        enabled: hasFile,
+        reason: hasFile ? null : "dockerfile not found",
+      },
+    ];
+  }
+
+  return [];
+}
+
+/**
+ * Builds deterministic props for opening an inspector tab (DM-44).
+ *
+ * @param {any} target
+ * @param {{ folder?: string | null, on?: string | null }} [options]
+ * @returns {{ mod: string, props: { folder: string | null, on: string | null, inspect: { kind: string, id: string, project: string | null, service: string | null } } }}
+ */
+export function buildInspectTabProps(target, options = {}) {
+  const t = target || {};
+  const kind =
+    t.kind ||
+    t.type ||
+    (t.service ? "service" : t.project ? "project" : t.id ? "container" : "container");
+  const id = t.id || t.containerId || t.name || "";
+  const project = t.project || null;
+  const service = t.service || null;
+  const folder = options.folder ?? t.folder ?? null;
+  const on = options.on ?? t.on ?? null;
+
+  return {
+    mod: "docker-manager",
+    props: {
+      folder,
+      on,
+      inspect: {
+        kind,
+        id,
+        project,
+        service,
+      },
+    },
+  };
+}
+
+/**
+ * Returns a stable name for an inspector tab (DM-44).
+ *
+ * @param {any} target
+ * @returns {string}
+ */
+export function inspectTabName(target) {
+  const t = target?.inspect || target || {};
+  if (t.project && t.service) {
+    return `Inspect: ${t.project}/${t.service}`;
+  }
+  if (t.name) {
+    return `Inspect: ${t.name}`;
+  }
+  if (t.id) {
+    return `Inspect: ${t.id}`;
+  }
+  if (t.project) {
+    return `Inspect: ${t.project}`;
+  }
+  return `Inspect: ${t.kind || "docker"}`;
+}
+
+/**
+ * Re-resolves a Compose service across recreation by (project, service),
+ * returning the new container ID, or null when the service no longer exists (DM-46).
+ *
+ * @param {{ kind?: string, id?: string, project?: string | null, service?: string | null }} inspect
+ * @param {any} containersTree
+ * @returns {string | null}
+ */
+export function resolveInspectorTarget(inspect, containersTree) {
+  if (!inspect) return null;
+
+  // Compose service target: re-resolve by project + service
+  if (inspect.project && inspect.service) {
+    const projName = inspect.project;
+    const sName = inspect.service;
+
+    // Structure 1: flat array of rows or containers
+    if (Array.isArray(containersTree)) {
+      const matchingRow = containersTree.find(
+        (r) =>
+          r &&
+          r.project === projName &&
+          r.service === sName &&
+          (r.containerId || r.id)
+      );
+      if (matchingRow) {
+        return matchingRow.containerId || matchingRow.id || null;
+      }
+
+      const proj = containersTree.find(
+        (p) => p && (p.name === projName || p.project === projName)
+      );
+      if (!proj) return null;
+      const s = (proj.services || []).find(
+        (srv) => srv && (srv.name === sName || srv.service === sName)
+      );
+      if (!s) return null;
+      if (s.containers && s.containers.length > 0) {
+        if (inspect.id) {
+          const match = s.containers.find(
+            (c) => c.id === inspect.id || c.name === inspect.id
+          );
+          if (match) return match.id || null;
+        }
+        return s.containers[0].id || null;
+      }
+      return null;
+    }
+
+    // Structure 2: object with composeProjects / projects
+    if (containersTree && typeof containersTree === "object") {
+      const projects = containersTree.composeProjects || containersTree.projects || [];
+      const proj = projects.find(
+        (p) => p && (p.name === projName || p.project === projName)
+      );
+      if (!proj) return null;
+      const s = (proj.services || []).find(
+        (srv) => srv && (srv.name === sName || srv.service === sName)
+      );
+      if (!s) return null;
+      if (s.containers && s.containers.length > 0) {
+        if (inspect.id) {
+          const match = s.containers.find(
+            (c) => c.id === inspect.id || c.name === inspect.id
+          );
+          if (match) return match.id || null;
+        }
+        return s.containers[0].id || null;
+      }
+      return null;
+    }
+
+    return null;
+  }
+
+  // Standalone container target: resolve by id
+  const targetId = inspect.id;
+  if (!targetId) return null;
+
+  if (Array.isArray(containersTree)) {
+    const match = containersTree.find(
+      (c) => c && (c.id === targetId || c.containerId === targetId || c.name === targetId)
+    );
+    return match ? match.id || match.containerId || targetId : null;
+  }
+
+  if (containersTree && typeof containersTree === "object") {
+    const standalone = containersTree.standalone || [];
+    const match = standalone.find(
+      (c) => c && (c.id === targetId || c.name === targetId)
+    );
+    if (match) return match.id || targetId;
+
+    const projects = containersTree.composeProjects || containersTree.projects || [];
+    for (const p of projects) {
+      for (const s of p.services || []) {
+        for (const c of s.containers || []) {
+          if (c.id === targetId || c.name === targetId) return c.id;
+        }
+      }
+    }
+  }
+
+  return targetId || null;
+}
+
+/**
+ * Processes environment entries, sorting alphabetically by key,
+ * masking values of secret keys unless revealed (DM-45).
+ *
+ * @param {Array<string | { key: string, value: string }> | Record<string, string>} env
+ * @param {boolean | Set<string> | Array<string>} [revealed=false]
+ * @returns {Array<{ key: string, value: string, secret: boolean, masked: boolean }>}
+ */
+export function maskEnvEntries(env, revealed = false) {
+  if (!env) return [];
+
+  const entries = [];
+  if (Array.isArray(env)) {
+    for (const item of env) {
+      if (typeof item === "string") {
+        const eq = item.indexOf("=");
+        if (eq >= 0) {
+          entries.push({ key: item.slice(0, eq), value: item.slice(eq + 1) });
+        } else {
+          entries.push({ key: item, value: "" });
+        }
+      } else if (item && typeof item === "object") {
+        entries.push({ key: item.key || item.name || "", value: item.value || "" });
+      }
+    }
+  } else if (typeof env === "object") {
+    for (const [key, value] of Object.entries(env)) {
+      entries.push({ key, value: String(value ?? "") });
+    }
+  }
+
+  entries.sort((a, b) => a.key.localeCompare(b.key));
+
+  return entries.map((e) => {
+    const isSecret = isSecretEnvKey(e.key);
+    let isRevealed = false;
+    if (revealed === true) {
+      isRevealed = true;
+    } else if (revealed instanceof Set) {
+      isRevealed = revealed.has(e.key);
+    } else if (Array.isArray(revealed)) {
+      isRevealed = revealed.includes(e.key);
+    }
+
+    const masked = isSecret && !isRevealed;
+    return {
+      key: e.key,
+      value: masked ? "••••••••" : e.value,
+      secret: isSecret,
+      masked,
+    };
+  });
+}
+
+/**
+ * Parses stdout from `docker stats --no-stream --format '{{json .}}'` (DM-45).
+ *
+ * @param {string | object} stdout
+ * @returns {{
+ *   container: string,
+ *   id: string,
+ *   name: string,
+ *   cpuPerc: string,
+ *   memPerc: string,
+ *   memUsage: string,
+ *   memLimit: string,
+ *   memUsageRaw: string,
+ *   netIO: string,
+ *   blockIO: string,
+ *   pids: number,
+ *   raw: any,
+ * }}
+ */
+export function parseDockerStats(stdout) {
+  if (!stdout) {
+    return {
+      container: "",
+      id: "",
+      name: "",
+      cpuPerc: "0.00%",
+      memPerc: "0.00%",
+      memUsage: "0B",
+      memLimit: "0B",
+      memUsageRaw: "0B / 0B",
+      netIO: "0B / 0B",
+      blockIO: "0B / 0B",
+      pids: 0,
+      raw: null,
+    };
+  }
+
+  let obj = stdout;
+  if (typeof stdout === "string") {
+    const trimmed = stdout.trim();
+    if (!trimmed) {
+      return parseDockerStats(null);
+    }
+    const firstLine = trimmed.split("\n")[0].trim();
+    try {
+      obj = JSON.parse(firstLine);
+    } catch {
+      return parseDockerStats(null);
+    }
+  }
+
+  const rawUsage = obj.MemUsage || "";
+  const parts = rawUsage.split("/").map((s) => s.trim());
+  const memUsage = parts[0] || "0B";
+  const memLimit = parts[1] || "0B";
+
+  return {
+    container: obj.Container || obj.ID || "",
+    id: obj.ID || "",
+    name: obj.Name || "",
+    cpuPerc: obj.CPUPerc || "0.00%",
+    memPerc: obj.MemPerc || "0.00%",
+    memUsage,
+    memLimit,
+    memUsageRaw: rawUsage || "0B / 0B",
+    netIO: obj.NetIO || "0B / 0B",
+    blockIO: obj.BlockIO || "0B / 0B",
+    pids: parseInt(obj.PIDs, 10) || 0,
+    raw: obj,
+  };
+}
+
+/**
+ * Formats a byte number into a human-readable string (e.g. 0 B, 1.4 MB, 2.1 GB).
+ *
+ * @param {number | string} value
+ * @returns {string}
+ */
+export function formatBytes(value) {
+  const bytes = Number(value);
+  if (!bytes || isNaN(bytes) || bytes <= 0) return "0 B";
+
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  if (i <= 0) return `${bytes} B`;
+
+  const val = bytes / Math.pow(1024, i);
+  const rounded = val >= 10 || val % 1 === 0 ? val.toFixed(0) : val.toFixed(1);
+  return `${Number(rounded)} ${units[i]}`;
+}
+
+/**
+ * Formats an ISO timestamp or date into relative time (e.g. 3 minutes ago).
+ *
+ * @param {string | number | Date} iso
+ * @param {number} [now=Date.now()]
+ * @returns {string}
+ */
+export function formatRelativeTime(iso, now = Date.now()) {
+  if (!iso) return "";
+  const date = typeof iso === "object" && iso instanceof Date ? iso : new Date(iso);
+  const time = date.getTime();
+  if (isNaN(time)) return String(iso);
+
+  const diffSec = Math.max(0, Math.floor((now - time) / 1000));
+  if (diffSec < 5) return "just now";
+  if (diffSec < 60) return `${diffSec} seconds ago`;
+
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return `${mins} ${mins === 1 ? "minute" : "minutes"} ago`;
+
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} ${hours === 1 ? "hour" : "hours"} ago`;
+
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} ${days === 1 ? "day" : "days"} ago`;
+
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months} ${months === 1 ? "month" : "months"} ago`;
+
+  const years = Math.floor(days / 365);
+  return `${years} ${years === 1 ? "year" : "years"} ago`;
+}
+
+/**
+ * Formats uptime from a container's StartedAt timestamp (e.g. up 2 days).
+ *
+ * @param {string | number | Date} startedAt
+ * @param {number} [now=Date.now()]
+ * @returns {string}
+ */
+export function formatUptime(startedAt, now = Date.now()) {
+  if (!startedAt) return "";
+  const date = typeof startedAt === "object" && startedAt instanceof Date ? startedAt : new Date(startedAt);
+  const time = date.getTime();
+  if (isNaN(time)) return "";
+
+  const diffSec = Math.max(0, Math.floor((now - time) / 1000));
+  if (diffSec < 60) return `up ${diffSec} seconds`;
+
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return `up ${mins} ${mins === 1 ? "minute" : "minutes"}`;
+
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `up ${hours} ${hours === 1 ? "hour" : "hours"}`;
+
+  const days = Math.floor(hours / 24);
+  return `up ${days} ${days === 1 ? "day" : "days"}`;
+}
+
+/**
+ * Normalizes raw `docker image inspect` output (DM-100..101).
+ *
+ * @param {string | object | Array<any>} raw
+ * @returns {{
+ *   id: string,
+ *   shortId: string,
+ *   tags: string[],
+ *   size: number,
+ *   sizeFormatted: string,
+ *   created: string,
+ *   architecture: string,
+ *   os: string,
+ *   labels: Record<string, string>,
+ *   env: string[],
+ *   cmd: string[],
+ *   entrypoint: string[],
+ *   raw: any,
+ * }}
+ */
+export function normalizeImageInspect(raw) {
+  let obj = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      obj = {};
+    }
+  }
+  if (Array.isArray(obj)) {
+    obj = obj[0] || {};
+  }
+  if (!obj || typeof obj !== "object") obj = {};
+
+  const id = obj.Id || "";
+  const shortId = id.replace(/^sha256:/, "").slice(0, 12);
+  const tags = Array.isArray(obj.RepoTags) ? obj.RepoTags : [];
+  const size = typeof obj.Size === "number" ? obj.Size : 0;
+  const config = obj.Config || {};
+
+  return {
+    id,
+    shortId,
+    tags,
+    size,
+    sizeFormatted: formatBytes(size),
+    created: obj.Created || "",
+    architecture: obj.Architecture || "",
+    os: obj.Os || "",
+    labels: config.Labels || obj.Labels || {},
+    env: Array.isArray(config.Env) ? config.Env : [],
+    cmd: Array.isArray(config.Cmd) ? config.Cmd : [],
+    entrypoint: Array.isArray(config.Entrypoint) ? config.Entrypoint : [],
+    raw: obj,
+  };
+}
+
+/**
+ * Normalizes raw `docker volume inspect` output (DM-106).
+ *
+ * @param {string | object | Array<any>} raw
+ * @returns {{
+ *   name: string,
+ *   driver: string,
+ *   mountpoint: string,
+ *   createdAt: string,
+ *   labels: Record<string, string>,
+ *   scope: string,
+ *   options: Record<string, string> | null,
+ *   raw: any,
+ * }}
+ */
+export function normalizeVolumeInspect(raw) {
+  let obj = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      obj = {};
+    }
+  }
+  if (Array.isArray(obj)) {
+    obj = obj[0] || {};
+  }
+  if (!obj || typeof obj !== "object") obj = {};
+
+  return {
+    name: obj.Name || "",
+    driver: obj.Driver || "local",
+    mountpoint: obj.Mountpoint || "",
+    createdAt: obj.CreatedAt || "",
+    labels: obj.Labels || {},
+    scope: obj.Scope || "local",
+    options: obj.Options || null,
+    raw: obj,
+  };
+}
+
+/**
+ * Normalizes raw `docker network inspect` output (DM-116).
+ *
+ * @param {string | object | Array<any>} raw
+ * @returns {{
+ *   id: string,
+ *   shortId: string,
+ *   name: string,
+ *   driver: string,
+ *   scope: string,
+ *   subnet: string,
+ *   gateway: string,
+ *   internal: boolean,
+ *   containers: Array<{ id: string, shortId: string, name: string, ip: string, macAddress: string }>,
+ *   labels: Record<string, string>,
+ *   raw: any,
+ * }}
+ */
+export function normalizeNetworkInspect(raw) {
+  let obj = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      obj = {};
+    }
+  }
+  if (Array.isArray(obj)) {
+    obj = obj[0] || {};
+  }
+  if (!obj || typeof obj !== "object") obj = {};
+
+  const id = obj.Id || "";
+  const shortId = id.slice(0, 12);
+  const ipamConfig = obj.IPAM?.Config?.[0] || {};
+  const containers = [];
+
+  if (obj.Containers && typeof obj.Containers === "object") {
+    for (const [cid, cinfo] of Object.entries(obj.Containers)) {
+      if (cinfo && typeof cinfo === "object") {
+        const ip4 = cinfo.IPv4Address || "";
+        const ip = ip4.includes("/") ? ip4.split("/")[0] : ip4;
+        containers.push({
+          id: cid,
+          shortId: cid.slice(0, 12),
+          name: cinfo.Name || "",
+          ip,
+          macAddress: cinfo.MacAddress || "",
+        });
+      }
+    }
+  }
+
+  return {
+    id,
+    shortId,
+    name: obj.Name || "",
+    driver: obj.Driver || "bridge",
+    scope: obj.Scope || "local",
+    subnet: ipamConfig.Subnet || "",
+    gateway: ipamConfig.Gateway || "",
+    internal: Boolean(obj.Internal),
+    containers,
+    labels: obj.Labels || {},
+    raw: obj,
+  };
+}
+
+/**
+ * Formats JSON with stable 2-space indentation that never throws on already-parsed objects (DM-45).
+ *
+ * @param {any} raw
+ * @returns {string}
+ */
+export function prettyJson(raw) {
+  if (raw === null || raw === undefined) return "";
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return raw;
+    }
+  }
+  try {
+    return JSON.stringify(raw, null, 2);
+  } catch {
+    return String(raw);
+  }
+}
+
+/**
+ * Maps Herdr theme colors to EditorState syntax theme tokens.
+ *
+ * @param {Record<string, string>} [themeObj={}]
+ * @returns {Record<string, string>}
+ */
+export function buildSyntaxTheme(themeObj = {}) {
+  const t = themeObj || {};
+  return {
+    keyword: t.ansi5 || "#b48ead",
+    string: t.ansi2 || "#a3be8c",
+    comment: t.dim || "#616e88",
+    function: t.ansi4 || "#81a1c1",
+    type: t.ansi3 || "#ebcb8b",
+    number: t.ansi1 || "#bf616a",
+    constant: t.ansi6 || "#88c0d0",
+  };
+}
+
+

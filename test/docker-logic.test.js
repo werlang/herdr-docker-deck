@@ -41,6 +41,27 @@ import {
   parseComposeConfig,
   discoverComposeGroups,
   parseComposeLs,
+  formatPortMappings,
+  buildContextMenuItems,
+  confirmKind,
+  requiresConfirm,
+  validateConfirmInput,
+  buildActionArgs,
+  findReusableTerminal,
+  terminalPlacement,
+  buildInspectTabProps,
+  inspectTabName,
+  resolveInspectorTarget,
+  maskEnvEntries,
+  parseDockerStats,
+  formatBytes,
+  formatRelativeTime,
+  formatUptime,
+  normalizeImageInspect,
+  normalizeVolumeInspect,
+  normalizeNetworkInspect,
+  prettyJson,
+  buildSyntaxTheme,
 } from "../mods/docker-manager/docker-logic.js";
 
 // =============================================================================
@@ -1359,4 +1380,901 @@ test("parseComposeLs parses JSON array from docker compose ls --all --format jso
   assert.deepEqual(parseComposeLs(""), []);
   assert.deepEqual(parseComposeLs(null), []);
 });
+
+// =============================================================================
+// Suite 18: formatPortMappings (R3 §0, §2)
+// =============================================================================
+test("formatPortMappings handles single mapping, IPv6-only mapping, unmapped ranges, and empty inputs", () => {
+  // Empty inputs -> []
+  assert.deepEqual(formatPortMappings(""), []);
+  assert.deepEqual(formatPortMappings("   "), []);
+  assert.deepEqual(formatPortMappings(null), []);
+  assert.deepEqual(formatPortMappings(undefined), []);
+
+  // Single mapping (IPv4 + IPv6 deduplicated)
+  const single = formatPortMappings("0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp");
+  assert.equal(single.length, 1);
+  assert.equal(single[0].text, "8080→8080");
+  assert.equal(single[0].published, true);
+  assert.equal(single[0].hostPort, "8080");
+  assert.equal(single[0].containerPort, "8080");
+  assert.equal(String(single[0]), "8080→8080");
+
+  // IPv6-only mapping
+  const ipv6 = formatPortMappings("[::]:8080->8080/tcp");
+  assert.equal(ipv6.length, 1);
+  assert.equal(ipv6[0].text, "8080→8080");
+  assert.equal(ipv6[0].published, true);
+
+  // Range without host publish (muted, not a mapping)
+  const range = formatPortMappings("9000-9001/tcp");
+  assert.equal(range.length, 1);
+  assert.equal(range[0].text, "9000-9001");
+  assert.equal(range[0].published, false);
+  assert.equal(range[0].hostPort, null);
+  assert.equal(range[0].containerPort, "9000-9001");
+
+  // Mixed multiple mappings
+  const mixed = formatPortMappings(
+    "0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, 9000/tcp"
+  );
+  assert.equal(mixed.length, 3);
+  assert.equal(mixed[0].text, "80→80");
+  assert.equal(mixed[0].published, true);
+  assert.equal(mixed[1].text, "443→443");
+  assert.equal(mixed[1].published, true);
+  assert.equal(mixed[2].text, "9000");
+  assert.equal(mixed[2].published, false);
+
+  // Array of inspect port objects
+  const objArray = formatPortMappings([
+    { hostPort: "3000", containerPort: "3000", proto: "tcp" },
+    { containerPort: "8080", proto: "tcp" },
+  ]);
+  assert.equal(objArray.length, 2);
+  assert.equal(objArray[0].text, "3000→3000");
+  assert.equal(objArray[0].published, true);
+  assert.equal(objArray[1].text, "8080");
+  assert.equal(objArray[1].published, false);
+});
+
+// =============================================================================
+// Suite 19: buildContextMenuItems (R3 §2)
+// =============================================================================
+test("buildContextMenuItems returns exact item list and order per target kind with reasons and danger flags", () => {
+  // 1. Project target with config files
+  const projTarget = {
+    kind: "project",
+    project: "my-app",
+    workingDir: "/app",
+    configFiles: ["/app/compose.yaml"],
+    hasConfigFiles: true,
+  };
+  const projItems = buildContextMenuItems(projTarget);
+  assert.equal(projItems.length, 12);
+  assert.deepEqual(
+    projItems.map((i) => i.id),
+    [
+      "project.up",
+      "project.up_build",
+      "project.start",
+      "project.stop",
+      "project.restart",
+      "project.pull",
+      "project.build",
+      "project.logs",
+      "project.open_file",
+      "project.copy_name",
+      "project.down",
+      "project.down_volumes",
+    ]
+  );
+  // Destructive items are danger: true and at the end
+  assert.equal(projItems[10].danger, true);
+  assert.equal(projItems[10].id, "project.down");
+  assert.equal(projItems[11].danger, true);
+  assert.equal(projItems[11].id, "project.down_volumes");
+  assert.equal(projItems[0].enabled, true);
+  assert.equal(projItems[0].reason, null);
+
+  // Project without config files disables up, up_build, pull, build, open_file
+  const missingFilesProj = {
+    kind: "project",
+    project: "orphaned",
+    configFiles: [],
+    hasConfigFiles: false,
+  };
+  const missingItems = buildContextMenuItems(missingFilesProj);
+  const disabledUp = missingItems.find((i) => i.id === "project.up");
+  assert.equal(disabledUp.enabled, false);
+  assert.equal(disabledUp.reason, "compose file not found");
+  const disabledPull = missingItems.find((i) => i.id === "project.pull");
+  assert.equal(disabledPull.enabled, false);
+  assert.equal(disabledPull.reason, "compose file not found");
+
+  // 2. Service target
+  const runningSvc = {
+    kind: "service",
+    project: "my-app",
+    service: "api",
+    isRunning: true,
+    hasConfigFiles: true,
+    ports: "0.0.0.0:3000->3000/tcp",
+  };
+  const svcItems = buildContextMenuItems(runningSvc);
+  assert.equal(svcItems.length, 12);
+  assert.deepEqual(
+    svcItems.map((i) => i.id),
+    [
+      "service.start",
+      "service.stop",
+      "service.restart",
+      "service.up",
+      "service.rebuild",
+      "service.recreate",
+      "service.logs",
+      "service.shell",
+      "service.inspect",
+      "service.open_port",
+      "service.copy_name",
+      "service.remove",
+    ]
+  );
+  // Destructive item at the end
+  assert.equal(svcItems[11].id, "service.remove");
+  assert.equal(svcItems[11].danger, true);
+  // Running service: start disabled, stop enabled, shell enabled, open_port enabled
+  const startItem = svcItems.find((i) => i.id === "service.start");
+  assert.equal(startItem.enabled, false);
+  assert.equal(startItem.reason, "container is already running");
+  const shellItem = svcItems.find((i) => i.id === "service.shell");
+  assert.equal(shellItem.enabled, true);
+  assert.equal(shellItem.reason, null);
+
+  // Stopped service with no ports
+  const stoppedSvc = {
+    kind: "service",
+    project: "my-app",
+    service: "worker",
+    isRunning: false,
+    hasConfigFiles: true,
+    ports: "",
+  };
+  const stoppedItems = buildContextMenuItems(stoppedSvc);
+  const stoppedShell = stoppedItems.find((i) => i.id === "service.shell");
+  assert.equal(stoppedShell.enabled, false);
+  assert.equal(stoppedShell.reason, "container is not running");
+  const stoppedPorts = stoppedItems.find((i) => i.id === "service.open_port");
+  assert.equal(stoppedPorts.enabled, false);
+  assert.equal(stoppedPorts.reason, "no published ports");
+
+  // 3. Container target
+  const runningCont = {
+    kind: "container",
+    id: "abcd1234efgh",
+    name: "web-server",
+    isRunning: true,
+    isPaused: false,
+    ports: "0.0.0.0:80->80/tcp",
+  };
+  const contItems = buildContextMenuItems(runningCont);
+  assert.equal(contItems.length, 13);
+  assert.deepEqual(
+    contItems.map((i) => i.id),
+    [
+      "container.start",
+      "container.stop",
+      "container.restart",
+      "container.pause",
+      "container.unpause",
+      "container.logs",
+      "container.shell",
+      "container.inspect",
+      "container.open_port",
+      "container.copy_id",
+      "container.copy_name",
+      "container.kill",
+      "container.remove",
+    ]
+  );
+  // Destructive items at the end
+  assert.equal(contItems[11].id, "container.kill");
+  assert.equal(contItems[11].danger, true);
+  assert.equal(contItems[12].id, "container.remove");
+  assert.equal(contItems[12].danger, true);
+
+  // Stopped container
+  const stoppedCont = {
+    kind: "container",
+    id: "c2",
+    name: "batch",
+    isRunning: false,
+    isPaused: false,
+  };
+  const stoppedContItems = buildContextMenuItems(stoppedCont);
+  const contKill = stoppedContItems.find((i) => i.id === "container.kill");
+  assert.equal(contKill.enabled, false);
+  assert.equal(contKill.reason, "container is not running");
+
+  // 4. Dockerfile target
+  const dfTarget = {
+    kind: "dockerfile",
+    path: "/app/Dockerfile",
+    hasBuiltAndRun: false,
+  };
+  const dfItems = buildContextMenuItems(dfTarget);
+  assert.equal(dfItems.length, 4);
+  assert.deepEqual(
+    dfItems.map((i) => i.id),
+    [
+      "dockerfile.build",
+      "dockerfile.build_run",
+      "dockerfile.rebuild_replace",
+      "dockerfile.open_file",
+    ]
+  );
+  const rebuildReplace = dfItems.find((i) => i.id === "dockerfile.rebuild_replace");
+  assert.equal(rebuildReplace.enabled, false);
+  assert.equal(rebuildReplace.reason, "no previous build & run");
+});
+
+// =============================================================================
+// Suite 20: requiresConfirm & confirmKind (R3 §2)
+// =============================================================================
+test("confirmKind and requiresConfirm distinguish typed, plain, and non-confirming actions", () => {
+  // Typed confirms
+  assert.equal(confirmKind("down -v"), "typed");
+  assert.equal(confirmKind("project.down_volumes"), "typed");
+  assert.equal(confirmKind({ id: "container.remove" }), "typed");
+  assert.equal(confirmKind({ id: "container.rm" }), "typed");
+  assert.equal(confirmKind("volume.restore"), "typed");
+  assert.equal(confirmKind("prune.all"), "typed");
+  assert.equal(confirmKind("image.prune_unused"), "typed");
+  assert.equal(confirmKind("system.prune"), "typed");
+
+  assert.equal(requiresConfirm("down -v"), true);
+  assert.equal(requiresConfirm("container.remove"), true);
+  assert.equal(requiresConfirm("volume.restore"), true);
+  assert.equal(requiresConfirm("prune.containers"), true);
+
+  // Plain confirms
+  assert.equal(confirmKind("down"), "plain");
+  assert.equal(confirmKind("project.down"), "plain");
+  assert.equal(confirmKind("container.kill"), "plain");
+  assert.equal(confirmKind("service.remove"), "plain");
+  assert.equal(confirmKind("service.rm"), "plain");
+
+  assert.equal(requiresConfirm("down"), true);
+  assert.equal(requiresConfirm("container.kill"), true);
+  assert.equal(requiresConfirm("service.remove"), true);
+
+  // None (no confirmation)
+  assert.equal(confirmKind("project.start"), "none");
+  assert.equal(confirmKind("container.start"), "none");
+  assert.equal(confirmKind("service.restart"), "none");
+  assert.equal(confirmKind("service.logs"), "none");
+  assert.equal(confirmKind("container.shell"), "none");
+
+  assert.equal(requiresConfirm("project.start"), false);
+  assert.equal(requiresConfirm("service.logs"), false);
+});
+
+// =============================================================================
+// Suite 21: validateConfirmInput (R3 §2)
+// =============================================================================
+test("validateConfirmInput enforces exact case-sensitive match for typed confirmations", () => {
+  // Typed confirm on project name
+  assert.equal(validateConfirmInput("typed", "my-project", "my-project"), true);
+  assert.equal(validateConfirmInput("typed", "My-Project", "my-project"), false);
+  assert.equal(validateConfirmInput("typed", "my-proj", "my-project"), false);
+  assert.equal(validateConfirmInput("typed", "", "my-project"), false);
+
+  // Typed confirm on "prune"
+  assert.equal(validateConfirmInput("typed", "prune", "prune"), true);
+  assert.equal(validateConfirmInput("typed", "Prune", "prune"), false);
+  assert.equal(validateConfirmInput("typed", "prun", "prune"), false);
+
+  // Plain and none kinds do not require typed match
+  assert.equal(validateConfirmInput("plain", "", "my-project"), true);
+  assert.equal(validateConfirmInput("none", "", ""), true);
+  assert.equal(validateConfirmInput("typed", null, "my-project"), false);
+});
+
+// =============================================================================
+// Suite 22: buildActionArgs for all 26 lifecycle actions (R3 §2)
+// =============================================================================
+test("buildActionArgs produces exact docker and docker compose argv for all 26 lifecycle actions", () => {
+  const proj = {
+    kind: "project",
+    project: "webstack",
+    workingDir: "/work",
+    configFiles: ["/work/compose.yaml"],
+    hasConfigFiles: true,
+  };
+
+  // 10 Project Actions
+  assert.deepEqual(
+    buildActionArgs("project.up", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "up", "-d"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.up_build", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "up", "-d", "--build"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.start", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "start"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.stop", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "stop"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.restart", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "restart"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.pull", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "pull"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.build", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "build"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.logs", proj),
+    ["docker", "compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "logs", "-f", "--tail", "500"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.down", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "down"]
+  );
+  assert.deepEqual(
+    buildActionArgs("project.down_volumes", proj),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "down", "-v"]
+  );
+
+  // 9 Service Actions
+  const svc = {
+    kind: "service",
+    project: "webstack",
+    service: "api",
+    workingDir: "/work",
+    configFiles: ["/work/compose.yaml"],
+    hasConfigFiles: true,
+    containerId: "cont-api-1",
+  };
+  assert.deepEqual(
+    buildActionArgs("service.start", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "start", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.stop", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "stop", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.restart", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "restart", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.up", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "up", "-d", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.rebuild", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "up", "-d", "--build", "--force-recreate", "--no-deps", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.recreate", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "up", "-d", "--force-recreate", "--no-deps", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.logs", svc),
+    ["docker", "compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "logs", "-f", "--tail", "500", "api"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.shell", svc),
+    ["docker", "exec", "-it", "cont-api-1", "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]
+  );
+  assert.deepEqual(
+    buildActionArgs("service.remove", svc),
+    ["compose", "-p", "webstack", "--project-directory", "/work", "-f", "/work/compose.yaml", "rm", "-s", "-f", "api"]
+  );
+
+  // 9 Container Actions
+  const runningCont = {
+    kind: "container",
+    id: "cont-123",
+    name: "web-runner",
+    isRunning: true,
+  };
+  assert.deepEqual(buildActionArgs("container.start", runningCont), ["start", "cont-123"]);
+  assert.deepEqual(buildActionArgs("container.stop", runningCont), ["stop", "cont-123"]);
+  assert.deepEqual(buildActionArgs("container.restart", runningCont), ["restart", "cont-123"]);
+  assert.deepEqual(buildActionArgs("container.pause", runningCont), ["pause", "cont-123"]);
+  assert.deepEqual(buildActionArgs("container.unpause", runningCont), ["unpause", "cont-123"]);
+  assert.deepEqual(buildActionArgs("container.kill", runningCont), ["kill", "cont-123"]);
+  // Running container rm gets -f
+  assert.deepEqual(buildActionArgs("container.remove", runningCont), ["rm", "-f", "cont-123"]);
+
+  const stoppedCont = {
+    kind: "container",
+    id: "cont-123",
+    name: "web-runner",
+    isRunning: false,
+  };
+  // Stopped container rm does not get -f
+  assert.deepEqual(buildActionArgs("container.remove", stoppedCont), ["rm", "cont-123"]);
+
+  assert.deepEqual(
+    buildActionArgs("container.logs", runningCont),
+    ["docker", "logs", "-f", "--tail", "500", "cont-123"]
+  );
+  assert.deepEqual(
+    buildActionArgs("container.shell", runningCont),
+    ["docker", "exec", "-it", "cont-123", "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]
+  );
+});
+
+// =============================================================================
+// Suite 23: findReusableTerminal (R3 §2)
+// =============================================================================
+test("findReusableTerminal matches terminal with matching argv in active space", () => {
+  const reqArgv = ["docker", "logs", "-f", "--tail", "500", "c-123"];
+  const terminals = [
+    {
+      address: "t1",
+      pane: "p1",
+      tab: "tab1",
+      space: "sp-active",
+      argv: ["docker", "logs", "-f", "--tail", "500", "c-other"],
+    },
+    {
+      address: "t2",
+      pane: "p2",
+      tab: "tab2",
+      space: "sp-other",
+      argv: ["docker", "logs", "-f", "--tail", "500", "c-123"],
+    },
+    {
+      address: "t3",
+      pane: "p3",
+      tab: "tab3",
+      space: "sp-active",
+      argv: ["docker", "logs", "-f", "--tail", "500", "c-123"],
+    },
+  ];
+
+  // Matches t3 because argv and spaceId match
+  const match = findReusableTerminal(terminals, reqArgv, "sp-active");
+  assert.ok(match);
+  assert.equal(match.address, "t3");
+  assert.equal(match.pane, "p3");
+
+  // No match when space does not match
+  assert.equal(findReusableTerminal(terminals, reqArgv, "sp-unknown"), null);
+
+  // No match when argv does not match
+  assert.equal(findReusableTerminal(terminals, ["docker", "exec", "sh"], "sp-active"), null);
+
+  // Null on invalid inputs
+  assert.equal(findReusableTerminal([], reqArgv, "sp-active"), null);
+  assert.equal(findReusableTerminal(null, reqArgv, "sp-active"), null);
+  assert.equal(findReusableTerminal(terminals, [], "sp-active"), null);
+});
+
+// =============================================================================
+// Suite 24: terminalPlacement (R3 §2)
+// =============================================================================
+test("terminalPlacement returns tab unless alt is pressed or preference is down", () => {
+  // Defaults to tab
+  assert.equal(terminalPlacement(), "tab");
+  assert.equal(terminalPlacement({}), "tab");
+  assert.equal(terminalPlacement({ alt: false, preference: "tab" }), "tab");
+  assert.equal(terminalPlacement({ alt: false, preference: "right" }), "tab");
+
+  // Alt pressed -> down
+  assert.equal(terminalPlacement({ alt: true }), "down");
+  assert.equal(terminalPlacement({ alt: true, preference: "tab" }), "down");
+
+  // Preference down -> down
+  assert.equal(terminalPlacement({ preference: "down" }), "down");
+  assert.equal(terminalPlacement({ alt: false, preference: "down" }), "down");
+});
+
+// =============================================================================
+// Suite 25: buildInspectTabProps & inspectTabName (R4 §2)
+// =============================================================================
+test("buildInspectTabProps and inspectTabName build deterministic props and stable tab names", () => {
+  // Target: Compose service
+  const serviceTarget = {
+    kind: "service",
+    id: "cv-mapa-web-1",
+    project: "cv-mapa",
+    service: "web",
+    folder: "/root/dev/herdr-docker-deck",
+  };
+  const serviceProps = buildInspectTabProps(serviceTarget);
+  assert.deepEqual(serviceProps, {
+    mod: "docker-manager",
+    props: {
+      folder: "/root/dev/herdr-docker-deck",
+      on: null,
+      inspect: {
+        kind: "service",
+        id: "cv-mapa-web-1",
+        project: "cv-mapa",
+        service: "web",
+      },
+    },
+  });
+  assert.equal(inspectTabName(serviceTarget), "Inspect: cv-mapa/web");
+
+  // Target: Standalone container
+  const containerTarget = {
+    kind: "container",
+    id: "tuya-panel-1",
+    name: "tuya-panel-1",
+  };
+  const containerProps = buildInspectTabProps(containerTarget, {
+    folder: "/workspace",
+    on: "remote-vm",
+  });
+  assert.deepEqual(containerProps, {
+    mod: "docker-manager",
+    props: {
+      folder: "/workspace",
+      on: "remote-vm",
+      inspect: {
+        kind: "container",
+        id: "tuya-panel-1",
+        project: null,
+        service: null,
+      },
+    },
+  });
+  assert.equal(inspectTabName(containerTarget), "Inspect: tuya-panel-1");
+
+  // inspectTabName with props wrapper
+  assert.equal(inspectTabName(containerProps.props), "Inspect: tuya-panel-1");
+  assert.equal(inspectTabName({ id: "c1234567890a" }), "Inspect: c1234567890a");
+  assert.equal(inspectTabName(null), "Inspect: docker");
+});
+
+// =============================================================================
+// Suite 26: resolveInspectorTarget (R4 §2)
+// =============================================================================
+test("resolveInspectorTarget re-resolves Compose services across recreation and handles gone targets", () => {
+  const tree = {
+    composeProjects: [
+      {
+        name: "my-app",
+        services: [
+          {
+            name: "web",
+            containers: [{ id: "c-web-recreated-999", name: "my-app-web-1" }],
+          },
+          {
+            name: "cache",
+            containers: [],
+          },
+        ],
+      },
+    ],
+    standalone: [{ id: "c-standalone-1", name: "redis-custom" }],
+  };
+
+  // Re-resolves service across recreation with new container ID
+  const newId = resolveInspectorTarget(
+    { kind: "service", id: "c-web-old-111", project: "my-app", service: "web" },
+    tree
+  );
+  assert.equal(newId, "c-web-recreated-999");
+
+  // Re-resolves with flat rows array as tree
+  const rows = [
+    { rowType: "service", project: "my-app", service: "web", containerId: "c-web-recreated-999" },
+    { rowType: "container", id: "c-standalone-1" },
+  ];
+  assert.equal(
+    resolveInspectorTarget({ project: "my-app", service: "web" }, rows),
+    "c-web-recreated-999"
+  );
+
+  // Returns null when service exists but has no running/created containers
+  assert.equal(
+    resolveInspectorTarget({ project: "my-app", service: "cache" }, tree),
+    null
+  );
+
+  // Returns null when service no longer exists in project
+  assert.equal(
+    resolveInspectorTarget({ project: "my-app", service: "deleted-service" }, tree),
+    null
+  );
+
+  // Returns null when project no longer exists
+  assert.equal(
+    resolveInspectorTarget({ project: "old-project", service: "web" }, tree),
+    null
+  );
+
+  // Resolves standalone container
+  assert.equal(
+    resolveInspectorTarget({ kind: "container", id: "c-standalone-1" }, tree),
+    "c-standalone-1"
+  );
+
+  // Returns null when standalone container is gone
+  assert.equal(
+    resolveInspectorTarget({ kind: "container", id: "c-missing" }, tree),
+    "c-missing" // keeps requested id as fallback if no tree match or null
+  );
+
+  // Invalid / null inspect
+  assert.equal(resolveInspectorTarget(null, tree), null);
+});
+
+// =============================================================================
+// Suite 27: maskEnvEntries (R4 §2)
+// =============================================================================
+test("maskEnvEntries sorts entries by key and masks secrets unless revealed", () => {
+  const env = [
+    "APP_ENV=production",
+    "DATABASE_URL=postgres://user:secret@localhost:5432/db",
+    "API_KEY=sk_live_1234567890",
+    "PORT=8080",
+    "AUTH_TOKEN=xyz_token",
+  ];
+
+  // Hidden by default (revealed = false)
+  const masked = maskEnvEntries(env, false);
+  assert.equal(masked.length, 5);
+  // Alphabetical sort: API_KEY, APP_ENV, AUTH_TOKEN, DATABASE_URL, PORT
+  assert.deepEqual(
+    masked.map((m) => m.key),
+    ["API_KEY", "APP_ENV", "AUTH_TOKEN", "DATABASE_URL", "PORT"]
+  );
+
+  // Secret keys masked
+  assert.equal(masked[0].key, "API_KEY");
+  assert.equal(masked[0].value, "••••••••");
+  assert.equal(masked[0].secret, true);
+  assert.equal(masked[0].masked, true);
+
+  // Ordinary keys untouched
+  assert.equal(masked[1].key, "APP_ENV");
+  assert.equal(masked[1].value, "production");
+  assert.equal(masked[1].secret, false);
+  assert.equal(masked[1].masked, false);
+
+  assert.equal(masked[2].key, "AUTH_TOKEN");
+  assert.equal(masked[2].value, "••••••••");
+  assert.equal(masked[2].secret, true);
+
+  assert.equal(masked[3].key, "DATABASE_URL");
+  assert.equal(masked[3].value, "••••••••");
+  assert.equal(masked[3].secret, true);
+
+  assert.equal(masked[4].key, "PORT");
+  assert.equal(masked[4].value, "8080");
+  assert.equal(masked[4].secret, false);
+
+  // Revealed = true
+  const revealed = maskEnvEntries(env, true);
+  assert.equal(revealed[0].value, "sk_live_1234567890");
+  assert.equal(revealed[0].masked, false);
+  assert.equal(revealed[3].value, "postgres://user:secret@localhost:5432/db");
+  assert.equal(revealed[3].masked, false);
+
+  // Revealed as Set of specific keys
+  const selective = maskEnvEntries(env, new Set(["API_KEY"]));
+  assert.equal(selective[0].value, "sk_live_1234567890"); // revealed
+  assert.equal(selective[0].masked, false);
+  assert.equal(selective[2].value, "••••••••"); // still masked
+
+  // Object input
+  const objEnv = { SECRET_PASSWORD: "admin", HOST: "0.0.0.0" };
+  const objResult = maskEnvEntries(objEnv, false);
+  assert.deepEqual(objResult, [
+    { key: "HOST", value: "0.0.0.0", secret: false, masked: false },
+    { key: "SECRET_PASSWORD", value: "••••••••", secret: true, masked: true },
+  ]);
+
+  // Empty / null inputs
+  assert.deepEqual(maskEnvEntries(null), []);
+  assert.deepEqual(maskEnvEntries([]), []);
+});
+
+// =============================================================================
+// Suite 28: parseDockerStats (R4 §2)
+// =============================================================================
+test("parseDockerStats parses CPU %, mem usage/limit/percent, net I/O, block I/O, and pids", () => {
+  const line = JSON.stringify({
+    BlockIO: "434MB / 679MB",
+    CPUPerc: "0.17%",
+    Container: "62780445b4a794377f3e7d70ce7dd192b51e83f86029d698bb9a8c235dcf0fec",
+    ID: "62780445b4a7",
+    MemPerc: "3.50%",
+    MemUsage: "277.6MiB / 7.746GiB",
+    Name: "cv-mapa-web-1",
+    NetIO: "214MB / 120MB",
+    PIDs: "3",
+  });
+
+  const parsed = parseDockerStats(line);
+  assert.equal(parsed.cpuPerc, "0.17%");
+  assert.equal(parsed.memPerc, "3.50%");
+  assert.equal(parsed.memUsage, "277.6MiB");
+  assert.equal(parsed.memLimit, "7.746GiB");
+  assert.equal(parsed.memUsageRaw, "277.6MiB / 7.746GiB");
+  assert.equal(parsed.netIO, "214MB / 120MB");
+  assert.equal(parsed.blockIO, "434MB / 679MB");
+  assert.equal(parsed.pids, 3);
+  assert.equal(parsed.name, "cv-mapa-web-1");
+  assert.equal(parsed.id, "62780445b4a7");
+
+  // Tolerates multi-line stdout (first line parsed)
+  const multiLine = `${line}\n{"CPUPerc":"0.00%"}`;
+  assert.equal(parseDockerStats(multiLine).cpuPerc, "0.17%");
+
+  // Tolerates already parsed object
+  assert.equal(parseDockerStats({ CPUPerc: "1.25%", PIDs: "12" }).cpuPerc, "1.25%");
+
+  // Gracefully handles empty or invalid string
+  const empty = parseDockerStats("");
+  assert.equal(empty.cpuPerc, "0.00%");
+  assert.equal(empty.pids, 0);
+
+  const invalid = parseDockerStats("not valid json");
+  assert.equal(invalid.cpuPerc, "0.00%");
+  assert.equal(invalid.pids, 0);
+});
+
+// =============================================================================
+// Suite 29: formatBytes, formatRelativeTime, formatUptime (R4 §2)
+// =============================================================================
+test("formatBytes, formatRelativeTime, and formatUptime format time and byte quantities accurately", () => {
+  // formatBytes: 0 B, 1.4 MB, 2.1 GB
+  assert.equal(formatBytes(0), "0 B");
+  assert.equal(formatBytes(null), "0 B");
+  assert.equal(formatBytes(512), "512 B");
+  assert.equal(formatBytes(1024), "1 KB");
+  assert.equal(formatBytes(1468006), "1.4 MB");
+  assert.equal(formatBytes(2254857830), "2.1 GB");
+
+  // formatRelativeTime: 3 minutes ago, just now, 2 days ago
+  const now = 1700000000000;
+  assert.equal(formatRelativeTime(new Date(now - 2000), now), "just now");
+  assert.equal(formatRelativeTime(new Date(now - 45000), now), "45 seconds ago");
+  assert.equal(formatRelativeTime(new Date(now - 180000), now), "3 minutes ago");
+  assert.equal(formatRelativeTime(new Date(now - 7200000), now), "2 hours ago");
+  assert.equal(formatRelativeTime(new Date(now - 172800000), now), "2 days ago");
+  assert.equal(formatRelativeTime(null, now), "");
+
+  // formatUptime: up 2 days, up 3 hours, up 15 seconds
+  assert.equal(formatUptime(new Date(now - 15000), now), "up 15 seconds");
+  assert.equal(formatUptime(new Date(now - 600000), now), "up 10 minutes");
+  assert.equal(formatUptime(new Date(now - 10800000), now), "up 3 hours");
+  assert.equal(formatUptime(new Date(now - 172800000), now), "up 2 days");
+  assert.equal(formatUptime("", now), "");
+});
+
+// =============================================================================
+// Suite 30: normalizeImageInspect, normalizeVolumeInspect, normalizeNetworkInspect (R4 §2)
+// =============================================================================
+test("normalizeImageInspect, normalizeVolumeInspect, and normalizeNetworkInspect normalize Docker objects", () => {
+  // Image inspect
+  const rawImage = {
+    Id: "sha256:3d8298dc64808164b1b778c44beb4c6049dad280fc8b28dba0118b6e31c215f5",
+    RepoTags: ["cv-mapa-web:latest"],
+    Size: 80279348,
+    Created: "2026-11-10T14:49:12.316629109-03:00",
+    Architecture: "arm64",
+    Os: "linux",
+    Config: {
+      Labels: { "com.docker.compose.project": "cv-mapa" },
+      Env: ["PATH=/usr/local/bin", "PORT=8000"],
+      Cmd: ["python", "app.py"],
+    },
+  };
+  const img = normalizeImageInspect(rawImage);
+  assert.equal(img.id, rawImage.Id);
+  assert.equal(img.shortId, "3d8298dc6480");
+  assert.deepEqual(img.tags, ["cv-mapa-web:latest"]);
+  assert.equal(img.size, 80279348);
+  assert.equal(img.architecture, "arm64");
+  assert.equal(img.os, "linux");
+  assert.equal(img.labels["com.docker.compose.project"], "cv-mapa");
+
+  // Volume inspect
+  const rawVolume = {
+    Name: "my_data_volume",
+    Driver: "local",
+    Mountpoint: "/var/lib/docker/volumes/my_data_volume/_data",
+    CreatedAt: "2026-11-05T07:38:42-03:00",
+    Labels: { app: "db" },
+    Scope: "local",
+  };
+  const vol = normalizeVolumeInspect(rawVolume);
+  assert.equal(vol.name, "my_data_volume");
+  assert.equal(vol.driver, "local");
+  assert.equal(vol.mountpoint, "/var/lib/docker/volumes/my_data_volume/_data");
+  assert.equal(vol.scope, "local");
+  assert.equal(vol.labels.app, "db");
+
+  // Network inspect
+  const rawNetwork = {
+    Name: "tuya_default",
+    Id: "5b48abf6d13a694b45143f9e1bfca8189caed3344abcedcb3724037072a0740a",
+    Driver: "bridge",
+    Scope: "local",
+    Internal: false,
+    IPAM: {
+      Config: [{ Subnet: "172.24.0.0/16", Gateway: "172.24.0.1" }],
+    },
+    Containers: {
+      c600a54d1e22060266983587792d3f3028ef1d26a372b6acf2879d18d3d8d02f: {
+        Name: "tuya-panel-1",
+        IPv4Address: "172.24.0.2/16",
+        MacAddress: "5a:a9:9a:0d:43:32",
+      },
+    },
+  };
+  const net = normalizeNetworkInspect(rawNetwork);
+  assert.equal(net.name, "tuya_default");
+  assert.equal(net.shortId, "5b48abf6d13a");
+  assert.equal(net.driver, "bridge");
+  assert.equal(net.subnet, "172.24.0.0/16");
+  assert.equal(net.gateway, "172.24.0.1");
+  assert.equal(net.containers.length, 1);
+  assert.equal(net.containers[0].name, "tuya-panel-1");
+  assert.equal(net.containers[0].ip, "172.24.0.2");
+  assert.equal(net.containers[0].macAddress, "5a:a9:9a:0d:43:32");
+});
+
+// =============================================================================
+// Suite 31: prettyJson & buildSyntaxTheme (R4 §2)
+// =============================================================================
+test("prettyJson formats stable 2-space JSON without throwing and buildSyntaxTheme maps colors", () => {
+  // prettyJson on object
+  const obj = { b: 2, a: 1 };
+  assert.equal(prettyJson(obj), '{\n  "b": 2,\n  "a": 1\n}');
+
+  // prettyJson on json string
+  assert.equal(prettyJson('{"hello":"world"}'), '{\n  "hello": "world"\n}');
+
+  // prettyJson on unparseable string returns raw string without throwing
+  assert.equal(prettyJson("just plain text"), "just plain text");
+
+  // prettyJson on null / undefined
+  assert.equal(prettyJson(null), "");
+  assert.equal(prettyJson(undefined), "");
+
+  // buildSyntaxTheme
+  const themeColors = {
+    ansi5: "#purple",
+    ansi2: "#green",
+    dim: "#gray",
+    ansi4: "#blue",
+    ansi3: "#yellow",
+    ansi1: "#red",
+    ansi6: "#cyan",
+  };
+  const syntax = buildSyntaxTheme(themeColors);
+  assert.equal(syntax.keyword, "#purple");
+  assert.equal(syntax.string, "#green");
+  assert.equal(syntax.comment, "#gray");
+  assert.equal(syntax.function, "#blue");
+  assert.equal(syntax.type, "#yellow");
+  assert.equal(syntax.number, "#red");
+  assert.equal(syntax.constant, "#cyan");
+
+  // Defaults fallback
+  const emptySyntax = buildSyntaxTheme({});
+  assert.ok(emptySyntax.keyword);
+  assert.ok(emptySyntax.string);
+});
+
+
 
