@@ -1,0 +1,7 @@
+{
+  "name": "docker-manager",
+  "version": "0.1.0",
+  "title": "Docker Manager",
+  "description": "Native Docker & Compose management panel and tabbed resource inspector",
+  "place": "none"
+}
