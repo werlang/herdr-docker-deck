@@ -6,8 +6,8 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 
 ## What you see
 
-- **Top bar button** (`tabs-ref`): a **Docker** toggle button beside **Files** and **Changes** that opens or hides the `docker` slot in the right-hand panel.
-- **Panel toolbar** (`38px`, `t.chrome`): live Docker engine status dot + version, **This space / All** scope switcher, refresh button, and `⋯` hygiene menu.
+- **Top bar button** (`tabs-ref`): a **Docker** toggle button left of **Files** that opens or hides the `docker` slot in the right-hand panel.
+- **Panel toolbar** (`38px`, `t.chrome`): live Docker engine status dot + version, **This space / All** scope switcher, a refresh button whose icon spins while refreshing, and `⋯` hygiene menu.
 - **Section strip** (`32px`): **Containers**, **Images**, **Volumes**, **Networks**, and **System**, plus an instant filter bar.
 - **Containers tree**:
   - **Compose projects** with aggregate running count (`●4/4`), compose file basename, **"this space"** badge, and expandable service rows.
@@ -56,5 +56,5 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 
 ## Not in this repository yet
 
-The top **Docker** button in `tabs-ref` and the compose/Dockerfile header actions in `file-editor` live in sibling mods. `docs/INTEGRATION.md` specifies both; each is a separate change so every mod stays publishable alone.
+The compose/Dockerfile header actions in `file-editor` still live in a sibling mod. `docs/INTEGRATION.md` specifies them; each integration is a separate change so every mod stays publishable alone. The **Docker** button in `tabs-ref` is implemented in `herdr-tab-actions` and appears left of **Files** when the layout has the `docker` block.
 

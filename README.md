@@ -4,7 +4,7 @@ A native GPUI **Docker & Compose Manager** mod for Herdr, inspired by Microsoft'
 
 > **Status**: implemented. `mods/docker-manager/` runs in Herdr: the five sections, Compose/Dockerfile discovery, the lifecycle action matrix, logs/shell terminals, volume backup/restore/clone, system hygiene, inspector drawer and inspector tab.
 >
-> **Not in this repository**: the `tabs-ref` **Docker** top button and the `file-editor` compose/Dockerfile header actions. Both live in sibling mods (see [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) and each is a separate change, so every mod stays publishable alone. Until then, mount the panel from a layout block or `pane.split` (below).
+> **Not in this repository**: the `tabs-ref` **Docker** top button (implemented in the sibling `herdr-tab-actions` repo; it appears left of **Files** when the layout wires the `docker` block) and the `file-editor` compose/Dockerfile header actions (still pending). Both live in sibling mods (see [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) and each is a separate change, so every mod stays publishable alone. Layouts without the button can still mount the panel from the block or `pane.split` (below).
 
 ---
 

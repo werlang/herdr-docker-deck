@@ -40,7 +40,7 @@ Following `file-editor` (`file-logic.js`) and `git-graph` (`git-logic.js`), keep
 1. **Docker Panel Mode (`!props()?.inspect`)**:
    - Mounted inside the layout's `#panel-body` stack under `"id": "docker"` (or opened in a split pane).
    - Renders:
-     - Top toolbar (`h(38)`, `bg(t.chrome)`): engine status badge, **This space / All** scope toggle, refresh button, and `⋯` menu.
+     - Top toolbar (`h(38)`, `bg(t.chrome)`): engine status badge, **This space / All** scope toggle, refresh button (its icon spins while `refreshing`), and `⋯` menu.
      - Section bar (`h(32)`): `Containers` | `Images` | `Volumes` | `Networks` | `System` + inline filter input.
      - Virtualized main list (`uniform_list` with `Scrollbar.vertical`).
      - Collapsible bottom **Inspector Drawer** (`#docker-inspector-drawer`, default height `220px`, resizable) when a service or container row is selected (`DM-40..43`).

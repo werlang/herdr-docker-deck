@@ -46,7 +46,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 
 | ID | Requirement |
 |---|---|
-| DM-01 | A **Docker** top button sits next to **Files** and **Changes** in the tab bar (`tabs-ref`). Clicking it selects the `docker` child of the `panel-body` stack and shows the panel; clicking it again while active hides the panel (same toggle behaviour as Files/Changes). See INTEGRATION §1. |
+| DM-01 | A **Docker** top button sits left of **Files** in the tab bar (`tabs-ref`) whenever the layout's `panel-body` stack has a `docker` child. Clicking it selects the `docker` child and shows the panel; clicking it again while active hides the panel (same toggle behaviour and per-space memory as Files/Changes). See INTEGRATION §1. |
 | DM-02 | The panel remembers its last section and scroll per space, like the other panel children. |
 | DM-03 | `herdr-app do pane.split --direction right --mod docker-manager` opens the same panel in a split pane. |
 | DM-04 | Compose files and Dockerfiles opened in `file-editor` get a Docker action group in their tab header (§8). |
@@ -79,7 +79,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 
 | ID | Requirement |
 |---|---|
-| DM-10 | **Toolbar**: engine status dot + version (green = reachable, red = daemon down, grey = CLI missing), scope toggle **This space / All** (§5.3), refresh button, `⋯` menu (Hygiene, Open Docker Desktop, Copy diagnostics). |
+| DM-10 | **Toolbar**: engine status dot + version (green = reachable, red = daemon down, grey = CLI missing), scope toggle **This space / All** (§5.3), refresh button (the icon spins and turns accent-coloured while a refresh is in flight), `⋯` menu (Hygiene, Open Docker Desktop, Copy diagnostics). |
 | DM-11 | **Section switcher**: Containers (default), Images, Volumes, Networks, System. Visual language matches `file-editor`/`git-graph` (24 px icon buttons, `theme()` colors, no hardcoded hex). |
 | DM-12 | **Filter box** filters the current section by name, image, service, project, port (substring, case-insensitive). `Esc` clears it. |
 | DM-13 | Rows are virtualized (`uniform_list`) so 500+ containers/images scroll smoothly. |

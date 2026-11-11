@@ -1,6 +1,6 @@
 # docker-manager — Cross-Mod & Layout Integration Spec
 
-Status: **specified, not implemented** — the sibling changes (`tabs-ref`, `file-editor`) are out of scope for this repository.
+Status: **partially implemented** — §1 layout wiring and the §2 `tabs-ref` **Docker** button are implemented (button left of **Files**); the §3 `file-editor` header actions remain specified, not implemented.
 
 Following Herdr's mod independence rule, `docker-manager`, `tabs-ref`, and `file-editor` live in separate repositories and remain independently installable. Neither `tabs-ref` nor `file-editor` imports code or assets from `docker-manager`; instead, they detect `mods/docker-manager/mod.json` at runtime, keep their own local SVG icons, and coordinate through layout commands and `shared()` keys.
 
@@ -70,25 +70,26 @@ Add a **Docker** button next to **Files** and **Changes** in the top tab bar (`m
 
 1. **Discovery**:
    - Check whether `find(body, "docker")` exists in the current `layout()` (or `"docker"` is listed in `shared("workspace.panels")`).
-   - Default `enabled` panels list in `tabs-ref`:
+   - `enabled` panels list in `tabs-ref` — a configured `workspace.panels` keeps its say, and `docker` is added when the block exists:
      ```js
-     const defaultPanels = find(body, "docker")
-       ? ["files", "changes", "docker"]
-       : ["files", "changes"];
-     const enabled = shared("workspace.panels") ?? defaultPanels;
+     const dockerPanel = Boolean(find(body, "docker"));
+     const configured = shared("workspace.panels") ?? ["files", "changes"];
+     const enabled = dockerPanel && !configured.includes("docker")
+       ? [...configured, "docker"]
+       : configured;
      ```
 2. **Icon Asset**:
    - Store a self-contained tinted SVG at `herdr-tab-actions/mods/tabs-ref/docker.svg` (never reference `mods/docker-manager/...` so `tabs-ref` stays standalone).
 3. **Button Rendering**:
    ```js
+   .when(enabled.includes("docker") && dockerPanel, el =>
+     el.child(panelButton("docker", "Docker", "mods/tabs-ref/docker.svg"))
+   )
    .when(enabled.includes("files"), el =>
      el.child(panelButton("files", "Files", "mods/files/file.svg"))
    )
    .when(enabled.includes("changes"), el =>
      el.child(panelButton("changes", "Changes", "mods/changes/changes.svg"))
-   )
-   .when(enabled.includes("docker") && Boolean(find(body, "docker")), el =>
-     el.child(panelButton("docker", "Docker", "mods/tabs-ref/docker.svg"))
    )
    ```
 4. **Per-Space Panel Memory**:
