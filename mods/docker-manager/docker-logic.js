@@ -526,7 +526,8 @@ export function normalizeContainerInspect(raw) {
     imageId: raw.Image ? raw.Image.replace(/^sha256:/, "").slice(0, 12) : "",
     created: raw.Created || "",
     startedAt: raw.State?.StartedAt || "",
-    finishedAt: raw.State?.FinishedAt || "",
+    // Docker reports a never-finished container with the zero time; showing 0001-01-01 is noise.
+    finishedAt: raw.State?.FinishedAt && !raw.State.FinishedAt.startsWith("0001-01-01") ? raw.State.FinishedAt : "",
     state: {
       status: raw.State?.Status || "unknown",
       running: Boolean(raw.State?.Running),

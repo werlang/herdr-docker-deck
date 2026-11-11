@@ -1186,3 +1186,18 @@ test("groupDiscoveredComposeFiles: groups primary and override files", () => {
   assert.equal(app2.isOverride, false);
   assert.equal(app2.files.length, 1);
 });
+
+test("normalizeContainerInspect: a never-finished container reports no finish time", async () => {
+  const { normalizeContainerInspect } = await import("../mods/docker-manager/docker-logic.js");
+  const running = normalizeContainerInspect({
+    Id: "abc",
+    State: { Status: "running", Running: true, StartedAt: "2026-11-09T15:03:08Z", FinishedAt: "0001-01-01T00:00:00Z" },
+  });
+  assert.equal(running.finishedAt, "");
+
+  const stopped = normalizeContainerInspect({
+    Id: "abc",
+    State: { Status: "exited", Running: false, StartedAt: "2026-11-09T15:03:08Z", FinishedAt: "2026-11-09T16:00:00Z" },
+  });
+  assert.equal(stopped.finishedAt, "2026-11-09T16:00:00Z");
+});
