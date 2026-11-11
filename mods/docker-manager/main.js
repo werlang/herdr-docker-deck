@@ -69,6 +69,11 @@ import {
   normalizeNetworkInspect,
   prettyJson,
   buildSyntaxTheme,
+  formatRestartPolicy,
+  formatImageLabel,
+  formatDrawerPortRows,
+  formatDrawerMounts,
+  formatDrawerNetworks,
 } from "./docker-logic.js";
 
 /** Available section keys in panel mode (DM-11). */
@@ -967,24 +972,24 @@ export default class DockerManager extends View {
    * @param {any} value
    * @param {ReturnType<typeof theme>} t
    * @param {import("gpui-kit").ViewContext} _cx
-   * @param {{ isCode?: boolean, copyVal?: any }} [opts]
+   * @param {{ isCode?: boolean, copyVal?: any, truncate?: boolean }} [opts]
    */
-  renderDrawerField(label, value, t, _cx, { isCode = false, copyVal = null } = {}) {
+  renderDrawerField(label, value, t, _cx, { isCode = false, copyVal = null, truncate = false } = {}) {
     if (value === null || value === undefined || value === "") return null;
     const strVal = String(value);
     const toCopy = copyVal !== null ? copyVal : strVal;
 
     return h_flex()
       .w_full()
-      .py(2)
+      .py(1.5)
       .px(8)
-      .items_start()
+      .items_center()
       .gap(8)
       .hover((s) => s.bg(t.hover))
       .rounded(3)
       .child(
         div()
-          .w(110)
+          .w(105)
           .flex_shrink_0()
           .text_size(10.5)
           .text_color(t.dim)
@@ -997,6 +1002,7 @@ export default class DockerManager extends View {
           .text_color(t.foreground)
           .cursor_pointer()
           .when(isCode, (el) => el.font_family("monospace"))
+          .when(truncate, (el) => el.truncate())
           .on_click((_e, cx) => this.copyValue(toCopy, cx, label))
           .child(strVal)
       );
@@ -1010,17 +1016,18 @@ export default class DockerManager extends View {
    * @param {import("gpui-kit").ViewContext} _cx
    */
   renderDrawerPorts(ports, t, _cx) {
-    if (!ports || ports.length === 0) return null;
+    const rows = formatDrawerPortRows(ports);
+    if (rows.length === 0) return null;
 
     return h_flex()
       .w_full()
-      .py(2)
+      .py(1.5)
       .px(8)
-      .items_start()
+      .items_center()
       .gap(8)
       .child(
         div()
-          .w(110)
+          .w(105)
           .flex_shrink_0()
           .text_size(10.5)
           .text_color(t.dim)
@@ -1032,14 +1039,8 @@ export default class DockerManager extends View {
           .flex_wrap()
           .gap(6)
           .children(
-            ports.map((p) => {
-              const hasHost = Boolean(p.hostPort);
-              const label = hasHost
-                ? `${p.hostPort} → ${p.containerPort}/${p.proto}`
-                : `${p.containerPort}/${p.proto}`;
-              const url = hasHost ? `http://localhost:${p.hostPort}` : null;
-
-              return h_flex()
+            rows.map((p) =>
+              h_flex()
                 .items_center()
                 .gap(4)
                 .px(5)
@@ -1050,64 +1051,148 @@ export default class DockerManager extends View {
                 .border_color(t.border)
                 .cursor_pointer()
                 .hover((s) => s.bg(t.hover))
-                .when(Boolean(url), (el) =>
-                  el.on_click((_e, cx) => cx.open_url(url))
+                .when(Boolean(p.url), (el) =>
+                  el.on_click((_e, cx) => cx.open_url(p.url))
                 )
-                .when(!url, (el) =>
-                  el.on_click((_e, cx) => this.copyValue(label, cx, "Port"))
+                .when(!p.url, (el) =>
+                  el.on_click((_e, cx) => this.copyValue(p.copyVal, cx, "Port"))
                 )
                 .child(
                   div()
                     .font_family("monospace")
                     .text_size(10)
-                    .when(Boolean(url), (el) => el.text_color(t.accent).underline())
-                    .when(!url, (el) => el.text_color(t.foreground))
-                    .child(label)
-                );
-            })
+                    .when(Boolean(p.url), (el) => el.text_color(t.accent).underline())
+                    .when(!p.url, (el) => el.text_color(t.foreground))
+                    .child(p.label)
+                )
+            )
           )
       );
   }
 
   /**
-   * Renders mounts in the inspector drawer.
+   * Renders mounts in the inspector drawer (DM-41).
    *
    * @param {any[]} mounts
    * @param {ReturnType<typeof theme>} t
-   * @param {import("gpui-kit").ViewContext} cx
+   * @param {import("gpui-kit").ViewContext} _cx
    */
-  renderDrawerMounts(mounts, t, cx) {
-    if (!mounts || mounts.length === 0) return null;
-    return v_flex()
+  renderDrawerMounts(mounts, t, _cx) {
+    const rows = formatDrawerMounts(mounts);
+    if (rows.length === 0) return null;
+
+    return h_flex()
       .w_full()
-      .children(
-        mounts
-          .map((m) => {
-            const text = `${m.type}: ${m.source} → ${m.destination} (${m.rw ? "rw" : "ro"})`;
-            return this.renderDrawerField("Mount", text, t, cx, { copyVal: m.source || text });
-          })
-          .filter(Boolean)
+      .py(1.5)
+      .px(8)
+      .items_center()
+      .gap(8)
+      .child(
+        div()
+          .w(105)
+          .flex_shrink_0()
+          .text_size(10.5)
+          .text_color(t.dim)
+          .child("Mounts")
+      )
+      .child(
+        h_flex()
+          .flex_1()
+          .flex_wrap()
+          .gap(6)
+          .children(
+            rows.map((m) =>
+              h_flex()
+                .items_center()
+                .gap(4)
+                .px(5)
+                .py(1)
+                .rounded(3)
+                .bg(t.surface)
+                .border_1()
+                .border_color(t.border)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_click((_e, cx) => {
+                  this.copyValue(m.copyVal, cx, m.isNamed ? "Volume" : "Mount");
+                  if (m.isNamed) {
+                    this.section = "volumes";
+                    cx.notify();
+                  }
+                })
+                .child(
+                  div()
+                    .font_family("monospace")
+                    .text_size(10)
+                    .when(m.isNamed, (el) => el.text_color(t.accent).underline())
+                    .when(!m.isNamed, (el) => el.text_color(t.foreground))
+                    .truncate()
+                    .child(m.text)
+                )
+            )
+          )
       );
   }
 
   /**
-   * Renders networks in the inspector drawer.
+   * Renders networks in the inspector drawer (DM-41).
    *
    * @param {any[]} networks
    * @param {ReturnType<typeof theme>} t
-   * @param {import("gpui-kit").ViewContext} cx
+   * @param {import("gpui-kit").ViewContext} _cx
    */
-  renderDrawerNetworks(networks, t, cx) {
-    if (!networks || networks.length === 0) return null;
-    return v_flex()
+  renderDrawerNetworks(networks, t, _cx) {
+    const rows = formatDrawerNetworks(networks);
+    if (rows.length === 0) return null;
+
+    return h_flex()
       .w_full()
-      .children(
-        networks
-          .map((n) => {
-            const text = `${n.name} (${n.ipAddress || "no IP"})`;
-            return this.renderDrawerField("Network", text, t, cx, { copyVal: n.ipAddress || n.name });
-          })
-          .filter(Boolean)
+      .py(1.5)
+      .px(8)
+      .items_center()
+      .gap(8)
+      .child(
+        div()
+          .w(105)
+          .flex_shrink_0()
+          .text_size(10.5)
+          .text_color(t.dim)
+          .child("Networks")
+      )
+      .child(
+        h_flex()
+          .flex_1()
+          .flex_wrap()
+          .gap(6)
+          .children(
+            rows.map((n) =>
+              h_flex()
+                .items_center()
+                .gap(4)
+                .px(5)
+                .py(1)
+                .rounded(3)
+                .bg(t.surface)
+                .border_1()
+                .border_color(t.border)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_click((_e, cx) => {
+                  this.copyValue(n.copyVal, cx, "Network");
+                  this.section = "networks";
+                  cx.notify();
+                })
+                .child(
+                  div()
+                    .font_family("monospace")
+                    .text_size(10)
+                    .text_color(t.accent)
+                    .underline()
+                    .truncate()
+                    .child(n.text)
+                )
+            )
+          )
       );
   }
 
@@ -1194,9 +1279,39 @@ export default class DockerManager extends View {
             )
           )
           .when(!this.inspectLoading && Boolean(data), (el) => {
+            const isUnhealthy =
+              data.health?.status === "unhealthy" || data.state?.status === "unhealthy";
+            const lastHealthLog =
+              isUnhealthy && data.health?.lastLog
+                ? data.health.lastLog.replace(/\r?\n/g, " ").trim()
+                : null;
+
+            const cmdStr = Array.isArray(data.cmd) ? data.cmd.join(" ") : data.cmd || "";
+            const entrypointStr = Array.isArray(data.entrypoint)
+              ? data.entrypoint.join(" ")
+              : data.entrypoint || "";
+            const composeFilesStr = Array.isArray(data.composeFiles)
+              ? data.composeFiles.join(", ")
+              : data.composeFiles || "";
+            const dependsOnStr = Array.isArray(data.dependsOn)
+              ? data.dependsOn.join(", ")
+              : data.dependsOn || "";
+
+            const imageDisplay = formatImageLabel(
+              data.image,
+              data.shortImageId || data.imageShortId
+            );
+            const restartPolicyDisplay = formatRestartPolicy(data.restartPolicy);
+
             const fields = [
-              this.renderDrawerField("Container ID", data.shortId || data.id, t, cx, { isCode: true }),
-              this.renderDrawerField("Image", data.image, t, cx),
+              this.renderDrawerField("Container ID", data.shortId || data.id, t, cx, {
+                isCode: true,
+                copyVal: data.id || data.shortId,
+              }),
+              this.renderDrawerField("Name", data.name, t, cx),
+              this.renderDrawerField("Image", imageDisplay, t, cx, {
+                copyVal: data.image || data.shortImageId || imageDisplay,
+              }),
               this.renderDrawerField(
                 "Status",
                 data.health?.status
@@ -1205,40 +1320,46 @@ export default class DockerManager extends View {
                 t,
                 cx
               ),
-              data.health?.lastLog ? this.renderDrawerField("Health Log", data.health.lastLog, t, cx) : null,
-              this.renderDrawerField("Created", data.created, t, cx),
-              this.renderDrawerField("Started", data.startedAt, t, cx),
-              this.renderDrawerField("Restart Policy", data.restartPolicy?.name, t, cx),
+              lastHealthLog
+                ? this.renderDrawerField("Health Check", lastHealthLog, t, cx, {
+                    truncate: true,
+                    copyVal: data.health.lastLog,
+                  })
+                : null,
+              this.renderDrawerField("Restart Policy", restartPolicyDisplay, t, cx),
               this.renderDrawerPorts(data.ports, t, cx),
               this.renderDrawerMounts(data.mounts, t, cx),
               this.renderDrawerNetworks(data.networks, t, cx),
+              this.renderDrawerField("Command", cmdStr, t, cx, {
+                isCode: true,
+                truncate: true,
+                copyVal: cmdStr,
+              }),
+              this.renderDrawerField("Entrypoint", entrypointStr, t, cx, {
+                isCode: true,
+                truncate: true,
+                copyVal: entrypointStr,
+              }),
+              this.renderDrawerField("Project", data.project, t, cx),
+              this.renderDrawerField("Service", data.service, t, cx),
               this.renderDrawerField(
-                "Command",
-                Array.isArray(data.cmd) ? data.cmd.join(" ") : data.cmd,
+                "Started / Created",
+                data.startedAt && data.created
+                  ? `${formatRelativeTime(data.startedAt) || data.startedAt} / ${formatRelativeTime(data.created) || data.created}`
+                  : data.startedAt || data.created,
                 t,
                 cx,
-                { isCode: true }
+                { copyVal: `Started: ${data.startedAt || "-"}, Created: ${data.created || "-"}` }
               ),
-              this.renderDrawerField(
-                "Entrypoint",
-                Array.isArray(data.entrypoint) ? data.entrypoint.join(" ") : data.entrypoint,
-                t,
-                cx,
-                { isCode: true }
-              ),
-              this.renderDrawerField("Working Dir", data.workingDir, t, cx),
-              this.renderDrawerField(
-                "Compose Files",
-                Array.isArray(data.composeFiles) ? data.composeFiles.join(", ") : data.composeFiles,
-                t,
-                cx
-              ),
-              this.renderDrawerField(
-                "Depends On",
-                Array.isArray(data.dependsOn) ? data.dependsOn.join(", ") : data.dependsOn,
-                t,
-                cx
-              ),
+              this.renderDrawerField("Working Dir", data.workingDir, t, cx, { isCode: true }),
+              this.renderDrawerField("Compose Files", composeFilesStr, t, cx, {
+                truncate: true,
+                copyVal: composeFilesStr,
+              }),
+              this.renderDrawerField("Depends On", dependsOnStr, t, cx, {
+                truncate: true,
+                copyVal: dependsOnStr,
+              }),
             ].filter(Boolean);
 
             return el.children(fields);

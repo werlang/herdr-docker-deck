@@ -62,6 +62,11 @@ import {
   normalizeNetworkInspect,
   prettyJson,
   buildSyntaxTheme,
+  formatRestartPolicy,
+  formatImageLabel,
+  formatDrawerPortRows,
+  formatDrawerMounts,
+  formatDrawerNetworks,
 } from "../mods/docker-manager/docker-logic.js";
 
 // =============================================================================
@@ -239,6 +244,7 @@ test("isSecretEnvKey leaves standard non-secret environment variables unmasked",
 test("normalizeContainerInspect extracts ports, mounts, networks, health log, restart policy, and exit code", () => {
   const rawInspect = {
     Id: "abc1234567890abcdef1234567890",
+    Image: "sha256:d1234567890abcdef1234567890",
     Name: "/web-service-1",
     Created: "2026-11-10T12:00:00Z",
     Config: {
@@ -320,6 +326,13 @@ test("normalizeContainerInspect extracts ports, mounts, networks, health log, re
   assert.equal(norm.name, "web-service-1");
   assert.equal(norm.project, "myproject");
   assert.equal(norm.service, "web");
+  assert.equal(norm.image, "nginx:alpine");
+  assert.equal(norm.imageId, "sha256:d1234567890abcdef1234567890");
+  assert.equal(norm.shortImageId, "d1234567890a");
+  assert.equal(norm.imageShortId, "d1234567890a");
+  assert.deepEqual(norm.entrypoint, ["/entrypoint.sh"]);
+  assert.deepEqual(norm.cmd, ["nginx", "-g", "daemon off;"]);
+  assert.equal(norm.workingDir, "/var/www/html");
   assert.deepEqual(norm.composeFiles, ["/app/compose.yaml"]);
   assert.deepEqual(norm.dependsOn, ["db:service_healthy"]);
 
@@ -2275,6 +2288,113 @@ test("prettyJson formats stable 2-space JSON without throwing and buildSyntaxThe
   assert.ok(emptySyntax.keyword);
   assert.ok(emptySyntax.string);
 });
+
+test("formatRestartPolicy formats empty, no, always, unless-stopped, and on-failure policies", () => {
+  assert.equal(formatRestartPolicy(null), "no");
+  assert.equal(formatRestartPolicy(undefined), "no");
+  assert.equal(formatRestartPolicy({}), "no");
+  assert.equal(formatRestartPolicy({ name: "" }), "no");
+  assert.equal(formatRestartPolicy({ name: "no" }), "no");
+  assert.equal(formatRestartPolicy({ name: "always" }), "always");
+  assert.equal(formatRestartPolicy({ name: "unless-stopped" }), "unless-stopped");
+  assert.equal(formatRestartPolicy({ name: "on-failure", maximumRetryCount: 0 }), "on-failure");
+  assert.equal(formatRestartPolicy({ name: "on-failure", maximumRetryCount: 5 }), "on-failure:5");
+});
+
+test("formatImageLabel formats image name with short id", () => {
+  assert.equal(formatImageLabel("rustfs/rustfs:latest", "ed9210d6411d"), "rustfs/rustfs:latest (ed9210d6411d)");
+  assert.equal(formatImageLabel("ed9210d6411d", "ed9210d6411d"), "ed9210d6411d");
+  assert.equal(formatImageLabel("nginx:alpine", ""), "nginx:alpine");
+  assert.equal(formatImageLabel("", "ed9210d6411d"), "ed9210d6411d");
+  assert.equal(formatImageLabel("", ""), "");
+});
+
+test("formatDrawerPortRows formats published and unmapped port rows with url and label", () => {
+  const ports = [
+    { hostIp: "0.0.0.0", hostPort: "8080", containerPort: "80", proto: "tcp" },
+    { hostIp: "127.0.0.1", hostPort: "5432", containerPort: "5432", proto: "tcp" },
+    { hostIp: null, hostPort: null, containerPort: "9000", proto: "tcp" },
+    { hostIp: null, hostPort: null, containerPort: "9001", proto: "tcp" },
+    // Duplicate IPv6 binding
+    { hostIp: "::", hostPort: "8080", containerPort: "80", proto: "tcp" },
+  ];
+
+  const rows = formatDrawerPortRows(ports);
+  assert.equal(rows.length, 4);
+
+  const r80 = rows.find((r) => r.label.includes("80/tcp"));
+  assert.ok(r80);
+  assert.equal(r80.label, "8080 → 80/tcp");
+  assert.equal(r80.url, "http://localhost:8080");
+  assert.equal(r80.published, true);
+
+  const r5432 = rows.find((r) => r.label.includes("5432/tcp"));
+  assert.ok(r5432);
+  assert.equal(r5432.label, "127.0.0.1:5432 → 5432/tcp");
+  assert.equal(r5432.url, "http://localhost:5432");
+
+  const r9000 = rows.find((r) => r.label === "9000/tcp");
+  assert.ok(r9000);
+  assert.equal(r9000.url, null);
+  assert.equal(r9000.copyVal, "9000/tcp");
+  assert.equal(r9000.published, false);
+});
+
+test("formatDrawerMounts formats volume and bind mounts with ro/rw and named flag", () => {
+  const mounts = [
+    {
+      type: "volume",
+      name: "cv-data",
+      source: "/var/lib/docker/volumes/cv-data/_data",
+      destination: "/data",
+      rw: true,
+    },
+    {
+      type: "bind",
+      source: "/home/user/config.yaml",
+      destination: "/etc/app/config.yaml",
+      rw: false,
+    },
+  ];
+
+  const formatted = formatDrawerMounts(mounts);
+  assert.equal(formatted.length, 2);
+
+  assert.equal(formatted[0].isNamed, true);
+  assert.equal(formatted[0].name, "cv-data");
+  assert.equal(formatted[0].text, "volume: cv-data → /data (rw)");
+  assert.equal(formatted[0].copyVal, "cv-data");
+
+  assert.equal(formatted[1].isNamed, false);
+  assert.equal(formatted[1].name, null);
+  assert.equal(formatted[1].text, "bind: /home/user/config.yaml → /etc/app/config.yaml (ro)");
+  assert.equal(formatted[1].copyVal, "/home/user/config.yaml");
+});
+
+test("formatDrawerNetworks formats networks with IP and aliases", () => {
+  const nets = [
+    {
+      name: "cv-mapa",
+      ipAddress: "172.25.0.3",
+      aliases: ["cv-mapa-rustfs-1", "rustfs"],
+    },
+    {
+      name: "bridge",
+      ipAddress: "",
+      aliases: [],
+    },
+  ];
+
+  const formatted = formatDrawerNetworks(nets);
+  assert.equal(formatted.length, 2);
+
+  assert.equal(formatted[0].text, "cv-mapa (172.25.0.3) [cv-mapa-rustfs-1, rustfs]");
+  assert.equal(formatted[0].copyVal, "172.25.0.3");
+
+  assert.equal(formatted[1].text, "bridge");
+  assert.equal(formatted[1].copyVal, "bridge");
+});
+
 
 
 

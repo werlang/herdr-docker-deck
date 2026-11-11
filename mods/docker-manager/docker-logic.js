@@ -277,6 +277,9 @@ export function normalizeContainerInspect(raw) {
     };
   });
 
+  const imageId = data.Image || "";
+  const shortImageId = imageId.replace(/^sha256:/, "").slice(0, 12);
+
   return {
     id,
     shortId,
@@ -284,7 +287,9 @@ export function normalizeContainerInspect(raw) {
     project,
     service,
     image: data.Config?.Image || "",
-    imageId: data.Image || "",
+    imageId,
+    shortImageId,
+    imageShortId: shortImageId,
     created: data.Created || "",
     startedAt: state.startedAt,
     finishedAt: state.finishedAt,
@@ -302,6 +307,134 @@ export function normalizeContainerInspect(raw) {
     composeFiles,
     dependsOn,
   };
+}
+
+/**
+ * Formats a container restart policy into a human-readable display string (DM-41).
+ *
+ * @param {{ name?: string, maximumRetryCount?: number } | null | undefined} policy
+ * @returns {string}
+ */
+export function formatRestartPolicy(policy) {
+  if (!policy || !policy.name || policy.name === "no") return "no";
+  if (policy.name === "on-failure") {
+    return policy.maximumRetryCount > 0 ? `on-failure:${policy.maximumRetryCount}` : "on-failure";
+  }
+  return policy.name;
+}
+
+/**
+ * Formats an image name and short id for drawer display (DM-41).
+ *
+ * @param {string | null | undefined} image
+ * @param {string | null | undefined} shortImageId
+ * @returns {string}
+ */
+export function formatImageLabel(image, shortImageId) {
+  const img = image || "";
+  const sid = shortImageId || "";
+  if (img && sid && !img.includes(sid)) {
+    return `${img} (${sid})`;
+  }
+  return img || sid || "";
+}
+
+/**
+ * Formats ports into drawer rows with display label, copy value, and clickable url (DM-41).
+ *
+ * @param {Array<{ hostIp?: string | null, hostPort?: string | null, containerPort: string, proto?: string }>} ports
+ * @returns {Array<{ label: string, url: string | null, copyVal: string, published: boolean }>}
+ */
+export function formatDrawerPortRows(ports) {
+  if (!ports || !Array.isArray(ports) || ports.length === 0) return [];
+  const results = [];
+  const seen = new Set();
+
+  for (const p of ports) {
+    if (!p || !p.containerPort) continue;
+    const proto = p.proto || "tcp";
+    const hasHost = Boolean(p.hostPort);
+    const hostPort = p.hostPort ? String(p.hostPort) : null;
+    const containerPort = String(p.containerPort);
+
+    let label;
+    let url = null;
+    let copyVal;
+
+    if (hasHost) {
+      const hostIp =
+        p.hostIp && p.hostIp !== "0.0.0.0" && p.hostIp !== "::" && p.hostIp !== "[::]"
+          ? p.hostIp
+          : null;
+      const hostPart = hostIp ? `${hostIp}:${hostPort}` : hostPort;
+      label = `${hostPart} → ${containerPort}/${proto}`;
+      url = `http://localhost:${hostPort}`;
+      copyVal = url;
+    } else {
+      label = `${containerPort}/${proto}`;
+      copyVal = label;
+    }
+
+    const dedupeKey = `${hasHost ? "pub" : "unpub"}:${label}`;
+    if (!seen.has(dedupeKey)) {
+      seen.add(dedupeKey);
+      results.push({
+        label,
+        url,
+        copyVal,
+        published: hasHost,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Formats mounts into drawer rows with display text, copy value, and isNamed volume flag (DM-41).
+ *
+ * @param {Array<{ type?: string, name?: string | null, source?: string, destination?: string, rw?: boolean }>} mounts
+ * @returns {Array<{ text: string, isNamed: boolean, name: string | null, source: string, destination: string, copyVal: string }>}
+ */
+export function formatDrawerMounts(mounts) {
+  if (!mounts || !Array.isArray(mounts) || mounts.length === 0) return [];
+  return mounts.map((m) => {
+    const isNamed = m.type === "volume" && Boolean(m.name);
+    const src = isNamed ? m.name : m.source;
+    const mode = m.rw === false ? "ro" : "rw";
+    const text = `${m.type || "bind"}: ${src} → ${m.destination} (${mode})`;
+    const copyVal = m.name || m.source || text;
+    return {
+      text,
+      isNamed,
+      name: m.name || null,
+      source: m.source || "",
+      destination: m.destination || "",
+      copyVal,
+    };
+  });
+}
+
+/**
+ * Formats networks into drawer rows with display text, copy value, and name (DM-41).
+ *
+ * @param {Array<{ name: string, ipAddress?: string, aliases?: string[] }>} networks
+ * @returns {Array<{ text: string, name: string, ipAddress: string, copyVal: string }>}
+ */
+export function formatDrawerNetworks(networks) {
+  if (!networks || !Array.isArray(networks) || networks.length === 0) return [];
+  return networks.map((n) => {
+    const aliasStr = n.aliases && n.aliases.length > 0 ? ` [${n.aliases.join(", ")}]` : "";
+    const ipStr = n.ipAddress ? ` (${n.ipAddress})` : "";
+    const text = `${n.name}${ipStr}${aliasStr}`;
+    const copyVal = n.ipAddress || n.name;
+    return {
+      text,
+      name: n.name,
+      ipAddress: n.ipAddress || "",
+      copyVal,
+    };
+  });
 }
 
 /**
