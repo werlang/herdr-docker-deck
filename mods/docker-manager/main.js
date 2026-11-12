@@ -4467,6 +4467,24 @@ export default class DockerManager extends View {
 
     const isRunning = Boolean(this.inspectData?.state?.running);
     const isService = Boolean(p?.inspect?.project && p?.inspect?.service);
+    // Splitting an editor pane creates another pane with the same content,
+    // not a new tab and not a terminal. Do the same for the inspector.
+    const splitInspector = (direction) =>
+      run("pane.split", {
+        direction,
+        ...(paneId ? { pane: paneId } : {}),
+        mod: "docker-manager",
+        props: {
+          inspect: {
+            kind,
+            id: targetId,
+            name: targetTitle,
+            project: p?.inspect?.project,
+            service: p?.inspect?.service,
+            subView: this.inspectTabSubView,
+          },
+        },
+      });
     // A tab mod does not get `props().pane`; when this tab is focused, its
     // pane is the focused pane in `panes()`. That is enough to draw the
     // standard split / zoom / close controls the pane header would own.
@@ -4845,7 +4863,31 @@ export default class DockerManager extends View {
                       .when(this.refreshing, (el) => el.spin(900))
                   )
               )
-              // Standard pane controls, since a mod pane has no pane-plus header.
+              // Standard editor-style splits: a new pane with the same
+              // inspector content, never a terminal or a separate tab.
+              .child(
+                h_flex()
+                  .size(24)
+                  .rounded(4)
+                  .items_center()
+                  .justify_center()
+                  .tooltip("Split right")
+                  .hover((s) => s.bg(toColor(t.hover)))
+                  .on_click((_e) => splitInspector("right"))
+                  .child(svg("mods/docker-manager/icons/split-right.svg").size(13).text_color(toColor(t.muted)))
+              )
+              .child(
+                h_flex()
+                  .size(24)
+                  .rounded(4)
+                  .items_center()
+                  .justify_center()
+                  .tooltip("Split down")
+                  .hover((s) => s.bg(toColor(t.hover)))
+                  .on_click((_e) => splitInspector("down"))
+                  .child(svg("mods/docker-manager/icons/split-down.svg").size(13).text_color(toColor(t.muted)))
+              )
+              // Zoom/close apply to this mod tab.
               .when(Boolean(paneId), (btn) => {
                 const paneButton = (icon, tip, action) =>
                   h_flex()
@@ -4859,8 +4901,6 @@ export default class DockerManager extends View {
                     .child(svg(`mods/docker-manager/icons/${icon}`).size(13).text_color(toColor(t.muted)));
                 return btn
                   .child(div().w(1).h(16).mx(2).bg(toColor(t.border)))
-                  .child(paneButton("split-right.svg", "Split right", () => run("pane.split", { direction: "right", pane: paneId })))
-                  .child(paneButton("split-down.svg", "Split down", () => run("pane.split", { direction: "down", pane: paneId })))
                   .child(
                     paneButton(paneInfo?.zoomed ? "unzoom.svg" : "zoom.svg", paneInfo?.zoomed ? "Unzoom" : "Zoom", () =>
                       run("pane.zoom", { pane: paneId })
