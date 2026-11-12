@@ -174,7 +174,7 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 | Container Logs (`DM-80`) | `["docker", "logs", "-f", "--tail", String(tail), containerId]` | `terminal.open` |
 | Container Shell (`DM-81`) | `["docker", "exec", "-it", containerId, "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]` | `terminal.open` |
 
-**Peekable background actions (`DM-16`)**: actions marked *Hidden terminal* start with `hc run --bg --json --no-parent` (no `herdr.space`/`herdr.tab` labels, so they stay out of the tab strip), are followed with `hc wait --json`, and their final screen is read with `hc read`. The floating spinner toast stores that address: clicking it runs `terminal.peek`. Finished terminals are removed after a 15 s grace period unless the user kept them as tabs. If the terminal cannot be created, the action falls back to `exec`.
+**Peekable background actions (`DM-16`)**: actions marked *Hidden terminal* start with `hc run --bg --json --no-parent` (no `herdr.space`/`herdr.tab` labels, so they stay out of the tab strip), are followed with `hc wait --json`, and their final screen is read with `hc read`. Progress is posted with `notify()` so the active toast mod (`toast-edited`) renders it: title = action label, body = background hint, spinner icon chosen from the popover luminance, and `action: terminal.peek` so the toast modal's **Run action** button peeks the terminal. The progress notification is closed on completion. Finished terminals are removed after a 60 s grace period unless the user kept them as tabs. If the terminal cannot be created, the action falls back to `exec`.
 
 ### 4.6 Images, Volumes, Networks & Hygiene Commands
 

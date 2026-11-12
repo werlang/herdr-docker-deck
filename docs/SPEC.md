@@ -85,7 +85,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 | DM-13 | Tree and section rows render from one stable row list inside a scroll container, so the whole section scrolls smoothly without virtualization gaps. |
 | DM-14 | Every row has a hover state, a selected state, and a right-click context menu (§7). Double-click on a container/service row opens the inspector tab. |
 | DM-15 | **Engine unavailable** empty state: explains whether the CLI is missing or the daemon is unreachable, with **Retry** and, on macOS, **Start Docker Desktop** (`open -a Docker`). |
-| DM-16 | Long or slow operations show a row spinner (native `.spin()`), never block the UI thread, and report failures with a toast containing the first lines of stderr plus a "Copy full error" action. Background Docker actions run in a hidden terminal; while one runs, the floating spinner toast is clickable and peeks that terminal (`terminal.peek`). |
+| DM-16 | Long or slow operations show a row spinner (native `.spin()`), never block the UI thread, and report failures with a toast containing the first lines of stderr plus a "Copy full error" action. Background Docker actions run in a hidden terminal. Progress is posted with `notify()` (rendered by the active toast mod, `toast-edited`) with a spinner icon; the toast modal's action peeks that terminal (`terminal.peek`). |
 
 ---
 

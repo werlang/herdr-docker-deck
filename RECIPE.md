@@ -45,13 +45,13 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - Cache the workspace `find`/`stat` scan; re-run it only on cwd change, folder-watch event, or manual Refresh.
 - Compose actions run from the project working directory, not the space root; otherwise `docker compose` can fall back to a default `compose.yaml`.
 - The inspector tab mounts its own dialog overlays (Run/Tag/Backup/Restore/Clone) and reloads its target after actions, so Stop turns into Start.
-- Async actions show a floating spinner toast; the action never blocks the UI. Docker actions run in a hidden `hc` terminal (`hc run --bg --json --no-parent`), so clicking the toast peeks that terminal with `terminal.peek`; `hc wait`/`hc read` collect the result and `hc rm` cleans up after a grace period.
+- Async actions post progress with `notify()`, so the active toast mod (`toast-edited`) renders them; the action never blocks the UI. Docker actions run in a hidden `hc` terminal (`hc run --bg --json --no-parent`), and the toast modal's action peeks that terminal with `terminal.peek`; `hc wait`/`hc read` collect the result and `hc rm` cleans up after a grace period.
 - The inspector header uses the standard split-right/split-down icons; each opens Herdr's **New pane chooser** in a new pane of the same tab (terminal or any installed agent). Without `new-pane`, it opens a terminal. The header wraps so split/zoom/close stay reachable in narrow panes.
 - Destructive confirm closures must receive the confirm button's `cx`; a zero-arg closure leaves `runAction` without a context and the action never starts.
 - Single-volume **Compute Size** parses `docker system df -v --format json` and writes the result into `volumeSizes`.
 - Right-click menu positions come from the panel root's bubbled `local_position`, divided by the window zoom and clamped/flipped inside the panel, like the file-editor fix.
 - Images and Volumes use one sort icon with a menu (Name / Size / Created) plus an **In use first** toggle; the tree builders receive `sortBy` and `inUseFirst`.
-- Every confirmation callback must use the confirm button's `cx`; a captured click context leaves the action stalled and the spinner toast running forever.
+- Every confirmation callback must use the confirm button's `cx`; a captured click context leaves the action stalled and the progress notification running forever.
 - Overlay dialogs/menus must stop clicks with `cx.stop_propagation()` inside `on_mouse_down`; `MouseButtonEvent` has no `stop_propagation`, and calling it leaves the backdrop to close the dialog.
 - Rows own right-click (`on_mouse_down("right")` + `cursor_context_menu()`); `uniform_list.on_item_secondary_click` does not reach them. Keep Images/Volumes/Networks as one scrollable row list under the subheader rather than a nested virtual list.
 - Volume backup and restore mount the target volume into a disposable `alpine:3` container; warn before backing up a volume attached to a running database container and refuse restore while any running container mounts the target volume.

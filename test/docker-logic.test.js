@@ -58,6 +58,7 @@ import {
   parseHcTerminalAddress,
   parseHcWaitResult,
   stripAnsiCodes,
+  isLightColor,
   parseDockerfileExpose,
   getDockerfileMenuItems,
   buildDockerfileBuildArgs,
@@ -325,6 +326,16 @@ test("parseHcWaitResult: reads ended and exit code", () => {
 test("stripAnsiCodes: removes color and progress escapes", () => {
   assert.equal(stripAnsiCodes("\u001b[32mok\u001b[0m"), "ok");
   assert.equal(stripAnsiCodes("plain"), "plain");
+});
+
+test("isLightColor: picks the matching spinner for the toast background", () => {
+  assert.equal(isLightColor("#ffffff"), true);
+  assert.equal(isLightColor("#fff"), true);
+  assert.equal(isLightColor("#f5f5f5"), true);
+  assert.equal(isLightColor("#000000"), false);
+  assert.equal(isLightColor("#1c1d21"), false);
+  assert.equal(isLightColor("#1c1d21ff"), false);
+  assert.equal(isLightColor(""), false);
 });
 
 test("buildContainerTree: compose ls-only project keeps its counts and actions", () => {

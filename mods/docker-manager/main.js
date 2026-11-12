@@ -24,6 +24,7 @@ import {
   theme,
   shared,
   notify,
+  closeOverlay,
   run,
   watchFolder,
   readTextFile,
@@ -66,6 +67,7 @@ import {
   parseHcTerminalAddress,
   parseHcWaitResult,
   stripAnsiCodes,
+  isLightColor,
   parseDockerfileExpose,
   getDockerfileMenuItems,
   buildDockerfileBuildArgs,
@@ -176,10 +178,8 @@ export default class DockerManager extends View {
         if (this.newPaneInstalled) cx.notify();
       })
       .catch(() => {});
-    this.busyCount = 0;
-    this.actionToast = null; // { label, terminal, seq } while one or more actions run
     this.actionSeq = 0;
-    this.busyTerminals = new Map(); // targetKey -> { address, label, seq }
+    this.busyToasts = new Map(); // targetKey -> { id, seq } for progress notifications
 
     // Inspector Tab Mode state (DM-44..46)
     this.inspectTabSubView = propsData?.inspect?.subView || "overview"; // overview | env | mounts | network | labels | stats | raw
@@ -2018,16 +2018,11 @@ export default class DockerManager extends View {
       const cloneLabel = `Cloning ${vol.name} → ${destVol}`;
       const seq = ++this.actionSeq;
       this.busyTargets.set(targetKey, `Cloning to ${destVol}`);
-      this.busyCount += 1;
-      this.actionToast = { label: cloneLabel, terminal: null, seq };
+      this.openProgressToast(targetKey, cloneLabel, seq, null, 660000);
       cx.notify();
 
       const attachTerminal = (address) => {
-        this.busyTerminals.set(targetKey, { address, label: cloneLabel, seq });
-        if (this.actionToast?.seq === seq) {
-          this.actionToast = { ...this.actionToast, terminal: address };
-          cx.notify();
-        }
+        this.openProgressToast(targetKey, cloneLabel, seq, address, 660000);
       };
 
       cx.spawn(async (cx) => {
@@ -2079,13 +2074,7 @@ export default class DockerManager extends View {
           });
         } finally {
           this.busyTargets.delete(targetKey);
-          this.busyTerminals.delete(targetKey);
-          if (this.busyCount > 0) this.busyCount--;
-          if (this.busyCount === 0) {
-            this.actionToast = null;
-          } else if (this.actionToast?.seq === seq) {
-            this.actionToast = { label: this.actionToast.label, terminal: null, seq: this.actionSeq };
-          }
+          this.closeProgressToast(targetKey, seq);
           this.refresh(cx);
           this.reloadInspectorIfNeeded(cx);
           cx.notify();
@@ -2104,9 +2093,10 @@ export default class DockerManager extends View {
       shared,
     });
     const key = `vol:${volName}`;
-    this.busyTargets.set(key, `Computing size for ${volName}`);
-    this.busyCount += 1;
-    this.actionToast = { label: `Computing size for ${volName}` };
+    const sizeLabel = `Computing size for ${volName}`;
+    const seq = ++this.actionSeq;
+    this.busyTargets.set(key, sizeLabel);
+    this.openProgressToast(key, sizeLabel, seq, null, 60000);
     cx.notify();
 
     cx.spawn(async (cx) => {
@@ -2134,8 +2124,7 @@ export default class DockerManager extends View {
         notify({ title: "Volume size failed", body: err.message, level: "error", timeout: 4000 });
       } finally {
         this.busyTargets.delete(key);
-        if (this.busyCount > 0) this.busyCount--;
-        if (this.busyCount === 0) this.actionToast = null;
+        this.closeProgressToast(key, seq);
         this.refresh(cx);
         cx.notify();
       }
@@ -2179,8 +2168,7 @@ export default class DockerManager extends View {
     const pruneLabel = "Pruning selected resources…";
     const seq = ++this.actionSeq;
     this.busyTargets.set("system:prune", "Pruning resources…");
-    this.busyCount += 1;
-    this.actionToast = { label: pruneLabel, terminal: null, seq };
+    this.openProgressToast("system:prune", pruneLabel, seq, null, 660000);
     cx.notify();
 
     const ctx = resolveDockerContext({
@@ -2198,11 +2186,7 @@ export default class DockerManager extends View {
         let result;
         try {
           result = await this.executeDockerAction(cmd.argv, ctx, 600000, (address) => {
-            this.busyTerminals.set("system:prune", { address, label: pruneLabel, seq });
-            if (this.actionToast?.seq === seq) {
-              this.actionToast = { ...this.actionToast, terminal: address };
-              cx.notify();
-            }
+            this.openProgressToast("system:prune", pruneLabel, seq, address, 660000);
           });
         } catch {
           errors++;
@@ -2212,16 +2196,7 @@ export default class DockerManager extends View {
         if (result.code !== 0) errors++;
       }
       this.busyTargets.delete("system:prune");
-      this.busyTerminals.delete("system:prune");
-      if (this.busyCount > 0) this.busyCount--;
-      if (this.busyCount === 0) {
-        this.actionToast = null;
-      } else if (this.actionToast?.seq === seq) {
-        const latest = Array.from(this.busyTerminals.values()).sort((a, b) => b.seq - a.seq)[0];
-        this.actionToast = latest
-          ? { label: latest.label, terminal: latest.address, seq: latest.seq }
-          : { label: this.actionToast.label, terminal: null, seq: this.actionSeq };
-      }
+      this.closeProgressToast("system:prune", seq);
       this.refresh(cx);
       notify({
         title: "Docker Prune Finished",
@@ -2232,20 +2207,16 @@ export default class DockerManager extends View {
     });
   }
 
-  /** Runs docker CLI argv in a hidden terminal, with busy spinner and error toast (DM-16). */
+  /** Runs docker CLI argv in a hidden terminal, with notifications through the toast mod (DM-16). */
   runDockerCmd(targetKey, actionLabel, argv, ctx, cx) {
     const seq = ++this.actionSeq;
     this.busyTargets.set(targetKey, actionLabel);
-    this.busyCount += 1;
-    this.actionToast = { label: actionLabel, terminal: null, seq };
     try {
       cx.notify();
     } catch (err) {
-      // A stale context must not leave the spinner toast running forever.
+      // A stale context must not leave the progress notification running forever.
       this.busyTargets.delete(targetKey);
-      this.busyTerminals.delete(targetKey);
-      if (this.busyCount > 0) this.busyCount--;
-      if (this.busyCount === 0) this.actionToast = null;
+      this.closeProgressToast(targetKey, seq);
       notify({
         title: "Docker action failed",
         body: err?.message || "The UI context was no longer available.",
@@ -2264,17 +2235,16 @@ export default class DockerManager extends View {
       a === "build" || a === "--build" || a === "pull" || a === "prune" || a === "df"
     );
     const timeout = isLongOp ? 600000 : 60000;
+    const toastTimeout = timeout + 30000;
+
+    this.openProgressToast(targetKey, actionLabel, seq, null, toastTimeout);
 
     cx.spawn(async (cx) => {
       let address = null;
       try {
         const result = await this.executeDockerAction(dockerArgv, ctx, timeout, (addr) => {
           address = addr;
-          this.busyTerminals.set(targetKey, { address: addr, label: actionLabel, seq });
-          if (this.actionToast?.seq === seq) {
-            this.actionToast = { ...this.actionToast, terminal: addr };
-            cx.notify();
-          }
+          this.openProgressToast(targetKey, actionLabel, seq, addr, toastTimeout);
         });
 
         if (result.code !== 0) {
@@ -2305,18 +2275,7 @@ export default class DockerManager extends View {
         });
       } finally {
         this.busyTargets.delete(targetKey);
-        this.busyTerminals.delete(targetKey);
-        if (this.busyCount > 0) this.busyCount--;
-        if (this.busyCount === 0) {
-          this.actionToast = null;
-        } else if (this.actionToast?.seq === seq) {
-          // Another action is still running; point the toast at the newest one
-          // that has a terminal instead of leaving it on a removed address.
-          const latest = Array.from(this.busyTerminals.values()).sort((a, b) => b.seq - a.seq)[0];
-          this.actionToast = latest
-            ? { label: latest.label, terminal: latest.address, seq: latest.seq }
-            : { label: this.actionToast.label, terminal: null, seq: this.actionSeq };
-        }
+        this.closeProgressToast(targetKey, seq);
         if (address) this.scheduleActionTerminalCleanup(address, cx);
         this.refresh(cx);
         this.reloadInspectorIfNeeded(cx);
@@ -2324,8 +2283,58 @@ export default class DockerManager extends View {
     });
   }
 
+  /** Spinner icon for the toast mod, contrasting with the toast background. */
+  progressToastIcon() {
+    return isLightColor(theme()?.popover)
+      ? "mods/docker-manager/icons/spinner-on-light.gif"
+      : "mods/docker-manager/icons/spinner-on-dark.gif";
+  }
+
   /**
-   * Runs one Docker command in a hidden `hc` terminal so the spinner toast can
+   * Opens or replaces a progress notification through `notify()`, so the
+   * installed toast mod (toast-edited) renders it. `action` is passed to the
+   * toast modal: its "Run action" button peeks the hidden terminal.
+   *
+   * @param {string} targetKey
+   * @param {string} label
+   * @param {number} seq
+   * @param {string | null} [address]
+   * @param {number} [timeout]
+   */
+  openProgressToast(targetKey, label, seq, address = null, timeout = 90000) {
+    const current = this.busyToasts.get(targetKey);
+    if (current?.id) {
+      try {
+        closeOverlay(current.id);
+      } catch {}
+    }
+    const id = notify({
+      title: label,
+      body: address ? "Running in the background · open, then Run action to peek" : "Working in the background…",
+      level: "info",
+      icon: this.progressToastIcon(),
+      timeout,
+      ...(address ? { action: { name: "terminal.peek", args: { terminal: address } } } : {}),
+    });
+    if (id) this.busyToasts.set(targetKey, { id, seq });
+    return id;
+  }
+
+  /** Closes the progress notification for one action unless a newer one replaced it. */
+  closeProgressToast(targetKey, seq) {
+    const current = this.busyToasts.get(targetKey);
+    if (!current) return;
+    if (seq != null && current.seq !== seq) return;
+    if (current.id) {
+      try {
+        closeOverlay(current.id);
+      } catch {}
+    }
+    this.busyToasts.delete(targetKey);
+  }
+
+  /**
+   * Runs one Docker command in a hidden `hc` terminal so the progress toast can
    * peek it. Falls back to `exec()` when the terminal cannot be created, which
    * keeps actions working if the `hc` API is unavailable.
    *
@@ -2414,7 +2423,7 @@ export default class DockerManager extends View {
   scheduleActionTerminalCleanup(address, cx) {
     cx.spawn(async (cx) => {
       try {
-        await cx.sleep(15000);
+        await cx.sleep(60000);
         const infoRes = await hc(["get", address, "--json"]);
         if ((infoRes.code ?? infoRes.exitCode) !== 0) {
           try {
@@ -4151,40 +4160,6 @@ export default class DockerManager extends View {
       );
   }
 
-  /** Floating progress toast: spinner + label; clicking peeks the hidden terminal running it. */
-  renderActionToast(t) {
-    const toast = this.actionToast;
-    if (!toast) return div();
-    return h_flex()
-      .id("docker-action-toast")
-      .absolute()
-      .right(12)
-      .bottom(12)
-      .h(32)
-      .px(10)
-      .gap(8)
-      .items_center()
-      .rounded(6)
-      .bg(toColor(t.popover))
-      .border_1()
-      .border_color(toColor(t.border))
-      .shadow_md()
-      .when(Boolean(toast.terminal), (el) =>
-        el
-          .cursor_pointer()
-          .tooltip("Peek the terminal running this command")
-          .hover((s) => s.bg(toColor(t.hover)))
-          .on_click(() => run("terminal.peek", { terminal: toast.terminal }))
-      )
-      .child(svg("mods/docker-manager/icons/spinner.svg").size(14).text_color(toColor(t.accent)).spin(900))
-      .child(div().text_size(11).text_color(toColor(t.foreground)).child(toast.label || "Working…"))
-      .when(Boolean(toast.terminal), (el) =>
-        el
-          .child(svg("mods/docker-manager/icons/terminal.svg").size(11).text_color(toColor(t.dim)))
-          .child(div().text_size(9).text_color(toColor(t.dim)).child("peek"))
-      );
-  }
-
   /** In-panel context menu overlay (DM-14, DM-50..73, DESIGN §5.4) */
   renderContextMenu(t, cx) {
     const menu = this.contextMenu;
@@ -5280,8 +5255,7 @@ export default class DockerManager extends View {
       // must be mounted here too; otherwise Run/Tag/Backup/Restore/Clone set
       // state but no modal is ever drawn.
       .when(Boolean(this.imageDialog), (el) => el.child(this.renderImageDialog(t, cx)))
-      .when(Boolean(this.volumeDialog), (el) => el.child(this.renderVolumeDialog(t, cx)))
-      .when(Boolean(this.actionToast), (el) => el.child(this.renderActionToast(t)));
+      .when(Boolean(this.volumeDialog), (el) => el.child(this.renderVolumeDialog(t, cx)));
   }
 
   renderInspectSubView(kind, targetId, t, cx, el) {
@@ -7582,7 +7556,6 @@ export default class DockerManager extends View {
       .when(Boolean(this.imageDialog), (el) => el.child(this.renderImageDialog(t, cx)))
       .when(Boolean(this.volumeDialog), (el) => el.child(this.renderVolumeDialog(t, cx)))
       .when(Boolean(this.toolbarMenuOpen), (el) => el.child(this.renderToolbarMenu(t, cx)))
-      .when(Boolean(this.sortMenuOpen), (el) => el.child(this.renderSortMenu(t, cx)))
-      .when(Boolean(this.actionToast), (el) => el.child(this.renderActionToast(t)));
+      .when(Boolean(this.sortMenuOpen), (el) => el.child(this.renderSortMenu(t, cx)));
   }
 }

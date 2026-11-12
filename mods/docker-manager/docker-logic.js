@@ -621,6 +621,23 @@ export function parseHcTerminalAddress(stdout) {
 }
 
 /**
+ * Whether a `#rrggbb` theme color is light enough to need a dark icon.
+ *
+ * @param {string} color
+ * @returns {boolean}
+ */
+export function isLightColor(color) {
+  const raw = String(color || "").trim().replace(/^#/, "");
+  const full = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw.slice(0, 6);
+  if (!/^[0-9a-f]{6}$/i.test(full)) return false;
+  const value = parseInt(full, 16);
+  const r = ((value >> 16) & 255) / 255;
+  const g = ((value >> 8) & 255) / 255;
+  const b = (value & 255) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5;
+}
+
+/**
  * Removes ANSI CSI escape sequences from terminal output before it is shown in
  * a notification body or matched by the reclaim regex.
  *
