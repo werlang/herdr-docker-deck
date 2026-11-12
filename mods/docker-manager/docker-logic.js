@@ -2239,7 +2239,7 @@ export function isAnonymousVolume(volumeName) {
  * @param {{ filter?: string, sortBy?: "name" | "size" | "created" }} options
  * @returns {{ images: Array<object>, dangling: Array<object>, totalCount: number, inUseCount: number }}
  */
-export function buildImageTree(imagesRaw = [], containersRaw = [], { filter = "", sortBy = "name" } = {}) {
+export function buildImageTree(imagesRaw = [], containersRaw = [], { filter = "", sortBy = "name", inUseFirst = false } = {}) {
   const imagesList = Array.isArray(imagesRaw) ? imagesRaw : [];
   const containersList = Array.isArray(containersRaw) ? containersRaw : [];
 
@@ -2343,8 +2343,12 @@ export function buildImageTree(imagesRaw = [], containersRaw = [], { filter = ""
     return (a.name || "").localeCompare(b.name || "");
   };
 
-  taggedList.sort(sortFn);
-  danglingList.sort(sortFn);
+  const compare = (a, b) => {
+    if (inUseFirst && a.inUse !== b.inUse) return a.inUse ? -1 : 1;
+    return sortFn(a, b);
+  };
+  taggedList.sort(compare);
+  danglingList.sort(compare);
 
   const totalCount = taggedList.length + danglingList.length;
   const inUseCount = taggedList.filter((i) => i.inUse).length + danglingList.filter((i) => i.inUse).length;
@@ -2441,7 +2445,7 @@ export function buildVolumeTree(
   volumesRaw = [],
   containersRaw = [],
   volumeSizes = {},
-  { scope = "all", spaceProjects = [], filter = "" } = {}
+  { scope = "all", spaceProjects = [], filter = "", sortBy = "name", inUseFirst = false } = {}
 ) {
   const volumesList = Array.isArray(volumesRaw) ? volumesRaw : [];
   const containersList = Array.isArray(containersRaw) ? containersRaw : [];
@@ -2461,6 +2465,7 @@ export function buildVolumeTree(
     const isAnon = isAnonymousVolume(name);
     const size = volumeSizes[name] || v.Size || null;
     const sizeBytes = size ? parseDockerSizeBytes(size) : 0;
+    const createdAt = v.CreatedAt || v.createdAt || "";
 
     // Cross-reference containers
     const using = [];
@@ -2526,6 +2531,7 @@ export function buildVolumeTree(
       isAnonymous: isAnon,
       size,
       sizeBytes,
+      createdAt,
       inUse,
       usedByRunningContainer,
       usedByContainers: using,
@@ -2538,8 +2544,14 @@ export function buildVolumeTree(
   const namedList = processed.filter((v) => !v.isAnonymous);
   const anonList = processed.filter((v) => v.isAnonymous);
 
-  namedList.sort((a, b) => a.name.localeCompare(b.name));
-  anonList.sort((a, b) => a.name.localeCompare(b.name));
+  const sortVolumes = (a, b) => {
+    if (inUseFirst && a.inUse !== b.inUse) return a.inUse ? -1 : 1;
+    if (sortBy === "size") return b.sizeBytes - a.sizeBytes;
+    if (sortBy === "created") return (b.createdAt || "").localeCompare(a.createdAt || "");
+    return a.name.localeCompare(b.name);
+  };
+  namedList.sort(sortVolumes);
+  anonList.sort(sortVolumes);
 
   const totalCount = namedList.length + anonList.length;
   const inUseCount = namedList.filter((v) => v.inUse).length + anonList.filter((v) => v.inUse).length;

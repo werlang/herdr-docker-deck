@@ -204,6 +204,10 @@ export default class DockerManager extends View {
     this.systemDfLoading = false;
     this.volumeSizes = {};
     this.imageSortBy = "name"; // "name" | "size" | "created"
+    this.volumeSortBy = "name"; // "name" | "size" | "created"
+    this.imageInUseFirst = false;
+    this.volumeInUseFirst = false;
+    this.sortMenuOpen = null; // "images" | "volumes" | null
     this.engineInfoRaw = null;
     this.granularPruneSelections = {
       containers: false,
@@ -5851,6 +5855,97 @@ export default class DockerManager extends View {
       );
   }
 
+  /** Single sort icon used by Images and Volumes. */
+  renderSortButton(section, t, cx) {
+    const open = this.sortMenuOpen === section;
+    return h_flex()
+      .h(22)
+      .px(6)
+      .rounded(3)
+      .items_center()
+      .tooltip(section === "images" ? "Sort images" : "Sort volumes")
+      .when(open, (el) => el.bg(toColor(t.raised)).text_color(toColor(t.accent)))
+      .when(!open, (el) =>
+        el.text_color(toColor(t.muted)).hover((s) => s.bg(toColor(t.hover)).text_color(toColor(t.foreground)))
+      )
+      .on_click((_e, cx2) => {
+        this.sortMenuOpen = open ? null : section;
+        cx2.notify();
+      })
+      .child(svg("mods/docker-manager/icons/sort.svg").size(12));
+  }
+
+  /** Sort options for Images/Volumes, including the in-use-first toggle. */
+  renderSortMenu(t, cx) {
+    const section = this.sortMenuOpen;
+    if (!section) return div();
+    const isImages = section === "images";
+    const sortBy = isImages ? this.imageSortBy : this.volumeSortBy;
+    const inUseFirst = isImages ? this.imageInUseFirst : this.volumeInUseFirst;
+
+    const pickSort = (by) => {
+      if (isImages) this.imageSortBy = by;
+      else this.volumeSortBy = by;
+      this.sortMenuOpen = null;
+    };
+    const toggleInUse = () => {
+      if (isImages) this.imageInUseFirst = !this.imageInUseFirst;
+      else this.volumeInUseFirst = !this.volumeInUseFirst;
+      this.sortMenuOpen = null;
+    };
+    const item = (label, active, onPick) =>
+      h_flex()
+        .h(24)
+        .w_full()
+        .px(8)
+        .rounded(3)
+        .items_center()
+        .justify_between()
+        .hover((s) => s.bg(toColor(t.hover)))
+        .on_click((_e, cx2) => {
+          onPick();
+          cx2.notify();
+        })
+        .child(div().text_size(11).text_color(toColor(t.foreground)).child(label))
+        .when(active, (el) => el.child(svg("mods/docker-manager/icons/check.svg").size(11).text_color(toColor(t.accent))));
+
+    return h_flex()
+      .id("docker-sort-backdrop")
+      .absolute()
+      .inset_0()
+      .on_mouse_down("left", (_e, cx2) => {
+        this.sortMenuOpen = null;
+        cx2.notify();
+      })
+      .on_mouse_down("right", (_e, cx2) => {
+        this.sortMenuOpen = null;
+        cx2.notify();
+      })
+      .child(
+        v_flex()
+          .id("docker-sort-menu")
+          .absolute()
+          .top(130)
+          .right(8)
+          .w(190)
+          .p(4)
+          .gap(1)
+          .rounded(6)
+          .bg(toColor(t.popover))
+          .border_1()
+          .border_color(toColor(t.border))
+          .shadow_md()
+          .on_mouse_down("left", (_e, cx2) => cx2.stop_propagation())
+          .on_mouse_down("right", (_e, cx2) => cx2.stop_propagation())
+          .child(div().px(8).py(4).text_size(10).text_color(toColor(t.dim)).child(isImages ? "Sort images" : "Sort volumes"))
+          .child(item("Name", sortBy === "name", () => pickSort("name")))
+          .child(item("Size", sortBy === "size", () => pickSort("size")))
+          .child(item("Created", sortBy === "created", () => pickSort("created")))
+          .child(div().my(2).h(1).bg(toColor(t.border)))
+          .child(item("In use first", inUseFirst, toggleInUse))
+      );
+  }
+
   renderContainersSection(t, ctx, cx) {
     const tree = buildContainerTree({
       containers: this.containersRaw,
@@ -5893,6 +5988,7 @@ export default class DockerManager extends View {
     const tree = buildImageTree(this.imagesRaw, this.containersRaw, {
       filter: this.filterQuery,
       sortBy: this.imageSortBy || "name",
+      inUseFirst: this.imageInUseFirst,
     });
     const rows = this.flattenImageTree(tree);
     for (const r of rows) this.rowByKey.set(r.key, r);
@@ -5933,55 +6029,8 @@ export default class DockerManager extends View {
             h_flex()
               .items_center()
               .gap(4)
-              // Sort buttons
-              .child(
-                h_flex()
-                  .items_center()
-                  .gap(2)
-                  .child(div().text_size(10).text_color(toColor(t.dim)).child("Sort:"))
-                  .child(
-                    div()
-                      .px(4)
-                      .py(1)
-                      .rounded(2)
-                      .text_size(10)
-                      .when(this.imageSortBy === "name", (s) => s.bg(toColor(t.raised)).text_color(toColor(t.accent)).font_semibold())
-                      .when(this.imageSortBy !== "name", (s) => s.text_color(toColor(t.muted)).hover((h) => h.bg(toColor(t.hover))))
-                      .on_click((_e, cx) => {
-                        this.imageSortBy = "name";
-                        cx.notify();
-                      })
-                      .child("Name")
-                  )
-                  .child(
-                    div()
-                      .px(4)
-                      .py(1)
-                      .rounded(2)
-                      .text_size(10)
-                      .when(this.imageSortBy === "size", (s) => s.bg(toColor(t.raised)).text_color(toColor(t.accent)).font_semibold())
-                      .when(this.imageSortBy !== "size", (s) => s.text_color(toColor(t.muted)).hover((h) => h.bg(toColor(t.hover))))
-                      .on_click((_e, cx) => {
-                        this.imageSortBy = "size";
-                        cx.notify();
-                      })
-                      .child("Size")
-                  )
-                  .child(
-                    div()
-                      .px(4)
-                      .py(1)
-                      .rounded(2)
-                      .text_size(10)
-                      .when(this.imageSortBy === "created", (s) => s.bg(toColor(t.raised)).text_color(toColor(t.accent)).font_semibold())
-                      .when(this.imageSortBy !== "created", (s) => s.text_color(toColor(t.muted)).hover((h) => h.bg(toColor(t.hover))))
-                      .on_click((_e, cx) => {
-                        this.imageSortBy = "created";
-                        cx.notify();
-                      })
-                      .child("Created")
-                  )
-              )
+              // One sort icon; options live in a small menu.
+              .child(this.renderSortButton("images", t, cx))
               // Prune Dangling
               .child(
                 h_flex()
@@ -6067,6 +6116,8 @@ export default class DockerManager extends View {
       scope: this.scope,
       spaceProjects,
       filter: this.filterQuery,
+      sortBy: this.volumeSortBy || "name",
+      inUseFirst: this.volumeInUseFirst,
     });
     const rows = this.flattenVolumeTree(tree);
     for (const r of rows) this.rowByKey.set(r.key, r);
@@ -6107,6 +6158,7 @@ export default class DockerManager extends View {
             h_flex()
               .items_center()
               .gap(4)
+              .child(this.renderSortButton("volumes", t, cx))
               // Compute sizes
               .child(
                 h_flex()
@@ -7171,6 +7223,7 @@ export default class DockerManager extends View {
       .when(Boolean(this.imageDialog), (el) => el.child(this.renderImageDialog(t, cx)))
       .when(Boolean(this.volumeDialog), (el) => el.child(this.renderVolumeDialog(t, cx)))
       .when(Boolean(this.toolbarMenuOpen), (el) => el.child(this.renderToolbarMenu(t, cx)))
+      .when(Boolean(this.sortMenuOpen), (el) => el.child(this.renderSortMenu(t, cx)))
       .when(Boolean(this.actionToast), (el) => el.child(this.renderActionToast(t)));
   }
 }
