@@ -197,6 +197,8 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 | Builder prune (`DM-122`) | `["builder", "prune", "-f", ...(olderThan7d ? ["--filter", "until=168h"] : [])]` |
 | Engine info (`DM-123`) | `["info", "--format", "{{json .}}"]` |
 
+Volume clone and granular prune also use the hidden-terminal path, so their spinner toast is peekable. `docker system df -v` (size check) stays on `exec` because its structured JSON must not be wrapped by a PTY.
+
 ---
 
 ## 5. Polling, Concurrency & GPUI Invariants

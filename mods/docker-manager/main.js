@@ -2015,20 +2015,32 @@ export default class DockerManager extends View {
       });
 
       const targetKey = `vol:${vol.name}`;
+      const cloneLabel = `Cloning ${vol.name} → ${destVol}`;
+      const seq = ++this.actionSeq;
       this.busyTargets.set(targetKey, `Cloning to ${destVol}`);
       this.busyCount += 1;
-      this.actionToast = { label: `Cloning ${vol.name} → ${destVol}` };
+      this.actionToast = { label: cloneLabel, terminal: null, seq };
       cx.notify();
+
+      const attachTerminal = (address) => {
+        this.busyTerminals.set(targetKey, { address, label: cloneLabel, seq });
+        if (this.actionToast?.seq === seq) {
+          this.actionToast = { ...this.actionToast, terminal: address };
+          cx.notify();
+        }
+      };
 
       cx.spawn(async (cx) => {
         try {
-          const createRes = await exec("docker", cloneSpec.createArgs, { on: ctx.on, timeout: 30000 });
-          if ((createRes.code ?? createRes.exitCode) !== 0) {
-            const err = (createRes.stderr || createRes.stdout || "Volume creation failed").trim();
+          const createRes = await this.executeDockerAction(cloneSpec.createArgs, ctx, 30000, attachTerminal);
+          if (createRes.address) this.scheduleActionTerminalCleanup(createRes.address, cx);
+          if (createRes.code !== 0) {
+            const err = (createRes.output || "Volume creation failed").trim();
             this.lastErrorText = err;
+            const lines = err.split("\n").filter((line) => line.trim().length > 0);
             notify({
               title: "Volume Clone Failed",
-              body: err.split("\n").slice(0, 3).join("\n"),
+              body: (createRes.address ? lines.slice(-3) : lines.slice(0, 3)).join("\n"),
               level: "error",
               timeout: 4000,
             });
@@ -2037,8 +2049,9 @@ export default class DockerManager extends View {
             return;
           }
 
-          const copyRes = await exec("docker", cloneSpec.copyArgs, { on: ctx.on, timeout: 600000 });
-          if ((copyRes.code ?? copyRes.exitCode) === 0) {
+          const copyRes = await this.executeDockerAction(cloneSpec.copyArgs, ctx, 600000, attachTerminal);
+          if (copyRes.address) this.scheduleActionTerminalCleanup(copyRes.address, cx);
+          if (copyRes.code === 0) {
             notify({
               title: "Volume Cloned",
               body: `Volume "${vol.name}" cloned to "${destVol}" successfully`,
@@ -2046,11 +2059,12 @@ export default class DockerManager extends View {
             });
             this.refresh(cx);
           } else {
-            const err = (copyRes.stderr || copyRes.stdout || "Data copy failed").trim();
+            const err = (copyRes.output || "Data copy failed").trim();
             this.lastErrorText = err;
+            const lines = err.split("\n").filter((line) => line.trim().length > 0);
             notify({
               title: "Volume Copy Failed",
-              body: err.split("\n").slice(0, 3).join("\n"),
+              body: (copyRes.address ? lines.slice(-3) : lines.slice(0, 3)).join("\n"),
               level: "error",
               timeout: 4000,
             });
@@ -2065,8 +2079,13 @@ export default class DockerManager extends View {
           });
         } finally {
           this.busyTargets.delete(targetKey);
+          this.busyTerminals.delete(targetKey);
           if (this.busyCount > 0) this.busyCount--;
-          if (this.busyCount === 0) this.actionToast = null;
+          if (this.busyCount === 0) {
+            this.actionToast = null;
+          } else if (this.actionToast?.seq === seq) {
+            this.actionToast = { label: this.actionToast.label, terminal: null, seq: this.actionSeq };
+          }
           this.refresh(cx);
           this.reloadInspectorIfNeeded(cx);
           cx.notify();
@@ -2157,9 +2176,11 @@ export default class DockerManager extends View {
     const plan = buildGranularPrunePlan(this.granularPruneSelections);
     if (plan.commands.length === 0) return;
 
+    const pruneLabel = "Pruning selected resources…";
+    const seq = ++this.actionSeq;
     this.busyTargets.set("system:prune", "Pruning resources…");
     this.busyCount += 1;
-    this.actionToast = { label: "Pruning selected resources…" };
+    this.actionToast = { label: pruneLabel, terminal: null, seq };
     cx.notify();
 
     const ctx = resolveDockerContext({
@@ -2174,18 +2195,33 @@ export default class DockerManager extends View {
     cx.spawn(async (cx) => {
       let errors = 0;
       for (const cmd of plan.commands) {
+        let result;
         try {
-          const res = await exec("docker", cmd.argv, { on: ctx.on, timeout: 600000 });
-          if ((res.code ?? res.exitCode) !== 0) {
-            errors++;
-          }
+          result = await this.executeDockerAction(cmd.argv, ctx, 600000, (address) => {
+            this.busyTerminals.set("system:prune", { address, label: pruneLabel, seq });
+            if (this.actionToast?.seq === seq) {
+              this.actionToast = { ...this.actionToast, terminal: address };
+              cx.notify();
+            }
+          });
         } catch {
           errors++;
+          continue;
         }
+        if (result.address) this.scheduleActionTerminalCleanup(result.address, cx);
+        if (result.code !== 0) errors++;
       }
       this.busyTargets.delete("system:prune");
+      this.busyTerminals.delete("system:prune");
       if (this.busyCount > 0) this.busyCount--;
-      if (this.busyCount === 0) this.actionToast = null;
+      if (this.busyCount === 0) {
+        this.actionToast = null;
+      } else if (this.actionToast?.seq === seq) {
+        const latest = Array.from(this.busyTerminals.values()).sort((a, b) => b.seq - a.seq)[0];
+        this.actionToast = latest
+          ? { label: latest.label, terminal: latest.address, seq: latest.seq }
+          : { label: this.actionToast.label, terminal: null, seq: this.actionSeq };
+      }
       this.refresh(cx);
       notify({
         title: "Docker Prune Finished",
@@ -4115,7 +4151,7 @@ export default class DockerManager extends View {
       );
   }
 
-  /** Floating progress toast: every async action shows a spinner and its label. */
+  /** Floating progress toast: spinner + label; clicking peeks the hidden terminal running it. */
   renderActionToast(t) {
     const toast = this.actionToast;
     if (!toast) return div();
