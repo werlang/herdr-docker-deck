@@ -140,7 +140,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 |---|---|
 | DM-44 | `Inspect` (context menu, double-click, or ⤢ in the drawer) opens a Herdr tab `tab.new { mod: "docker-manager", props: { inspect: { kind, id, project?, service? } } }`, reused when the same target is already open. |
 | DM-45 | Sub-views: **Overview** (DM-41 data), **Environment** (sorted table; values of keys matching `PASS|SECRET|TOKEN|KEY|PRIVATE|CREDENTIAL` masked with a reveal toggle), **Mounts**, **Network**, **Labels**, **Stats** (CPU %, mem usage/limit, net I/O, block I/O, PIDs from `docker stats --no-stream`, refreshed every 3 s while visible), **Raw JSON** (pretty `docker inspect` output, copy button). |
-| DM-46 | Header actions: Start/Stop/Restart, Logs, Shell, Refresh, Copy ID. The tab follows the container across recreation when it is a Compose service (re-resolves by project + service). |
+| DM-46 | Header actions: Start/Stop/Restart, Logs, Shell, Refresh, Copy ID, plus standard split-right/split-down/zoom/close. Splitting opens another **inspector pane** in the same tab (editor-style), never a terminal or a new tab. The tab follows the container across recreation when it is a Compose service (re-resolves by project + service). |
 
 ---
 
