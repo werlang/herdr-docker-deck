@@ -46,7 +46,10 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - Compose actions run from the project working directory, not the space root; otherwise `docker compose` can fall back to a default `compose.yaml`.
 - The inspector tab mounts its own dialog overlays (Run/Tag/Backup/Restore/Clone) and reloads its target after actions, so Stop turns into Start.
 - Async actions show a floating spinner toast; the action never blocks the UI.
+- Destructive confirm closures must receive the confirm button's `cx`; a zero-arg closure leaves `runAction` without a context and the action never starts.
+- Single-volume **Compute Size** parses `docker system df -v --format json` and writes the result into `volumeSizes`.
 - Right-click menu positions come from the panel root's bubbled `local_position`, divided by the window zoom and clamped/flipped inside the panel, like the file-editor fix.
+- Every confirmation callback must use the confirm button's `cx`; a captured click context leaves the action stalled and the spinner toast running forever.
 - Overlay dialogs/menus must stop clicks with `cx.stop_propagation()` inside `on_mouse_down`; `MouseButtonEvent` has no `stop_propagation`, and calling it leaves the backdrop to close the dialog.
 - Rows own right-click (`on_mouse_down("right")` + `cursor_context_menu()`); `uniform_list.on_item_secondary_click` does not reach them. Keep Images/Volumes/Networks as one scrollable row list under the subheader rather than a nested virtual list.
 - Volume backup and restore mount the target volume into a disposable `alpine:3` container; warn before backing up a volume attached to a running database container and refuse restore while any running container mounts the target volume.

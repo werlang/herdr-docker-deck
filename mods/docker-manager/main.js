@@ -1472,7 +1472,8 @@ export default class DockerManager extends View {
         ...spec,
         // Keep the data, never the event context: the confirm click happens in another call and
         // a stashed cx is stale by then (gpui-kit: a cx is valid for the call that made it).
-        confirmAction: () => this.runAction(item.id, row, isAlt),
+        // The confirm button passes its own cx into this closure.
+        confirmAction: (confirmCx) => this.runAction(item.id, row, isAlt, confirmCx),
       };
       cx.notify();
       return;
@@ -1994,7 +1995,43 @@ export default class DockerManager extends View {
       focused: focused(),
       shared,
     });
-    this.runDockerCmd(`vol:${volName}`, `Computing size for ${volName}`, ["system", "df", "-v", "--format", "json"], ctx, cx);
+    const key = `vol:${volName}`;
+    this.busyTargets.set(key, `Computing size for ${volName}`);
+    this.busyCount += 1;
+    this.actionToast = { label: `Computing size for ${volName}` };
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("docker", ["system", "df", "-v", "--format", "json"], {
+          on: ctx.on,
+          timeout: 25000,
+        });
+        if ((res.code ?? res.exitCode) === 0) {
+          const parsed = parseSystemDfVerbose(res.stdout);
+          this.systemDfVerbose = parsed;
+          Object.assign(this.volumeSizes, parsed.volumeSizes);
+          const size = parsed.volumeSizes[volName];
+          notify({
+            title: "Volume size",
+            body: size ? `${volName}: ${size}` : `${volName}: size not reported by Docker`,
+            level: size ? "success" : "warning",
+            timeout: 4000,
+          });
+        } else {
+          const err = (res.stderr || res.stdout || "docker system df -v failed").trim();
+          notify({ title: "Volume size failed", body: err.split("\n").slice(0, 3).join("\n"), level: "error", timeout: 4000 });
+        }
+      } catch (err) {
+        notify({ title: "Volume size failed", body: err.message, level: "error", timeout: 4000 });
+      } finally {
+        this.busyTargets.delete(key);
+        if (this.busyCount > 0) this.busyCount--;
+        if (this.busyCount === 0) this.actionToast = null;
+        this.refresh(cx);
+        cx.notify();
+      }
+    });
   }
 
   runVerboseSizeCheck(cx) {
@@ -2075,7 +2112,21 @@ export default class DockerManager extends View {
     this.busyTargets.set(targetKey, actionLabel);
     this.busyCount += 1;
     this.actionToast = { label: actionLabel };
-    cx.notify();
+    try {
+      cx.notify();
+    } catch (err) {
+      // A stale context must not leave the spinner toast running forever.
+      this.busyTargets.delete(targetKey);
+      if (this.busyCount > 0) this.busyCount--;
+      if (this.busyCount === 0) this.actionToast = null;
+      notify({
+        title: "Docker action failed",
+        body: err?.message || "The UI context was no longer available.",
+        level: "error",
+        timeout: 4000,
+      });
+      return;
+    }
 
     // Some builders return ["docker", ...] (they are shared with terminal.open, which needs the
     // full command) and some return arguments only. Normalise here: exec() always adds "docker",
@@ -5949,7 +6000,7 @@ export default class DockerManager extends View {
                     });
                     this.promptConfirm(
                       spec,
-                      () => this.runDockerCmd("images:prune-dangling", "Pruning dangling images", ["image", "prune", "-f"], ctx, cx),
+                      (confirmCx) => this.runDockerCmd("images:prune-dangling", "Pruning dangling images", ["image", "prune", "-f"], ctx, confirmCx),
                       cx
                     );
                   })
@@ -5974,7 +6025,7 @@ export default class DockerManager extends View {
                     });
                     this.promptConfirm(
                       spec,
-                      () => this.runDockerCmd("images:prune-unused", "Pruning unused images", ["image", "prune", "-a", "-f"], ctx, cx),
+                      (confirmCx) => this.runDockerCmd("images:prune-unused", "Pruning unused images", ["image", "prune", "-a", "-f"], ctx, confirmCx),
                       cx
                     );
                   })
@@ -6095,7 +6146,7 @@ export default class DockerManager extends View {
                     });
                     this.promptConfirm(
                       spec,
-                      () => this.runDockerCmd("volumes:prune", "Pruning unused volumes", ["volume", "prune", "-f"], ctx, cx),
+                      (confirmCx) => this.runDockerCmd("volumes:prune", "Pruning unused volumes", ["volume", "prune", "-f"], ctx, confirmCx),
                       cx
                     );
                   })
@@ -6180,7 +6231,7 @@ export default class DockerManager extends View {
                 const spec = buildConfirmationSpec("prune-networks");
                 this.promptConfirm(
                   spec,
-                  () => this.runDockerCmd("networks:prune", "Pruning unused networks", ["network", "prune", "-f"], ctx, cx),
+                  (confirmCx) => this.runDockerCmd("networks:prune", "Pruning unused networks", ["network", "prune", "-f"], ctx, confirmCx),
                   cx
                 );
               })
@@ -6532,7 +6583,7 @@ export default class DockerManager extends View {
                               plan,
                               requiresTypedConfirm: plan.requiresTypedConfirm,
                             });
-                            this.promptConfirm(spec, () => this.runGranularPrune(cx), cx);
+                            this.promptConfirm(spec, (confirmCx) => this.runGranularPrune(confirmCx), cx);
                           })
                           .child(svg("mods/docker-manager/icons/trash.svg").size(11).text_color(toColor(t.solid_foreground)))
                           .child(
