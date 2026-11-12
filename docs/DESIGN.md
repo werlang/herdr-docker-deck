@@ -160,19 +160,21 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 
 | Action | `argv` | Execution Mode |
 |---|---|---|
-| Project Up | `[...composeTarget, "up", "-d"]` | Background `exec` (or terminal if from file header `DM-92`) |
-| Project Up (build) | `[...composeTarget, "up", "-d", "--build"]` | Terminal (`terminal.open`) or background `exec` |
-| Project Start / Stop / Restart | `[...composeTarget, "start" \| "stop" \| "restart"]` | Background `exec` |
-| Project Down | `[...composeTarget, "down"]` | Background `exec` (after confirm `DM-58`) |
-| Project Down + Volumes | `[...composeTarget, "down", "-v"]` | Background `exec` (after typed confirm `DM-59`) |
-| Service Start / Stop / Restart | `[...composeTarget, "start" \| "stop" \| "restart", service]` | Background `exec` |
-| Service Up | `[...composeTarget, "up", "-d", service]` | Background `exec` |
-| Service Rebuild (`DM-62`) | `[...composeTarget, "up", "-d", "--build", "--force-recreate", "--no-deps", service]` | Background `exec` + progress toast (or terminal) |
-| Service Recreate (`DM-63`) | `[...composeTarget, "up", "-d", "--force-recreate", "--no-deps", service]` | Background `exec` |
-| Service Remove (`DM-69`) | `[...composeTarget, "rm", "-s", "-f", service]` | Background `exec` (after confirm) |
+| Project Up | `[...composeTarget, "up", "-d"]` | Hidden terminal (`hc`, peekable) |
+| Project Up (build) | `[...composeTarget, "up", "-d", "--build"]` | Hidden terminal (`hc`, peekable) |
+| Project Start / Stop / Restart | `[...composeTarget, "start" \| "stop" \| "restart"]` | Hidden terminal (`hc`, peekable) |
+| Project Down | `[...composeTarget, "down"]` | Hidden terminal (`hc`, peekable; after confirm `DM-58`) |
+| Project Down + Volumes | `[...composeTarget, "down", "-v"]` | Hidden terminal (`hc`, peekable; after typed confirm `DM-59`) |
+| Service Start / Stop / Restart | `[...composeTarget, "start" \| "stop" \| "restart", service]` | Hidden terminal (`hc`, peekable) |
+| Service Up | `[...composeTarget, "up", "-d", service]` | Hidden terminal (`hc`, peekable) |
+| Service Rebuild (`DM-62`) | `[...composeTarget, "up", "-d", "--build", "--force-recreate", "--no-deps", service]` | Hidden terminal + progress toast (`hc`, peekable) |
+| Service Recreate (`DM-63`) | `[...composeTarget, "up", "-d", "--force-recreate", "--no-deps", service]` | Hidden terminal (`hc`, peekable) |
+| Service Remove (`DM-69`) | `[...composeTarget, "rm", "-s", "-f", service]` | Hidden terminal (`hc`, peekable; after confirm) |
 | Service Logs (`DM-80`) | `["docker", ...composeTarget, "logs", "-f", "--tail", String(tail), service]` | `terminal.open` |
 | Container Logs (`DM-80`) | `["docker", "logs", "-f", "--tail", String(tail), containerId]` | `terminal.open` |
 | Container Shell (`DM-81`) | `["docker", "exec", "-it", containerId, "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]` | `terminal.open` |
+
+**Peekable background actions (`DM-16`)**: actions marked *Hidden terminal* start with `hc run --bg --json --no-parent` (no `herdr.space`/`herdr.tab` labels, so they stay out of the tab strip), are followed with `hc wait --json`, and their final screen is read with `hc read`. The floating spinner toast stores that address: clicking it runs `terminal.peek`. Finished terminals are removed after a 15 s grace period unless the user kept them as tabs. If the terminal cannot be created, the action falls back to `exec`.
 
 ### 4.6 Images, Volumes, Networks & Hygiene Commands
 

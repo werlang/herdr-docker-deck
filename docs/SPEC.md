@@ -85,7 +85,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 | DM-13 | Tree and section rows render from one stable row list inside a scroll container, so the whole section scrolls smoothly without virtualization gaps. |
 | DM-14 | Every row has a hover state, a selected state, and a right-click context menu (§7). Double-click on a container/service row opens the inspector tab. |
 | DM-15 | **Engine unavailable** empty state: explains whether the CLI is missing or the daemon is unreachable, with **Retry** and, on macOS, **Start Docker Desktop** (`open -a Docker`). |
-| DM-16 | Long or slow operations show a row spinner (native `.spin()`), never block the UI thread, and report failures with a toast containing the first lines of stderr plus a "Copy full error" action. |
+| DM-16 | Long or slow operations show a row spinner (native `.spin()`), never block the UI thread, and report failures with a toast containing the first lines of stderr plus a "Copy full error" action. Background Docker actions run in a hidden terminal; while one runs, the floating spinner toast is clickable and peeks that terminal (`terminal.peek`). |
 
 ---
 
@@ -140,7 +140,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 |---|---|
 | DM-44 | `Inspect` (context menu, double-click, or ⤢ in the drawer) opens a Herdr tab `tab.new { mod: "docker-manager", props: { inspect: { kind, id, project?, service? } } }`, reused when the same target is already open. |
 | DM-45 | Sub-views: **Overview** (DM-41 data), **Environment** (sorted table; values of keys matching `PASS|SECRET|TOKEN|KEY|PRIVATE|CREDENTIAL` masked with a reveal toggle), **Mounts**, **Network**, **Labels**, **Stats** (CPU %, mem usage/limit, net I/O, block I/O, PIDs from `docker stats --no-stream`, refreshed every 3 s while visible), **Raw JSON** (pretty `docker inspect` output, copy button). |
-| DM-46 | Header actions: Start/Stop/Restart, Logs, Shell, Refresh, Copy ID, plus standard split-right/split-down/zoom/close. Splitting opens another **inspector pane** in the same tab (editor-style), never a terminal or a new tab. The tab follows the container across recreation when it is a Compose service (re-resolves by project + service). |
+| DM-46 | Header actions: Start/Stop/Restart, Logs, Shell, Refresh, Copy ID, plus standard split-right/split-down/zoom/close. Splitting opens the standard **New pane chooser** in a new pane of the same tab (terminal or an installed agent); without `new-pane`, a terminal. The tab follows the container across recreation when it is a Compose service (re-resolves by project + service). |
 
 ---
 

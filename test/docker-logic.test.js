@@ -54,6 +54,10 @@ import {
   parseComposeConfigJson,
   composeProjectNameFromFolder,
   parseComposeLsStatus,
+  buildHiddenTerminalArgs,
+  parseHcTerminalAddress,
+  parseHcWaitResult,
+  stripAnsiCodes,
   parseDockerfileExpose,
   getDockerfileMenuItems,
   buildDockerfileBuildArgs,
@@ -273,6 +277,54 @@ test("composeProjectNameFromFolder: normalizes the folder like Compose does", ()
   assert.equal(composeProjectNameFromFolder("/work/My App"), "my-app");
   assert.equal(composeProjectNameFromFolder("/work/__Test__"), "test");
   assert.equal(composeProjectNameFromFolder(""), "compose");
+});
+
+test("buildHiddenTerminalArgs: starts a hidden terminal with argv after --", () => {
+  assert.deepEqual(buildHiddenTerminalArgs(["docker", "compose", "up", "-d"], { cwd: "/work/app", machine: "rpi5" }), [
+    "run",
+    "--bg",
+    "--json",
+    "--no-parent",
+    "--cwd",
+    "/work/app",
+    "--on",
+    "rpi5",
+    "--",
+    "docker",
+    "compose",
+    "up",
+    "-d",
+  ]);
+  assert.deepEqual(buildHiddenTerminalArgs(["docker", "ps"]), [
+    "run",
+    "--bg",
+    "--json",
+    "--no-parent",
+    "--",
+    "docker",
+    "ps",
+  ]);
+});
+
+test("parseHcTerminalAddress: reads the address and rejects junk", () => {
+  assert.equal(parseHcTerminalAddress('{"address":"t1gz"}'), "t1gz");
+  assert.equal(parseHcTerminalAddress("not json"), null);
+  assert.equal(parseHcTerminalAddress('{"state":"live"}'), null);
+});
+
+test("parseHcWaitResult: reads ended and exit code", () => {
+  assert.deepEqual(parseHcWaitResult('{"ended":true,"exit_code":3,"reason":"exit"}'), {
+    ended: true,
+    exitCode: 3,
+    reason: "exit",
+  });
+  assert.deepEqual(parseHcWaitResult('{"ended":false}'), { ended: false, exitCode: null, reason: null });
+  assert.equal(parseHcWaitResult("nope"), null);
+});
+
+test("stripAnsiCodes: removes color and progress escapes", () => {
+  assert.equal(stripAnsiCodes("\u001b[32mok\u001b[0m"), "ok");
+  assert.equal(stripAnsiCodes("plain"), "plain");
 });
 
 test("buildContainerTree: compose ls-only project keeps its counts and actions", () => {

@@ -588,6 +588,71 @@ export function normalizeContainerInspect(raw) {
 }
 
 /**
+ * Builds `hc run` argv for a hidden background terminal. Hidden terminals have
+ * no `herdr.space` / `herdr.tab` labels, so they stay out of the tab strip and
+ * remain reachable by address for `terminal.peek` (DM-16).
+ *
+ * @param {string[]} command - Program and arguments, executed without a shell.
+ * @param {{ cwd?: string | null, machine?: string | null }} [options]
+ * @returns {string[]}
+ */
+export function buildHiddenTerminalArgs(command, { cwd = null, machine = null } = {}) {
+  const argv = ["run", "--bg", "--json", "--no-parent"];
+  if (cwd) argv.push("--cwd", cwd);
+  if (machine) argv.push("--on", machine);
+  argv.push("--", ...(Array.isArray(command) ? command : []));
+  return argv;
+}
+
+/**
+ * Extracts the terminal address from `hc run --bg --json` output.
+ *
+ * @param {string} stdout
+ * @returns {string | null}
+ */
+export function parseHcTerminalAddress(stdout) {
+  if (!stdout || typeof stdout !== "string") return null;
+  try {
+    const data = JSON.parse(stdout);
+    return typeof data?.address === "string" && data.address ? data.address : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Removes ANSI CSI escape sequences from terminal output before it is shown in
+ * a notification body or matched by the reclaim regex.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripAnsiCodes(text) {
+  return String(text || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+/**
+ * Parses `hc wait <terminal> --json` output.
+ *
+ * @param {string} stdout
+ * @returns {{ ended: boolean, exitCode: number | null, reason: string | null } | null}
+ */
+export function parseHcWaitResult(stdout) {
+  if (!stdout || typeof stdout !== "string") return null;
+  try {
+    const data = JSON.parse(stdout);
+    if (!data || typeof data !== "object") return null;
+    return {
+      ended: Boolean(data.ended),
+      exitCode: Number.isInteger(data.exit_code) ? data.exit_code : null,
+      reason: typeof data.reason === "string" ? data.reason : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parses `docker compose ls` status strings such as `running(3)` or
  * `exited(2), running(5)`. Docker Desktop hides extension containers from an
  * unfiltered `docker ps`, but compose ls still reports their counts.

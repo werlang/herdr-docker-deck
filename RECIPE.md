@@ -45,8 +45,8 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - Cache the workspace `find`/`stat` scan; re-run it only on cwd change, folder-watch event, or manual Refresh.
 - Compose actions run from the project working directory, not the space root; otherwise `docker compose` can fall back to a default `compose.yaml`.
 - The inspector tab mounts its own dialog overlays (Run/Tag/Backup/Restore/Clone) and reloads its target after actions, so Stop turns into Start.
-- Async actions show a floating spinner toast; the action never blocks the UI.
-- The inspector header uses the standard split-right/split-down icons; each opens another **inspector pane** in the same tab (editor-style), never a terminal or a new tab. Zoom/close target the pane.
+- Async actions show a floating spinner toast; the action never blocks the UI. Docker actions run in a hidden `hc` terminal (`hc run --bg --json --no-parent`), so clicking the toast peeks that terminal with `terminal.peek`; `hc wait`/`hc read` collect the result and `hc rm` cleans up after a grace period.
+- The inspector header uses the standard split-right/split-down icons; each opens Herdr's **New pane chooser** in a new pane of the same tab (terminal or any installed agent). Without `new-pane`, it opens a terminal. The header wraps so split/zoom/close stay reachable in narrow panes.
 - Destructive confirm closures must receive the confirm button's `cx`; a zero-arg closure leaves `runAction` without a context and the action never starts.
 - Single-volume **Compute Size** parses `docker system df -v --format json` and writes the result into `volumeSizes`.
 - Right-click menu positions come from the panel root's bubbled `local_position`, divided by the window zoom and clamped/flipped inside the panel, like the file-editor fix.

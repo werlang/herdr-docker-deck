@@ -13,6 +13,7 @@ import {
 } from "gpui-base";
 import {
   exec,
+  hc,
   spaces,
   panes,
   focused,
@@ -22,11 +23,11 @@ import {
   layout,
   theme,
   shared,
-  setShared,
   notify,
   run,
   watchFolder,
   readTextFile,
+  appHome,
 } from "herdr";
 import {
   resolveDockerContext,
@@ -61,6 +62,10 @@ import {
   groupDiscoveredComposeFiles,
   parseComposeConfigJson,
   composeProjectNameFromFolder,
+  buildHiddenTerminalArgs,
+  parseHcTerminalAddress,
+  parseHcWaitResult,
+  stripAnsiCodes,
   parseDockerfileExpose,
   getDockerfileMenuItems,
   buildDockerfileBuildArgs,
@@ -164,8 +169,17 @@ export default class DockerManager extends View {
     this.refreshSeq = 0;
     this.refreshing = false; // drives the toolbar refresh spinner
     this.busyTargets = new Map(); // targetKey -> actionLabel
+    this.newPaneInstalled = false;
+    readTextFile(`${appHome()}/mods/new-pane/mod.json`)
+      .then((text) => {
+        this.newPaneInstalled = typeof text === "string";
+        if (this.newPaneInstalled) cx.notify();
+      })
+      .catch(() => {});
     this.busyCount = 0;
-    this.actionToast = null; // { label } while one or more actions run
+    this.actionToast = null; // { label, terminal, seq } while one or more actions run
+    this.actionSeq = 0;
+    this.busyTerminals = new Map(); // targetKey -> { address, label, seq }
 
     // Inspector Tab Mode state (DM-44..46)
     this.inspectTabSubView = propsData?.inspect?.subView || "overview"; // overview | env | mounts | network | labels | stats | raw
@@ -2182,16 +2196,18 @@ export default class DockerManager extends View {
     });
   }
 
-  /** Runs docker CLI argv in the background with busy spinner and error toast (DM-16) */
+  /** Runs docker CLI argv in a hidden terminal, with busy spinner and error toast (DM-16). */
   runDockerCmd(targetKey, actionLabel, argv, ctx, cx) {
+    const seq = ++this.actionSeq;
     this.busyTargets.set(targetKey, actionLabel);
     this.busyCount += 1;
-    this.actionToast = { label: actionLabel };
+    this.actionToast = { label: actionLabel, terminal: null, seq };
     try {
       cx.notify();
     } catch (err) {
       // A stale context must not leave the spinner toast running forever.
       this.busyTargets.delete(targetKey);
+      this.busyTerminals.delete(targetKey);
       if (this.busyCount > 0) this.busyCount--;
       if (this.busyCount === 0) this.actionToast = null;
       notify({
@@ -2204,9 +2220,8 @@ export default class DockerManager extends View {
     }
 
     // Some builders return ["docker", ...] (they are shared with terminal.open, which needs the
-    // full command) and some return arguments only. Normalise here: exec() always adds "docker",
-    // so a builder that includes it produced `docker docker start <id>` for every container
-    // action (DM-70/72/73).
+    // full command) and some return arguments only. Normalise here: the hidden terminal runs
+    // `docker`, so a builder that includes it would produce `docker docker start <id>`.
     const dockerArgv = Array.isArray(argv) && argv[0] === "docker" ? argv.slice(1) : argv;
 
     const isLongOp = Array.isArray(argv) && argv.some((a) =>
@@ -2215,20 +2230,29 @@ export default class DockerManager extends View {
     const timeout = isLongOp ? 600000 : 60000;
 
     cx.spawn(async (cx) => {
+      let address = null;
       try {
-        const res = await exec("docker", dockerArgv, { cwd: ctx?.cwd, on: ctx?.on, timeout });
-        if ((res.code ?? res.exitCode) !== 0) {
-          const err = (res.stderr || res.stdout || "Command failed").trim();
+        const result = await this.executeDockerAction(dockerArgv, ctx, timeout, (addr) => {
+          address = addr;
+          this.busyTerminals.set(targetKey, { address: addr, label: actionLabel, seq });
+          if (this.actionToast?.seq === seq) {
+            this.actionToast = { ...this.actionToast, terminal: addr };
+            cx.notify();
+          }
+        });
+
+        if (result.code !== 0) {
+          const err = (result.output || "Command failed").trim();
           this.lastErrorText = err;
-          const lines = err.split("\n");
+          const lines = err.split("\n").filter((line) => line.trim().length > 0);
           notify({
             title: "Docker Error",
-            body: lines.slice(0, 3).join("\n"),
+            body: (result.address ? lines.slice(-3) : lines.slice(0, 3)).join("\n"),
             level: "error",
             timeout: 4000,
           });
         } else {
-          const reclaimed = /Total reclaimed space:\s*([0-9.]+\s*[kMGT]?B)/i.exec(res.stdout || "");
+          const reclaimed = /Total reclaimed space:\s*([0-9.]+\s*[kMGT]?B)/i.exec(result.output || "");
           notify({
             title: "Docker",
             body: reclaimed ? `${actionLabel} finished — reclaimed ${reclaimed[1]}` : `${actionLabel} finished`,
@@ -2245,11 +2269,128 @@ export default class DockerManager extends View {
         });
       } finally {
         this.busyTargets.delete(targetKey);
+        this.busyTerminals.delete(targetKey);
         if (this.busyCount > 0) this.busyCount--;
-        if (this.busyCount === 0) this.actionToast = null;
+        if (this.busyCount === 0) {
+          this.actionToast = null;
+        } else if (this.actionToast?.seq === seq) {
+          // Another action is still running; point the toast at the newest one
+          // that has a terminal instead of leaving it on a removed address.
+          const latest = Array.from(this.busyTerminals.values()).sort((a, b) => b.seq - a.seq)[0];
+          this.actionToast = latest
+            ? { label: latest.label, terminal: latest.address, seq: latest.seq }
+            : { label: this.actionToast.label, terminal: null, seq: this.actionSeq };
+        }
+        if (address) this.scheduleActionTerminalCleanup(address, cx);
         this.refresh(cx);
         this.reloadInspectorIfNeeded(cx);
       }
+    });
+  }
+
+  /**
+   * Runs one Docker command in a hidden `hc` terminal so the spinner toast can
+   * peek it. Falls back to `exec()` when the terminal cannot be created, which
+   * keeps actions working if the `hc` API is unavailable.
+   *
+   * @param {string[]} dockerArgv - Arguments after `docker`.
+   * @param {{ cwd?: string, on?: string | null }} ctx
+   * @param {number} timeout
+   * @param {(address: string) => void} [onStarted]
+   * @returns {Promise<{ code: number, output: string, address: string | null }>}
+   */
+  async executeDockerAction(dockerArgv, ctx, timeout, onStarted) {
+    let address = null;
+    let started = false;
+    try {
+      const startRes = await hc(
+        buildHiddenTerminalArgs(["docker", ...dockerArgv], {
+          cwd: ctx?.cwd || null,
+          machine: ctx?.on || null,
+        })
+      );
+      if ((startRes.code ?? startRes.exitCode) !== 0) {
+        throw new Error((startRes.stderr || startRes.stdout || "Could not start a terminal").trim());
+      }
+      started = true;
+      address = parseHcTerminalAddress(startRes.stdout);
+      if (!address) throw new Error("The action terminal did not report an address");
+
+      onStarted?.(address);
+
+      const deadline = Date.now() + timeout;
+      let ended = null;
+      while (!ended?.ended) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          try {
+            await hc(["kill", address]);
+          } catch {}
+          throw new Error(`Timed out after ${Math.round(timeout / 1000)}s`);
+        }
+        const waitRes = await hc([
+          "wait",
+          address,
+          "--json",
+          "--timeout",
+          String(Math.min(180, Math.max(1, Math.ceil(remaining / 1000)))),
+        ]);
+        if ((waitRes.code ?? waitRes.exitCode) !== 0) {
+          throw new Error((waitRes.stderr || waitRes.stdout || "Could not read the command result").trim());
+        }
+        ended = parseHcWaitResult(waitRes.stdout);
+        if (!ended) throw new Error("Could not parse the command result");
+      }
+
+      let output = "";
+      try {
+        const readRes = await hc(["read", address]);
+        output = stripAnsiCodes(readRes.stdout || readRes.stderr || "").trim();
+      } catch {}
+      const code = ended.exitCode ?? (ended.reason === "exit" ? 0 : 1);
+      return { code, output, address };
+    } catch (err) {
+      if (started) {
+        if (address) {
+          try {
+            await hc(["kill", address]);
+          } catch {}
+        }
+        return { code: 1, output: err?.message || String(err), address };
+      }
+      // No terminal was created: use the previous background-exec path.
+      const res = await exec("docker", dockerArgv, { cwd: ctx?.cwd, on: ctx?.on, timeout });
+      return {
+        code: res.code ?? res.exitCode ?? 0,
+        output: stripAnsiCodes(res.stderr || res.stdout || "").trim(),
+        address: null,
+      };
+    }
+  }
+
+  /**
+   * Removes a finished hidden action terminal after a grace period so an open
+   * peek can still be read. Terminals the user kept as tabs are left alone.
+   *
+   * @param {string} address
+   * @param {any} cx
+   */
+  scheduleActionTerminalCleanup(address, cx) {
+    cx.spawn(async (cx) => {
+      try {
+        await cx.sleep(15000);
+        const infoRes = await hc(["get", address, "--json"]);
+        if ((infoRes.code ?? infoRes.exitCode) !== 0) {
+          try {
+            await hc(["rm", address]);
+          } catch {}
+          return;
+        }
+        const info = JSON.parse(infoRes.stdout);
+        const labels = info?.labels || {};
+        if (labels["herdr.space"] || labels["herdr.tab"]) return;
+        await hc(["rm", address]);
+      } catch {}
     });
   }
 
@@ -3992,8 +4133,20 @@ export default class DockerManager extends View {
       .border_1()
       .border_color(toColor(t.border))
       .shadow_md()
+      .when(Boolean(toast.terminal), (el) =>
+        el
+          .cursor_pointer()
+          .tooltip("Peek the terminal running this command")
+          .hover((s) => s.bg(toColor(t.hover)))
+          .on_click(() => run("terminal.peek", { terminal: toast.terminal }))
+      )
       .child(svg("mods/docker-manager/icons/spinner.svg").size(14).text_color(toColor(t.accent)).spin(900))
-      .child(div().text_size(11).text_color(toColor(t.foreground)).child(toast.label || "Working…"));
+      .child(div().text_size(11).text_color(toColor(t.foreground)).child(toast.label || "Working…"))
+      .when(Boolean(toast.terminal), (el) =>
+        el
+          .child(svg("mods/docker-manager/icons/terminal.svg").size(11).text_color(toColor(t.dim)))
+          .child(div().text_size(9).text_color(toColor(t.dim)).child("peek"))
+      );
   }
 
   /** In-panel context menu overlay (DM-14, DM-50..73, DESIGN §5.4) */
@@ -4588,31 +4741,24 @@ export default class DockerManager extends View {
 
     const isRunning = Boolean(this.inspectData?.state?.running);
     const isService = Boolean(p?.inspect?.project && p?.inspect?.service);
-    // Splitting an editor pane creates another pane with the same content,
-    // not a new tab and not a terminal. Do the same for the inspector.
-    const splitInspector = (direction) =>
+    // Use Herdr's standard split target: the New pane chooser (terminal or
+    // any installed agent), not a second inspector. Without new-pane, the
+    // split opens a terminal as usual.
+    const splitInspector = (direction) => {
+      const props = {
+        direction,
+        ...(focused()?.space ? { space: focused().space } : {}),
+        ...(ctx.cwd ? { folder: ctx.cwd } : {}),
+      };
       run("pane.split", {
         direction,
         ...(paneId ? { pane: paneId } : {}),
-        mod: "docker-manager",
-        props: {
-          inspect: {
-            kind,
-            id: targetId,
-            name: targetTitle,
-            project: p?.inspect?.project,
-            service: p?.inspect?.service,
-            subView: this.inspectTabSubView,
-          },
-        },
+        ...(this.newPaneInstalled ? { mod: "new-pane", props } : {}),
       });
-    // A tab mod does not get `props().pane`; when this tab is focused, its
-    // pane is the focused pane in `panes()`. That is enough to draw the
-    // standard split / zoom / close controls the pane header would own.
+    };
     const focusedPaneInfo = panes().find((candidate) => candidate.pane === focused()?.pane);
     const paneId = p?.pane || (focusedPaneInfo?.mod === "docker-manager" ? focusedPaneInfo.pane : null);
     const paneInfo = panes().find((candidate) => candidate.pane === paneId);
-
     let subViews;
     if (kind === "image") {
       subViews = [
@@ -4666,11 +4812,13 @@ export default class DockerManager extends View {
       // Full tab header bar with lifecycle actions (DM-46)
       .child(
         h_flex()
-          .h(40)
+          .min_h(40)
           .w_full()
           .px(12)
+          .py(4)
           .items_center()
           .justify_between()
+          .flex_wrap()
           .bg(toColor(t.chrome))
           .border_b(1)
           .border_color(toColor(t.border))
@@ -4703,6 +4851,7 @@ export default class DockerManager extends View {
             h_flex()
               .items_center()
               .gap(6)
+              .flex_wrap()
               // --- CONTAINER ACTIONS ---
               .when(kind === "container" && !isRunning && Boolean(targetId), (btn) =>
                 btn.child(
@@ -4991,8 +5140,7 @@ export default class DockerManager extends View {
                       .when(this.refreshing, (el) => el.spin(900))
                   )
               )
-              // Standard editor-style splits: a new pane with the same
-              // inspector content, never a terminal or a separate tab.
+              // Pane controls; split duplicates the inspector pane (same tab).
               .child(
                 h_flex()
                   .size(24)
@@ -5015,7 +5163,6 @@ export default class DockerManager extends View {
                   .on_click((_e) => splitInspector("down"))
                   .child(svg("mods/docker-manager/icons/split-down.svg").size(13).text_color(toColor(t.muted)))
               )
-              // Zoom/close apply to this mod tab.
               .when(Boolean(paneId), (btn) => {
                 const paneButton = (icon, tip, action) =>
                   h_flex()
