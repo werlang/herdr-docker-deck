@@ -123,12 +123,14 @@ When `root` changes or `watchFolder(root)` fires:
 1. **Compose Projects**:
    - `runtime projects` are keyed by Compose project name and merge rows from `docker compose ls` with containers carrying `com.docker.compose.project`. `docker compose ls` status counts are authoritative when a container is hidden from `docker ps` (Docker Desktop extension containers): the row keeps its real running/total counts, gets an **external** badge, and **Stop/Down** stay enabled. `hiddenContainers` records the difference.
    - `discovered targets` (`DM-30..32`) are separate nodes unless the running project's `config_files` label already contains that target's file set. A variant such as `compose.dev.yaml` therefore gets its own row (`mocitec (dev)`) instead of being merged into the base project and passed as an extra `-f` on every action. If several targets share a Compose project name, each row gets a distinct display name (variant label, or the file basename when the label is the same).
+   - Runtime label paths and discovered paths are canonicalized through a `pathAliases` map (resolved with `realpath` for local spaces). A workspace reached through a symlink (`/Documents/Workspaces -> /workspaces`) therefore keeps one runtime row instead of adding a discovered-only duplicate, and `inSpace` compares the same form (`DM-37`).
    - `key` is a stable unique row id (project name for runtime projects, `disc:<folder>:<files>` for discovered-only targets); `project` is the name passed to `docker compose -p`; `name` is the display label.
    - Records `workingDirs: Set<string>` and `configFiles: Set<string>` across all containers of the project. If `workingDirs.size > 1`, sets `mixedSources: true` (`DM-25`).
    - Sets `inSpace = true` if any `workingDir` or `configFile` is equal to or inside `spaceRoot`.
    - Within each project, merges running/stopped containers by `serviceName` with declared services from `compose config`:
      - Services present in `compose config` with 0 containers get a synthetic `status: "not-created"` service node (`DM-24`).
      - Services in an inactive Compose profile without containers go under the project's `inactiveProfiles` group (`DM-33`).
+     - A container whose service name is absent from every successfully resolved config for that project is marked `orphan` (`DM-28`). The union of resolved configs is used so variants do not produce false positives; if any config for the project failed to resolve, orphan detection is skipped rather than guessing. Orphan actions use the container (`docker logs`/`start`/`stop`/`restart`/`rm`) because Compose no longer knows the service.
    - A target whose `compose config` failed carries `configError`; the row shows the warning icon with the Compose error as its tooltip (`DM-31`).
 2. **Dockerfile Projects**:
    - Matches containers with label `herdr.docker-manager.source` to discovered Dockerfiles (plus any running container with that label outside the workspace when `scope === "all"`).
@@ -171,6 +173,7 @@ When a container row is selected for the drawer or opened in an Inspector Tab:
 | Service Recreate (`DM-63`) | `[...composeTarget, "up", "-d", "--force-recreate", "--no-deps", service]` | Hidden terminal (`hc`, peekable) |
 | Service Remove (`DM-69`) | `[...composeTarget, "rm", "-s", "-f", service]` | Hidden terminal (`hc`, peekable; after confirm) |
 | Service Logs (`DM-80`) | `["docker", ...composeTarget, "logs", "-f", "--tail", String(tail), service]` | `terminal.open` |
+| Orphan service Actions (`DM-28`) | `["docker", "logs" \| "start" \| "stop" \| "restart" \| "rm", ...containerIds]` (Compose has no such service) | `terminal.open` / hidden terminal |
 | Container Logs (`DM-80`) | `["docker", "logs", "-f", "--tail", String(tail), containerId]` | `terminal.open` |
 | Container Shell (`DM-81`) | `["docker", "exec", "-it", containerId, "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]` | `terminal.open` |
 

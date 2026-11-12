@@ -127,6 +127,32 @@ export function isPathInside(parent, child) {
 }
 
 /**
+ * Resolves a path through a precomputed alias map.
+ *
+ * Docker records the paths it was invoked with in container labels, while the
+ * workspace scan reports paths under the space root. When one of those roots is
+ * a symlink (`/Documents/Workspaces -> /workspaces`), the same compose file is
+ * reached through two different strings: the project splits into a runtime row
+ * and a discovered-only row, and `inSpace` is computed against the wrong path.
+ * The caller resolves real paths once and passes the mapping here so every
+ * comparison uses one form.
+ *
+ * @param {string | null | undefined} path
+ * @param {Map<string, string> | Record<string, string> | null | undefined} aliases
+ * @returns {string | null | undefined}
+ */
+export function canonicalPath(path, aliases) {
+  if (!path || typeof path !== "string" || !aliases) return path;
+  const lookup = (p) =>
+    typeof aliases.get === "function" ? aliases.get(p) : aliases[p];
+  const direct = lookup(path);
+  if (direct) return direct;
+  const trimmed = path.replace(/\/+$/, "");
+  if (trimmed !== path) return lookup(trimmed) || path;
+  return path;
+}
+
+/**
  * Resolves current workspace execution context (cwd, on/machine)
  * following Herdr standard (DESIGN §3).
  *
@@ -328,16 +354,40 @@ export function buildContainerShellArgs(containerId, shellType = "auto") {
 }
 
 export function buildContainerActionArgs(action, containerId) {
-  validateDockerIdentifier(containerId, "container ID");
+  return buildContainerActionArgsForMany(action, [containerId]);
+}
+
+/**
+ * Builds one container lifecycle command for several containers. Orphaned
+ * services can have more than one leftover replica, and `docker stop a b` is
+ * still a single validated command.
+ *
+ * @param {string} action
+ * @param {string[]} containerIds
+ * @returns {string[]}
+ */
+export function buildContainerActionArgsForMany(action, containerIds = []) {
+  if (!Array.isArray(containerIds) || containerIds.length === 0) {
+    throw new Error("At least one container ID is required");
+  }
   if (!["start", "stop", "restart", "pause", "unpause", "kill"].includes(action)) {
     throw new Error(`Invalid container action: ${action}`);
   }
-  return ["docker", action, containerId];
+  for (const containerId of containerIds) {
+    validateDockerIdentifier(containerId, "container ID");
+  }
+  return ["docker", action, ...containerIds];
 }
 
 export function buildContainerRmArgs(containerId, { force = false } = {}) {
-  validateDockerIdentifier(containerId, "container ID");
-  return ["docker", "rm", ...(force ? ["-f"] : []), containerId];
+  const containerIds = Array.isArray(containerId) ? containerId : [containerId];
+  if (containerIds.length === 0) {
+    throw new Error("At least one container ID is required");
+  }
+  for (const id of containerIds) {
+    validateDockerIdentifier(id, "container ID");
+  }
+  return ["docker", "rm", ...(force ? ["-f"] : []), ...containerIds];
 }
 
 export function buildVolumeInspectArgs(volumeName) {
@@ -732,8 +782,11 @@ export function buildContainerTree({
   spaceRoot = null,
   scope = "all",
   filter = "",
+  pathAliases = null,
 } = {}) {
   const normFilter = (filter || "").trim().toLowerCase();
+  const resolvePath = (path) => canonicalPath(path, pathAliases);
+  const resolvedSpaceRoot = resolvePath(spaceRoot);
 
   // Helper: check if a container matches filter query
   function containerMatchesFilter(c) {
@@ -759,9 +812,9 @@ export function buildContainerTree({
     const project = labels["com.docker.compose.project"] || null;
     const service = labels["com.docker.compose.service"] || null;
     const containerNumber = parseInt(labels["com.docker.compose.container-number"] || "1", 10);
-    const workingDir = labels["com.docker.compose.project.working_dir"] || null;
+    const workingDir = resolvePath(labels["com.docker.compose.project.working_dir"] || null);
     const configFilesStr = labels["com.docker.compose.project.config_files"] || "";
-    const configFiles = configFilesStr ? configFilesStr.split(",") : [];
+    const configFiles = configFilesStr ? configFilesStr.split(",").map(resolvePath) : [];
     const sourceLabel = labels["herdr.docker-manager.source"] || null;
     const rawState = (c.State || c.state || "").toLowerCase();
     const rawStatus = c.Status || c.status || "";
@@ -797,7 +850,10 @@ export function buildContainerTree({
   for (const item of composeLs) {
     const name = item.Name || item.name;
     if (name && !runtimeProjects.has(name)) {
-      const configFiles = (item.ConfigFiles || item.configFiles || "").split(",").filter(Boolean);
+      const configFiles = (item.ConfigFiles || item.configFiles || "")
+        .split(",")
+        .map(resolvePath)
+        .filter(Boolean);
       const lsStatus = item.Status || item.status || "";
       const counts = parseComposeLsStatus(lsStatus);
       runtimeProjects.set(name, {
@@ -850,10 +906,14 @@ export function buildContainerTree({
     const projectName = disc.project || disc.name;
     if (!projectName) continue;
 
-    const files =
+    const files = (
       Array.isArray(disc.files) && disc.files.length > 0
         ? disc.files.filter(Boolean)
-        : [disc.filePath].filter(Boolean);
+        : [disc.filePath].filter(Boolean)
+    ).map(resolvePath);
+    const folder = resolvePath(disc.folder) || disc.folder;
+    const filePath = resolvePath(disc.filePath) || disc.filePath;
+    const resolvedDisc = { ...disc, files, folder, filePath };
     const runtime = runtimeProjects.get(projectName);
     const tiedToRuntime =
       Boolean(runtime) &&
@@ -864,24 +924,24 @@ export function buildContainerTree({
       const current = runtime.discoveredConfig;
       const currentFileCount = current ? (current.files || [current.filePath]).filter(Boolean).length : 0;
       if (!current || files.length > currentFileCount) {
-        runtime.discoveredConfig = disc;
+        runtime.discoveredConfig = resolvedDisc;
       }
-      if (disc.folder) runtime.workingDirs.add(disc.folder);
+      if (folder) runtime.workingDirs.add(folder);
       continue;
     }
 
     discoveredTargets.push({
-      key: `disc:${disc.folder || ""}:${files.join(",") || disc.filePath || projectName}`,
+      key: `disc:${folder || ""}:${files.join(",") || filePath || projectName}`,
       project: projectName,
       displayName: disc.displayName || disc.name || projectName,
       containers: [],
       configFiles: files,
-      workingDirs: new Set(disc.folder ? [disc.folder] : []),
-      discoveredConfig: disc,
+      workingDirs: new Set(folder ? [folder] : []),
+      discoveredConfig: resolvedDisc,
       lsStatus: "",
       lsRunning: 0,
       lsTotal: 0,
-      primaryFile: files[0] || disc.filePath || null,
+      primaryFile: files[0] || filePath || null,
     });
   }
 
@@ -912,11 +972,11 @@ export function buildContainerTree({
 
     // inSpace determination
     let inSpace = false;
-    if (spaceRoot) {
+    if (resolvedSpaceRoot) {
       inSpace =
-        workingDirsList.some((dir) => isPathInside(spaceRoot, dir)) ||
-        projData.configFiles.some((f) => isPathInside(spaceRoot, f)) ||
-        Boolean(projData.discoveredConfig && isPathInside(spaceRoot, projData.discoveredConfig.filePath));
+        workingDirsList.some((dir) => isPathInside(resolvedSpaceRoot, dir)) ||
+        projData.configFiles.some((f) => isPathInside(resolvedSpaceRoot, f)) ||
+        Boolean(projData.discoveredConfig && isPathInside(resolvedSpaceRoot, projData.discoveredConfig.filePath));
     }
 
     // Scope filtering (DM-36)
@@ -966,12 +1026,55 @@ export function buildContainerTree({
       }
     }
 
+    // A container keeps the service name it was created with. Renaming or
+    // deleting a service in the compose file and running `compose up` leaves the
+    // old container behind (Compose calls it an orphan): `docker ps -a` still
+    // lists it, but the current config no longer declares the service, so
+    // `docker compose logs <name>` fails with "no such service". Detect it so
+    // the row is labelled and actions use the container instead of Compose.
+    const runtimeConfigFiles = new Set(projData.configFiles || []);
+    const configsForProject = discoveredCompose.filter((disc) => {
+      if ((disc.project || disc.name) !== projName) return false;
+      const files =
+        Array.isArray(disc.files) && disc.files.length > 0
+          ? disc.files
+          : [disc.filePath].filter(Boolean);
+      if (files.length === 0) return false;
+      // Only configs that cover a file this project actually runs can tell us
+      // whether a service was removed. A sibling variant or an unrelated
+      // project with the same name must not make its services look orphaned.
+      if (runtimeConfigFiles.size === 0) return true;
+      return files.some((file) => runtimeConfigFiles.has(resolvePath(file)));
+    });
+    const resolvedConfigs = configsForProject.filter(
+      (disc) =>
+        !disc.configError &&
+        disc.config &&
+        typeof disc.config.services === "object" &&
+        Object.keys(disc.config.services).length > 0
+    );
+    const hasUnresolvedConfig = configsForProject.some(
+      (disc) =>
+        Boolean(disc.configError) ||
+        !disc.config ||
+        typeof disc.config.services !== "object" ||
+        Object.keys(disc.config.services).length === 0
+    );
+    const declaredAnywhere = new Set(Object.keys(declaredServices));
+    for (const disc of resolvedConfigs) {
+      for (const name of Object.keys(disc.config?.services || {})) {
+        declaredAnywhere.add(name);
+      }
+    }
+    const canDetectOrphans = resolvedConfigs.length > 0 && !hasUnresolvedConfig;
+
     // Construct service nodes
     const serviceNodes = [];
     for (const [sName, svcContainers] of serviceMap.entries()) {
       svcContainers.sort((a, b) => a.containerNumber - b.containerNumber);
 
       const notCreated = svcContainers.length === 0;
+      const orphan = canDetectOrphans && !notCreated && !declaredAnywhere.has(sName);
       const runningCount = svcContainers.filter((c) => c.running).length;
       const totalCount = svcContainers.length;
 
@@ -1006,6 +1109,7 @@ export function buildContainerTree({
         name: sName,
         containers: svcContainers,
         notCreated,
+        orphan,
         runningCount,
         totalCount,
         statusText,
@@ -1084,6 +1188,7 @@ export function buildContainerTree({
       statusColor: aggregateColor,
       configError: projData.discoveredConfig?.configError || null,
       services: serviceNodes,
+      orphanCount: serviceNodes.filter((service) => service.orphan).length,
       inactiveProfiles: inactiveProfilesList,
     });
   }
@@ -1423,6 +1528,8 @@ export function getServiceMenuItems(service, project = null) {
   const isRunning = (service.runningCount ?? 0) > 0;
   const isAllRunning = service.totalCount > 0 && service.runningCount === service.totalCount;
   const notCreated = Boolean(service.notCreated);
+  const orphan = Boolean(service.orphan);
+  const composeUnavailableReason = orphan ? "service not in compose config" : "compose file not found";
   const containerId = service.containers && service.containers.length > 0 ? service.containers[0].id : service.id;
 
   const items = [
@@ -1457,8 +1564,8 @@ export function getServiceMenuItems(service, project = null) {
       id: "up",
       label: "Up (this service)",
       icon: "play.svg",
-      enabled: hasConfigFiles,
-      disabledReason: hasConfigFiles ? null : "compose file not found",
+      enabled: hasConfigFiles && !orphan,
+      disabledReason: !hasConfigFiles ? "compose file not found" : composeUnavailableReason,
       destructive: false,
       requiresTypedConfirm: false,
     },
@@ -1466,8 +1573,8 @@ export function getServiceMenuItems(service, project = null) {
       id: "rebuild",
       label: "Rebuild",
       icon: "rebuild.svg",
-      enabled: hasConfigFiles,
-      disabledReason: hasConfigFiles ? null : "compose file not found",
+      enabled: hasConfigFiles && !orphan,
+      disabledReason: !hasConfigFiles ? "compose file not found" : composeUnavailableReason,
       destructive: false,
       requiresTypedConfirm: false,
     },
@@ -1475,17 +1582,17 @@ export function getServiceMenuItems(service, project = null) {
       id: "recreate",
       label: "Recreate (no build)",
       icon: "restart.svg",
-      enabled: hasConfigFiles,
-      disabledReason: hasConfigFiles ? null : "compose file not found",
+      enabled: hasConfigFiles && !orphan,
+      disabledReason: !hasConfigFiles ? "compose file not found" : composeUnavailableReason,
       destructive: false,
       requiresTypedConfirm: false,
     },
     {
       id: "logs",
-      label: "Logs",
+      label: orphan ? "Logs (orphan container)" : "Logs",
       icon: "logs.svg",
-      enabled: !notCreated,
-      disabledReason: notCreated ? "not created" : null,
+      enabled: !notCreated || Boolean(containerId),
+      disabledReason: !notCreated && !containerId ? "not created" : null,
       destructive: false,
       requiresTypedConfirm: false,
     },
@@ -1547,7 +1654,7 @@ export function getServiceMenuItems(service, project = null) {
   items.push(
     {
       id: "copy-name",
-      label: "Copy service name",
+      label: orphan ? "Copy container name" : "Copy service name",
       icon: "copy.svg",
       enabled: true,
       disabledReason: null,
@@ -1565,7 +1672,7 @@ export function getServiceMenuItems(service, project = null) {
     },
     {
       id: "remove",
-      label: "Remove",
+      label: orphan ? "Remove orphan container(s)" : "Remove",
       icon: "trash.svg",
       enabled: !notCreated,
       disabledReason: notCreated ? "not created" : null,
@@ -1785,9 +1892,12 @@ export function buildConfirmationSpec(action, target) {
 
   if (action === "remove") {
     const isService = target.kind === "service" || (target.project && target.name);
+    const isOrphan = Boolean(target.orphan);
     return {
-      title: isService ? "Remove Service" : "Remove Container",
-      message: isService
+      title: isOrphan ? "Remove Orphan Container" : isService ? "Remove Service" : "Remove Container",
+      message: isOrphan
+        ? `Stops and removes the leftover container(s) for service "${targetName}". Compose no longer declares this service.`
+        : isService
         ? `Stops and removes all containers for service "${targetName}".`
         : `Permanently removes container "${targetName}".`,
       confirmLabel: "Remove",

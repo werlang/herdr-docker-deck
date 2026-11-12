@@ -53,6 +53,7 @@ import {
   buildContainerLogsArgs,
   buildContainerShellArgs,
   buildContainerActionArgs,
+  buildContainerActionArgsForMany,
   buildContainerRmArgs,
   getProjectMenuItems,
   getServiceMenuItems,
@@ -258,6 +259,12 @@ export default class DockerManager extends View {
     this.watchedCwd = null;
     this.scannedCwd = null;
     this.workspaceDirty = true;
+    // Docker records the paths used at container-creation time; they can be a
+    // symlinked form of the space root (e.g. /Documents/Workspaces -> /workspaces).
+    // Real paths are cached here so the tree compares one canonical form.
+    this.pathAliases = new Map();
+    this.pathAliasMisses = new Set();
+    this.canonicalCwd = null;
 
     // Cross-mod request tracking (DM-93, INTEGRATION §3.4)
     this.lastHandledRequestTs = 0;
@@ -353,9 +360,10 @@ export default class DockerManager extends View {
         composeLs: this.composeLsRaw,
         discoveredCompose: this.discoveredCompose,
         discoveredDockerfiles: this.discoveredDockerfiles,
-        spaceRoot: ctx.cwd,
+        spaceRoot: this.canonicalCwd || ctx.cwd,
         scope: this.scope,
         filter: this.filterQuery,
+        pathAliases: ctx.on === null ? this.pathAliases : null,
       });
 
       const matched = matchDockerRequestTarget(req, tree);
@@ -903,6 +911,7 @@ export default class DockerManager extends View {
     if (!this.workspaceDirty && this.scannedCwd === ctx.cwd) return;
     this.workspaceDirty = false;
     this.scannedCwd = ctx.cwd;
+    this.pathAliasMisses.clear();
 
     try {
       const findRes = await exec(
@@ -1054,6 +1063,76 @@ export default class DockerManager extends View {
     }
   }
 
+  /**
+   * Resolves symlinked forms of workspace paths once and caches them.
+   *
+   * Docker container labels record the path that was current when the container
+   * was created. If the user reaches a workspace through a symlink
+   * (`/Documents/Workspaces -> /workspaces`), those labels and the workspace
+   * scan disagree even though both point at the same compose file. The tree
+   * receives this map so runtime projects and discovered targets merge, and
+   * `inSpace` is decided with one canonical path form.
+   *
+   * Local only: remote spaces would pay an SSH round-trip per path, and the
+   * stale-service fix does not depend on path identity.
+   */
+  async resolvePathAliases(ctx) {
+    if (!ctx?.cwd || ctx.on !== null) {
+      this.canonicalCwd = ctx?.cwd || null;
+      return false;
+    }
+
+    const paths = new Set();
+    const addPath = (value) => {
+      if (typeof value === "string" && value.startsWith("/")) paths.add(value);
+    };
+    addPath(ctx.cwd);
+    for (const container of this.containersRaw || []) {
+      const labels =
+        typeof container.Labels === "string" ? parseContainerLabels(container.Labels) : container.Labels || {};
+      addPath(labels["com.docker.compose.project.working_dir"]);
+      const files = labels["com.docker.compose.project.config_files"];
+      if (typeof files === "string") files.split(",").forEach(addPath);
+    }
+    for (const item of this.composeLsRaw || []) {
+      const files = item.ConfigFiles || item.configFiles || "";
+      if (typeof files === "string") files.split(",").forEach(addPath);
+    }
+    for (const disc of this.discoveredCompose || []) {
+      addPath(disc.folder);
+      addPath(disc.filePath);
+      for (const file of disc.files || []) addPath(file);
+    }
+
+    const pending = [...paths].filter(
+      (path) => !this.pathAliases.has(path) && !this.pathAliasMisses.has(path)
+    );
+    if (pending.length === 0) {
+      this.canonicalCwd = this.pathAliases.get(ctx.cwd) || ctx.cwd;
+      return false;
+    }
+
+    let changed = false;
+    await Promise.all(
+      pending.map(async (path) => {
+        try {
+          const res = await exec("realpath", [path], { timeout: 1500 });
+          const resolved = (res.stdout || "").trim().split("\n")[0];
+          if ((res.code ?? res.exitCode) === 0 && resolved) {
+            this.pathAliases.set(path, resolved);
+            if (resolved !== path) changed = true;
+          } else {
+            this.pathAliasMisses.add(path);
+          }
+        } catch {
+          this.pathAliasMisses.add(path);
+        }
+      })
+    );
+    this.canonicalCwd = this.pathAliases.get(ctx.cwd) || ctx.cwd;
+    return changed;
+  }
+
   /** Fast status refresh (DM-15, DESIGN §4.1) */
   refresh(cx, options = {}) {
     const seq = ++this.refreshSeq;
@@ -1068,6 +1147,10 @@ export default class DockerManager extends View {
       focused: focused(),
       shared,
     });
+    // Keep the scope root aligned with the container-label form even before the
+    // first alias pass finishes (and avoid leaking a local alias into a remote
+    // space that happens to use the same absolute path).
+    this.canonicalCwd = ctx.on === null ? this.pathAliases.get(ctx.cwd) || ctx.cwd : ctx.cwd;
 
     cx.spawn(async (cx) => {
       // 1. Probe Engine
@@ -1143,6 +1226,10 @@ export default class DockerManager extends View {
 
         // Trigger workspace scan
         await this.scanWorkspace(ctx);
+
+        // Resolve symlinked label/scan paths before the tree is built.
+        await this.resolvePathAliases(ctx);
+        if (seq !== this.refreshSeq) return;
 
         // Fetch section-specific resources (P4)
         if (this.activeSection === "images") {
@@ -1294,14 +1381,16 @@ export default class DockerManager extends View {
           name: `Inspect: ${row.project} / ${row.data.name}`,
           mod: "docker-manager",
           props: {
-            inspect: {
-              kind: "container",
-              id: containerId,
-              project: row.composeProject || row.project,
-              service: row.data.name,
-              configFiles: row.configFiles,
-              workingDir: row.workingDirs?.[0] || null,
-            },
+            inspect: row.data.orphan
+              ? { kind: "container", id: containerId }
+              : {
+                  kind: "container",
+                  id: containerId,
+                  project: row.composeProject || row.project,
+                  service: row.data.name,
+                  configFiles: row.configFiles,
+                  workingDir: row.workingDirs?.[0] || null,
+                },
           },
         });
         return;
@@ -1627,30 +1716,60 @@ export default class DockerManager extends View {
         configFiles: project?.configFiles || row.configFiles || [],
       };
       const key = `svc:${row.project}:${rowData.name}`;
-      const containerId = rowData.containers?.[0]?.id;
+      const orphan = Boolean(rowData.orphan);
+      const containerIds = (rowData.containers || []).map((c) => c.id).filter(Boolean);
+      const containerId = containerIds[0];
       const svcCtx = { ...ctx, cwd: projTarget.workingDir || ctx.cwd };
 
-      if (actionId === "start") {
-        this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeStartArgs(projTarget, rowData.name), svcCtx, cx);
-      } else if (actionId === "stop") {
-        this.runDockerCmd(key, `Stopping service ${rowData.name}`, buildComposeStopArgs(projTarget, rowData.name), svcCtx, cx);
-      } else if (actionId === "restart") {
-        this.runDockerCmd(key, `Restarting service ${rowData.name}`, buildComposeRestartArgs(projTarget, rowData.name), svcCtx, cx);
-      } else if (actionId === "up") {
-        this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeUpArgs(projTarget, { service: rowData.name }), svcCtx, cx);
-      } else if (actionId === "rebuild") {
-        this.runDockerCmd(key, `Rebuilding service ${rowData.name}`, buildComposeRebuildArgs(projTarget, rowData.name), svcCtx, cx);
-      } else if (actionId === "recreate") {
-        this.runDockerCmd(key, `Recreating service ${rowData.name}`, buildComposeRecreateArgs(projTarget, rowData.name), svcCtx, cx);
+      if (actionId === "start" || actionId === "stop" || actionId === "restart") {
+        if (orphan) {
+          if (containerIds.length === 0) return;
+          const labels = { start: "Starting", stop: "Stopping", restart: "Restarting" };
+          this.runDockerCmd(
+            key,
+            `${labels[actionId]} orphan ${rowData.name}`,
+            buildContainerActionArgsForMany(actionId, containerIds),
+            svcCtx,
+            cx
+          );
+        } else if (actionId === "start") {
+          this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeStartArgs(projTarget, rowData.name), svcCtx, cx);
+        } else if (actionId === "stop") {
+          this.runDockerCmd(key, `Stopping service ${rowData.name}`, buildComposeStopArgs(projTarget, rowData.name), svcCtx, cx);
+        } else {
+          this.runDockerCmd(key, `Restarting service ${rowData.name}`, buildComposeRestartArgs(projTarget, rowData.name), svcCtx, cx);
+        }
+      } else if (actionId === "up" || actionId === "rebuild" || actionId === "recreate") {
+        // The menu disables these for orphaned services; keep the guard so a
+        // stale menu cannot send a compose command for a service Compose does
+        // not declare.
+        if (orphan) return;
+        if (actionId === "up") {
+          this.runDockerCmd(key, `Starting service ${rowData.name}`, buildComposeUpArgs(projTarget, { service: rowData.name }), svcCtx, cx);
+        } else if (actionId === "rebuild") {
+          this.runDockerCmd(key, `Rebuilding service ${rowData.name}`, buildComposeRebuildArgs(projTarget, rowData.name), svcCtx, cx);
+        } else {
+          this.runDockerCmd(key, `Recreating service ${rowData.name}`, buildComposeRecreateArgs(projTarget, rowData.name), svcCtx, cx);
+        }
       } else if (actionId === "logs") {
-        this.openLogs(
-          {
-            ...rowData,
-            configFiles: projTarget.configFiles,
-            workingDirs: projTarget.workingDir ? [projTarget.workingDir] : [],
-          },
-          isAlt
-        );
+        if (orphan && containerId) {
+          // `docker compose logs <service>` fails with "no such service" for a
+          // container left behind after a rename/removal; log the container.
+          const orphanContainer = (rowData.containers || []).find((c) => c.id === containerId);
+          this.openLogs(
+            { kind: "container", id: containerId, name: orphanContainer?.name || rowData.name },
+            isAlt
+          );
+        } else {
+          this.openLogs(
+            {
+              ...rowData,
+              configFiles: projTarget.configFiles,
+              workingDirs: projTarget.workingDir ? [projTarget.workingDir] : [],
+            },
+            isAlt
+          );
+        }
       } else if (actionId === "shell") {
         if (containerId) {
           this.openShell(containerId, rowData.name, isAlt, cx);
@@ -1671,14 +1790,16 @@ export default class DockerManager extends View {
           name: `Inspect: ${row.project} / ${rowData.name}`,
           mod: "docker-manager",
           props: {
-            inspect: {
-              kind: "container",
-              id: containerId,
-              project: projTarget.project,
-              service: rowData.name,
-              configFiles: projTarget.configFiles,
-              workingDir: projTarget.workingDir,
-            },
+            inspect: orphan
+              ? { kind: "container", id: containerId }
+              : {
+                  kind: "container",
+                  id: containerId,
+                  project: projTarget.project,
+                  service: rowData.name,
+                  configFiles: projTarget.configFiles,
+                  workingDir: projTarget.workingDir,
+                },
           },
         });
       } else if (actionId.startsWith("open-port:")) {
@@ -1686,11 +1807,23 @@ export default class DockerManager extends View {
         if (cx?.open_url) cx.open_url(`http://localhost:${port}`);
         else exec("open", [`http://localhost:${port}`]);
       } else if (actionId === "copy-name") {
-        this.copyValue(rowData.name, "Service Name", cx);
+        const copyName = orphan ? rowData.containers?.[0]?.name || rowData.name : rowData.name;
+        this.copyValue(copyName, orphan ? "Container Name" : "Service Name", cx);
       } else if (actionId === "copy-id") {
         this.copyValue(containerId, "Container ID", cx);
       } else if (actionId === "remove") {
-        this.runDockerCmd(key, `Removing service ${rowData.name}`, buildComposeRmArgs(projTarget, rowData.name), svcCtx, cx);
+        if (orphan) {
+          if (containerIds.length === 0) return;
+          this.runDockerCmd(
+            key,
+            `Removing orphan ${rowData.name}`,
+            buildContainerRmArgs(containerIds, { force: true }),
+            svcCtx,
+            cx
+          );
+        } else {
+          this.runDockerCmd(key, `Removing service ${rowData.name}`, buildComposeRmArgs(projTarget, rowData.name), svcCtx, cx);
+        }
       }
       return;
     }
@@ -3111,6 +3244,25 @@ export default class DockerManager extends View {
                   .text_color(toColor(t.working))
               )
             )
+            .when((p.orphanCount || 0) > 0, (el) =>
+              el.child(
+                h_flex()
+                  .items_center()
+                  .px(4)
+                  .py(1)
+                  .rounded(3)
+                  .bg(toColor(t.raised))
+                  .tooltip(
+                    "Containers left behind by services that are no longer declared in the Compose config. Expand the project to inspect or remove them."
+                  )
+                  .child(
+                    div()
+                      .text_size(9)
+                      .text_color(toColor(t.working))
+                      .child(`${p.orphanCount} orphan${p.orphanCount === 1 ? "" : "s"}`)
+                  )
+              )
+            )
             .when(Boolean(p.configError), (el) =>
               el.child(
                 h_flex()
@@ -3231,6 +3383,25 @@ export default class DockerManager extends View {
                 .text_size(11)
                 .text_color(toColor(s.notCreated ? t.dim : t.foreground))
                 .child(s.name)
+            )
+            .when(Boolean(s.orphan), (el) =>
+              el.child(
+                h_flex()
+                  .items_center()
+                  .px(4)
+                  .py(1)
+                  .rounded(3)
+                  .bg(toColor(t.raised))
+                  .tooltip(
+                    "The container still exists, but the Compose config no longer declares this service. Actions use the container instead of Compose."
+                  )
+                  .child(
+                    div()
+                      .text_size(9)
+                      .text_color(toColor(t.working))
+                      .child("orphan")
+                  )
+              )
             )
             .when(isBusy, (el) =>
               el
@@ -3725,6 +3896,18 @@ export default class DockerManager extends View {
                     .child(`(${projName})`)
                 )
               )
+              .when(Boolean(sel.orphan), (el) =>
+                el.child(
+                  div()
+                    .px(4)
+                    .py(1)
+                    .rounded(3)
+                    .bg(toColor(t.raised))
+                    .text_size(9)
+                    .text_color(toColor(t.working))
+                    .child("orphan")
+                )
+              )
           )
           .child(
             h_flex()
@@ -3746,15 +3929,17 @@ export default class DockerManager extends View {
                       name: `Inspect: ${title}`,
                       mod: "docker-manager",
                       props: {
-                        inspect: {
-                          kind,
-                          id,
-                          name,
-                          project: sel.composeProject || sel.project || projName,
-                          service: sel.service || sel.name,
-                          configFiles: sel.configFiles,
-                          workingDir: sel.workingDirs?.[0] || null,
-                        },
+                        inspect: sel.orphan
+                          ? { kind, id, name }
+                          : {
+                              kind,
+                              id,
+                              name,
+                              project: sel.composeProject || sel.project || projName,
+                              service: sel.service || sel.name,
+                              configFiles: sel.configFiles,
+                              workingDir: sel.workingDirs?.[0] || null,
+                            },
                       },
                     });
                   })
@@ -6277,9 +6462,10 @@ export default class DockerManager extends View {
       composeLs: this.composeLsRaw,
       discoveredCompose: this.discoveredCompose,
       discoveredDockerfiles: this.discoveredDockerfiles,
-      spaceRoot: ctx.cwd,
+      spaceRoot: this.canonicalCwd || ctx.cwd,
       scope: this.scope,
       filter: this.filterQuery,
+      pathAliases: ctx.on === null ? this.pathAliases : null,
     });
 
     const rows = this.flattenTree(tree);

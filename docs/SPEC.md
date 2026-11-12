@@ -103,6 +103,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 | DM-25 | **Mixed sources warning**: when containers of one project come from different `working_dir`s (two checkouts using the same project name), the project row shows a warning icon whose tooltip lists the folders. Actions use the folder of the space when it is one of them, otherwise ask which folder to use. |
 | DM-26 | Expanded/collapsed state persists per project name in mod state. Projects of the current space start expanded; others start collapsed. |
 | DM-27 | Status refreshes automatically (§9.2) and after every action. Rows never jump: sort order is stable between refreshes. |
+| DM-28 | A container whose Compose service is no longer declared in the project's resolved compose config is an **orphan** (left behind by a service rename/removal). Its service row carries an `orphan` badge, the project row shows the orphan count, and **Logs**, **Start**, **Stop**, **Restart**, and **Remove** act on the container instead of `docker compose` (which would fail with `no such service`). Compose-only actions (**Up**, **Rebuild**, **Recreate**) are disabled with a clear reason. |
 
 ### 5.2 Compose file and Dockerfile discovery
 
@@ -120,6 +121,7 @@ Inspiration: Microsoft's [vscode-containers](https://github.com/microsoft/vscode
 |---|---|
 | DM-35 | **All** (default): every container on the machine, current-space projects first. |
 | DM-36 | **This space**: only projects/Dockerfiles discovered in the space root or whose container `working_dir`/`config_files`/`source` label is inside it; standalone containers are hidden. The choice persists in mod state. |
+| DM-37 | Compose paths are compared using resolved real paths. When the workspace is reached through a symlink (for example `/Documents/Workspaces -> /workspaces`), container-label paths and discovered paths still form one project row, and **This space** containment uses the same canonical form. |
 
 ---
 

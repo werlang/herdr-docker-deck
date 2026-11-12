@@ -26,6 +26,7 @@ import {
   buildContainerLogsArgs,
   buildContainerShellArgs,
   buildContainerActionArgs,
+  buildContainerActionArgsForMany,
   buildContainerRmArgs,
   buildVolumeInspectArgs,
   buildVolumeBrowseArgs,
@@ -454,6 +455,120 @@ test("buildContainerTree: a running project only absorbs discovered files it act
   assert.deepEqual(base.configFiles, ["/work/mocitec/compose.yaml"]);
 });
 
+test("buildContainerTree: marks services left behind by a renamed compose service as orphans", () => {
+  const labels = (service) =>
+    `com.docker.compose.project=node-aec,com.docker.compose.service=${service},com.docker.compose.project.config_files=/work/node-aec/compose.dev.yaml,com.docker.compose.project.working_dir=/work/node-aec`;
+  const containers = [
+    {
+      ID: "c-minio",
+      Names: "/node-aec-minio-1",
+      Labels: labels("minio"),
+      State: "running",
+      Status: "Up 47 hours",
+    },
+    {
+      ID: "c-api",
+      Names: "/node-aec-api-1",
+      Labels: labels("api"),
+      State: "running",
+      Status: "Up 47 hours",
+    },
+  ];
+  const discoveredCompose = [
+    {
+      project: "node-aec",
+      filePath: "/work/node-aec/compose.dev.yaml",
+      files: ["/work/node-aec/compose.dev.yaml"],
+      folder: "/work/node-aec",
+      config: { services: { api: {}, s3: {} } },
+    },
+  ];
+
+  const proj = buildContainerTree({ containers, discoveredCompose })
+    .find((g) => g.id === "projects")
+    .items.find((p) => p.name === "node-aec");
+
+  assert.equal(proj.services.find((s) => s.name === "minio")?.orphan, true);
+  assert.equal(proj.services.find((s) => s.name === "api")?.orphan, false);
+  assert.equal(proj.services.find((s) => s.name === "s3")?.notCreated, true);
+  assert.equal(proj.orphanCount, 1);
+});
+
+test("buildContainerTree: keeps orphan detection conservative when a compose config failed", () => {
+  const containers = [
+    {
+      ID: "c-old",
+      Names: "/broken-old-1",
+      Labels:
+        "com.docker.compose.project=broken,com.docker.compose.service=old,com.docker.compose.project.config_files=/work/broken/compose.yaml,com.docker.compose.project.working_dir=/work/broken",
+      State: "running",
+      Status: "Up 1 minute",
+    },
+  ];
+  const discoveredCompose = [
+    {
+      project: "broken",
+      filePath: "/work/broken/compose.yaml",
+      files: ["/work/broken/compose.yaml"],
+      folder: "/work/broken",
+      config: { services: {} },
+      configError: "service depends on undefined service",
+    },
+  ];
+
+  const proj = buildContainerTree({ containers, discoveredCompose })
+    .find((g) => g.id === "projects")
+    .items.find((p) => p.name === "broken");
+
+  assert.equal(proj.services.find((s) => s.name === "old")?.orphan, false);
+  assert.equal(proj.orphanCount, 0);
+});
+
+test("buildContainerTree: path aliases merge a symlinked discovered target into the runtime project", () => {
+  const containers = [
+    {
+      ID: "c-minio",
+      Names: "/p-minio-1",
+      Labels:
+        "com.docker.compose.project=p,com.docker.compose.service=minio,com.docker.compose.project.config_files=/alias/p/compose.dev.yaml,com.docker.compose.project.working_dir=/alias/p",
+      State: "running",
+      Status: "Up 47 hours",
+    },
+  ];
+  const discoveredCompose = [
+    {
+      project: "p",
+      filePath: "/real/p/compose.dev.yaml",
+      files: ["/real/p/compose.dev.yaml"],
+      folder: "/real/p",
+      config: { services: { api: {}, s3: {} } },
+    },
+  ];
+  const pathAliases = new Map([
+    ["/alias/p", "/real/p"],
+    ["/alias/p/compose.dev.yaml", "/real/p/compose.dev.yaml"],
+  ]);
+
+  const items = buildContainerTree({
+    containers,
+    discoveredCompose,
+    spaceRoot: "/real",
+    pathAliases,
+  }).find((g) => g.id === "projects").items;
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].name, "p");
+  assert.equal(items[0].inSpace, true);
+  assert.deepEqual(items[0].configFiles, ["/real/p/compose.dev.yaml"]);
+  assert.equal(items[0].services.find((s) => s.name === "minio")?.orphan, true);
+  assert.equal(items[0].services.find((s) => s.name === "s3")?.notCreated, true);
+});
+
+test("buildContainerActionArgsForMany: batches container lifecycle commands", () => {
+  assert.deepEqual(buildContainerActionArgsForMany("stop", ["a1", "b2"]), ["docker", "stop", "a1", "b2"]);
+  assert.throws(() => buildContainerActionArgsForMany("stop", []), /At least one container/);
+});
+
 test("buildContainerTree: handles not-created services for discovered projects", () => {
   const discoveredCompose = [
     {
@@ -804,6 +919,7 @@ test("buildContainerActionArgs: supports lifecycle actions and rejects invalid a
 test("buildContainerRmArgs: standard vs force removal", () => {
   assert.deepEqual(buildContainerRmArgs("c1"), ["docker", "rm", "c1"]);
   assert.deepEqual(buildContainerRmArgs("c1", { force: true }), ["docker", "rm", "-f", "c1"]);
+  assert.deepEqual(buildContainerRmArgs(["c1", "c2"], { force: true }), ["docker", "rm", "-f", "c1", "c2"]);
 });
 
 test("parseDockerfileExpose: extracts valid exposed ports", () => {
@@ -1058,6 +1174,34 @@ test("getServiceMenuItems: includes port actions and reflects service state", ()
 
   const rebuildItem = items.find((i) => i.id === "rebuild");
   assert.equal(rebuildItem?.enabled, true);
+});
+
+test("getServiceMenuItems: orphan services disable compose-only actions", () => {
+  const service = {
+    kind: "service",
+    name: "minio",
+    orphan: true,
+    runningCount: 1,
+    totalCount: 1,
+    notCreated: false,
+    containers: [{ id: "c1", ports: "0.0.0.0:9000->9000/tcp" }],
+  };
+  const project = { name: "node-aec", configFiles: ["/work/node-aec/compose.dev.yaml"] };
+  const items = getServiceMenuItems(service, project);
+
+  assert.equal(items.find((i) => i.id === "logs")?.enabled, true);
+  assert.equal(items.find((i) => i.id === "stop")?.enabled, true);
+  assert.equal(items.find((i) => i.id === "up")?.enabled, false);
+  assert.equal(items.find((i) => i.id === "up")?.disabledReason, "service not in compose config");
+  assert.equal(items.find((i) => i.id === "rebuild")?.enabled, false);
+  assert.equal(items.find((i) => i.id === "recreate")?.enabled, false);
+  assert.equal(items.find((i) => i.id === "remove")?.label, "Remove orphan container(s)");
+});
+
+test("buildConfirmationSpec: explains orphan removal", () => {
+  const spec = buildConfirmationSpec("remove", { kind: "service", project: "node-aec", name: "minio", orphan: true });
+  assert.match(spec.title, /Orphan/);
+  assert.match(spec.message, /no longer declares/);
 });
 
 test("getContainerMenuItems: returns lifecycle items for container", () => {

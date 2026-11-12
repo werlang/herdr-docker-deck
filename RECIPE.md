@@ -12,6 +12,7 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - **Containers tree**:
   - **Compose projects** with aggregate running count (`●4/4`), compose file basename, **"this space"** badge, and expandable service rows.
   - **Service rows** with a state dot, service name, and compact uptime/status text. Health detail, published ports, mounts and networks stay in the **Details** drawer, opened by clicking the row; long values wrap there instead of truncating.
+  - **Orphaned services**: after a service is renamed or removed, Compose leaves the old container behind. The row is still visible (it is a real container) but carries an `orphan` badge and the project row counts it, with Logs/Start/Stop/Restart/Remove routed to the container instead of `docker compose`.
   - **Dockerfiles** discovered in the active workspace and their containers.
   - **Standalone** containers.
 - **Inspector drawer**: a collapsible bottom pane (`220px`) displaying the selected service or container's project, image, container ID, health log, ports, mounts, networks, and compose files.
@@ -27,7 +28,8 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
   - **Dockerfile**: `Build image…`, `Build & run…`, `Rebuild & replace`, `Open Dockerfile`.
   - **Volume**: `Inspect`, `Browse` (read-only Alpine shell), `Size`, `Backup…` (`.tar.gz`), `Restore…`, `Clone…`, `Remove`.
   - **Image / Network**: `Inspect`, `Run` / `Disconnect`, `Prune`, `Remove`.
-- Choosing **Logs** or **Shell** opens a Herdr terminal tab (`Alt`-click splits down) running `docker compose logs -f` or `docker exec -it <id> bash/sh`, reusing an existing terminal when already open in the space.
+- Choosing **Logs** or **Shell** opens a Herdr terminal tab (`Alt`-click splits down) running `docker compose logs -f` or `docker exec -it <id> bash/sh`, reusing an existing terminal when already open in the space. For an orphaned service, Logs runs `docker logs -f <container>` because Compose returns `no such service`.
+- Service rows missing from the resolved compose config are marked **orphan**; the project row shows the count. Removing one deletes its leftover containers (`docker rm -f`), not a Compose service.
 - Destructive actions always confirm; data-destroying actions (`down -v`, volume remove/restore, `prune -a`) require typing the target name.
 
 ## Built from
@@ -44,6 +46,7 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - Pause the 3s status poll whenever the Docker panel is hidden in the `panel-body` stack so background spaces cost zero CPU/processes. An inspector tab polls only its Stats sub-view, never the full list/workspace sweep.
 - Cache the workspace `find`/`stat` scan; re-run it only on cwd change, folder-watch event, or manual Refresh.
 - Compose actions run from the project working directory, not the space root; otherwise `docker compose` can fall back to a default `compose.yaml`.
+- Compare container-label paths and workspace-scan paths through resolved `realpath` aliases. A symlinked workspace root (`/Documents/Workspaces -> /workspaces`) otherwise splits one Compose project into a runtime row plus a duplicate discovered-only row and breaks **This space** containment.
 - The inspector tab mounts its own dialog overlays (Run/Tag/Backup/Restore/Clone) and reloads its target after actions, so Stop turns into Start.
 - Async actions post progress with `notify()`, so the active toast mod (`toast-edited`) renders them; the action never blocks the UI. Docker actions run in a hidden `hc` terminal (`hc run --bg --json --no-parent`), and the toast modal's action peeks that terminal with `terminal.peek`; `hc wait`/`hc read` collect the result and `hc rm` cleans up after a grace period.
 - The inspector header uses the standard split-right/split-down icons; each opens Herdr's **New pane chooser** in a new pane of the same tab (terminal or any installed agent). Without `new-pane`, it opens a terminal. The header wraps so split/zoom/close stay reachable in narrow panes.
@@ -61,6 +64,7 @@ A native Docker & Compose deck for Herdr: inspect and operate Compose projects, 
 - `herdr-app check mods/docker-manager` passes with zero errors.
 - `docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/*.test.js` passes all unit tests; `test/mod-safety.test.js` fails on a chained element method that is not in `gpui-kit.d.ts` (it cannot judge a call on a receiver it cannot type, so the studio check is still the authority).
 - Running and stopped containers appear grouped under their Compose project and service, and uncreated services from workspace Compose files appear as `not created`.
+- Renaming or removing a service does not leave an unlabelled stale row: leftover containers are marked **orphan**, and Logs/Start/Stop/Restart/Remove work against the container.
 - Project and single-service lifecycle actions (`Up`, `Down`, `Start`, `Stop`, `Restart`, `Rebuild`, `Remove`) work from the right-click menu.
 - **Logs** and **Shell** open working Herdr terminals for the chosen service or container.
 - Images, volumes, and networks can be inspected and pruned, and volume backup/restore round-trips data cleanly.
