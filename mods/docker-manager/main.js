@@ -60,6 +60,7 @@ import {
   resolveDockerMenuPosition,
   groupDiscoveredComposeFiles,
   parseComposeConfigJson,
+  composeProjectNameFromFolder,
   parseDockerfileExpose,
   getDockerfileMenuItems,
   buildDockerfileBuildArgs,
@@ -124,6 +125,7 @@ export default class DockerManager extends View {
     this.expandedServices = new Set();
     this.rowByKey = new Map();
     this.projectByName = new Map();
+    this.projectByDisplay = new Map();
 
     // Double-click tracking (DM-14, DM-44)
     this.lastClickedKey = null;
@@ -1005,23 +1007,24 @@ export default class DockerManager extends View {
                 parsedConfig = parseComposeConfigJson(cfgRes.stdout);
                 configErr = null;
               } else {
-                parsedConfig = { projectName: entry.name, services: {} };
+                parsedConfig = { projectName: composeProjectNameFromFolder(entry.folder), services: {} };
                 configErr = (cfgRes.stderr || cfgRes.stdout).trim();
               }
             } catch (err) {
-              parsedConfig = { projectName: entry.name, services: {} };
+              parsedConfig = { projectName: composeProjectNameFromFolder(entry.folder), services: {} };
               configErr = err?.message || "Failed to parse compose config";
             }
 
             this.composeConfigCache.set(cacheKey, { config: parsedConfig, configError: configErr });
           }
 
-          const projectName = parsedConfig?.projectName || entry.name;
+          const projectName = parsedConfig?.projectName || composeProjectNameFromFolder(entry.folder);
           resolvedCompose.push({
             filePath: entry.primaryFile,
             files: entry.files,
             folder: entry.folder,
             project: projectName,
+            displayName: entry.name,
             config: parsedConfig,
             configError: configErr,
             isOverride: entry.isOverride,
@@ -1276,7 +1279,16 @@ export default class DockerManager extends View {
         run("tab.new", {
           name: `Inspect: ${row.project} / ${row.data.name}`,
           mod: "docker-manager",
-          props: { inspect: { kind: "container", id: containerId, project: row.project, service: row.data.name } },
+          props: {
+            inspect: {
+              kind: "container",
+              id: containerId,
+              project: row.composeProject || row.project,
+              service: row.data.name,
+              configFiles: row.configFiles,
+              workingDir: row.workingDirs?.[0] || null,
+            },
+          },
         });
         return;
       }
@@ -1354,7 +1366,17 @@ export default class DockerManager extends View {
           this.expandedServices.add(svcKey);
         }
       }
-      this.selectTarget({ ...s, project: row.project, key: row.key }, cx);
+      this.selectTarget(
+        {
+          ...s,
+          project: row.project,
+          composeProject: row.composeProject,
+          configFiles: row.configFiles,
+          workingDirs: row.workingDirs,
+          key: row.key,
+        },
+        cx
+      );
       return;
     }
 
@@ -1386,7 +1408,18 @@ export default class DockerManager extends View {
     }
 
     if (row.type === "inactive-profile-service") {
-      this.selectTarget({ ...row.data, project: row.project, key: row.key, notCreated: true }, cx);
+      this.selectTarget(
+        {
+          ...row.data,
+          project: row.project,
+          composeProject: row.composeProject,
+          configFiles: row.configFiles,
+          workingDirs: row.workingDirs,
+          key: row.key,
+          notCreated: true,
+        },
+        cx
+      );
       return;
     }
 
@@ -1407,7 +1440,7 @@ export default class DockerManager extends View {
     if (row.type === "project") {
       items = getProjectMenuItems(row.data);
     } else if (row.type === "service") {
-      items = getServiceMenuItems(row.data, this.projectByName?.get(row.project));
+      items = getServiceMenuItems(row.data, this.projectByDisplay?.get(row.project) || this.projectByName?.get(row.project));
     } else if (row.type === "replica" || row.type === "df-container" || row.type === "standalone") {
       items = getContainerMenuItems(row.data);
     } else if (row.type === "image") {
@@ -1435,7 +1468,17 @@ export default class DockerManager extends View {
 
     // Also select row
     if (row.type === "service") {
-      this.selectTarget({ ...row.data, project: row.project, key: row.key }, cx);
+      this.selectTarget(
+        {
+          ...row.data,
+          project: row.project,
+          composeProject: row.composeProject,
+          configFiles: row.configFiles,
+          workingDirs: row.workingDirs,
+          key: row.key,
+        },
+        cx
+      );
     } else if (row.type === "replica" || row.type === "df-container" || row.type === "standalone" || row.type === "image" || row.type === "volume" || row.type === "network") {
       this.selectTarget({ ...row.data, type: row.type, key: row.key }, cx);
     }
@@ -1507,11 +1550,14 @@ export default class DockerManager extends View {
     });
 
     const rowData = row.data;
-    const project = row.type === "project" ? rowData : this.projectByName?.get(row.project);
+    const project =
+      row.type === "project"
+        ? rowData
+        : this.projectByDisplay?.get(row.project) || this.projectByName?.get(row.project);
 
     if (row.type === "project") {
       const projTarget = {
-        project: rowData.name,
+        project: rowData.project || rowData.name,
         workingDir: rowData.workingDirs?.[0] || null,
         configFiles: rowData.configFiles || [],
       };
@@ -1562,9 +1608,9 @@ export default class DockerManager extends View {
 
     if (row.type === "service") {
       const projTarget = {
-        project: row.project,
-        workingDir: project?.workingDirs?.[0] || null,
-        configFiles: project?.configFiles || [],
+        project: row.composeProject || project?.project || row.project,
+        workingDir: project?.workingDirs?.[0] || row.workingDirs?.[0] || null,
+        configFiles: project?.configFiles || row.configFiles || [],
       };
       const key = `svc:${row.project}:${rowData.name}`;
       const containerId = rowData.containers?.[0]?.id;
@@ -1583,18 +1629,43 @@ export default class DockerManager extends View {
       } else if (actionId === "recreate") {
         this.runDockerCmd(key, `Recreating service ${rowData.name}`, buildComposeRecreateArgs(projTarget, rowData.name), svcCtx, cx);
       } else if (actionId === "logs") {
-        this.openLogs(rowData, isAlt);
+        this.openLogs(
+          {
+            ...rowData,
+            configFiles: projTarget.configFiles,
+            workingDirs: projTarget.workingDir ? [projTarget.workingDir] : [],
+          },
+          isAlt
+        );
       } else if (actionId === "shell") {
         if (containerId) {
           this.openShell(containerId, rowData.name, isAlt, cx);
         }
       } else if (actionId === "inspect") {
-        this.selectTarget({ ...rowData, project: row.project }, cx);
+        this.selectTarget(
+          {
+            ...rowData,
+            project: row.project,
+            composeProject: projTarget.project,
+            configFiles: projTarget.configFiles,
+            workingDirs: projTarget.workingDir ? [projTarget.workingDir] : [],
+          },
+          cx
+        );
       } else if (actionId === "inspect-tab") {
         run("tab.new", {
           name: `Inspect: ${row.project} / ${rowData.name}`,
           mod: "docker-manager",
-          props: { inspect: { kind: "container", id: containerId, project: row.project, service: rowData.name } },
+          props: {
+            inspect: {
+              kind: "container",
+              id: containerId,
+              project: projTarget.project,
+              service: rowData.name,
+              configFiles: projTarget.configFiles,
+              workingDir: projTarget.workingDir,
+            },
+          },
         });
       } else if (actionId.startsWith("open-port:")) {
         const port = actionId.split(":")[1];
@@ -1752,11 +1823,11 @@ export default class DockerManager extends View {
     if (row.type === "inactive-profile-service" && actionId.startsWith("start-profile:")) {
       const profile = actionId.split(":")[1];
       const projTarget = {
-        project: row.project,
-        workingDir: project?.workingDirs?.[0] || null,
-        configFiles: project?.configFiles || [],
+        project: row.composeProject || row.project,
+        workingDir: row.workingDirs?.[0] || project?.workingDirs?.[0] || null,
+        configFiles: row.configFiles?.length ? row.configFiles : project?.configFiles || [],
       };
-      const argv = ["compose", "-p", row.project];
+      const argv = ["compose", "-p", projTarget.project];
       if (projTarget.workingDir) argv.push("--project-directory", projTarget.workingDir);
       for (const f of projTarget.configFiles) argv.push("-f", f);
       argv.push("--profile", profile, "up", "-d", rowData.name);
@@ -2210,9 +2281,13 @@ export default class DockerManager extends View {
     // fell through to `buildContainerLogsArgs(undefined)` and opened nothing.
     const projTarget =
       target.kind === "project"
-        ? { project: target.name, configFiles: target.configFiles || [], workingDir: target.workingDirs?.[0] }
-        : target.project
-        ? { project: target.project, configFiles: target.configFiles || [], workingDir: target.workingDirs?.[0] }
+        ? { project: target.project || target.name, configFiles: target.configFiles || [], workingDir: target.workingDirs?.[0] }
+        : target.composeProject || target.project
+        ? {
+            project: target.composeProject || target.project,
+            configFiles: target.configFiles || [],
+            workingDir: target.workingDirs?.[0] || null,
+          }
         : null;
 
     let argv;
@@ -2540,6 +2615,9 @@ export default class DockerManager extends View {
               type: "service",
               key: `svc:${proj.name}:${svc.name}`,
               project: proj.name,
+              composeProject: proj.project || proj.name,
+              configFiles: proj.configFiles,
+              workingDirs: proj.workingDirs,
               data: svc,
               hasReplicas,
               expanded: isSvcExpanded,
@@ -2551,6 +2629,7 @@ export default class DockerManager extends View {
                   type: "replica",
                   key: `rep:${ctr.id}`,
                   project: proj.name,
+                  composeProject: proj.project || proj.name,
                   service: svc.name,
                   data: ctr,
                 });
@@ -2565,6 +2644,9 @@ export default class DockerManager extends View {
               type: "profiles-header",
               key: `prof-hdr:${proj.name}`,
               project: proj.name,
+              composeProject: proj.project || proj.name,
+              configFiles: proj.configFiles,
+              workingDirs: proj.workingDirs,
               count: proj.inactiveProfiles.length,
               expanded: isProfilesExpanded,
             });
@@ -2575,6 +2657,9 @@ export default class DockerManager extends View {
                   type: "inactive-profile-service",
                   key: `prof-svc:${proj.name}:${profSvc.name}`,
                   project: proj.name,
+                  composeProject: proj.project || proj.name,
+                  configFiles: proj.configFiles,
+                  workingDirs: proj.workingDirs,
                   data: profSvc,
                 });
               }
@@ -2842,9 +2927,31 @@ export default class DockerManager extends View {
             )
             .when(Boolean(p.configError), (el) =>
               el.child(
-                svg("mods/docker-manager/icons/warning.svg")
-                  .size(13)
-                  .text_color(toColor(t.blocked))
+                h_flex()
+                  .items_center()
+                  .tooltip(p.configError)
+                  .child(
+                    svg("mods/docker-manager/icons/warning.svg")
+                      .size(13)
+                      .text_color(toColor(t.blocked))
+                  )
+              )
+            )
+            .when(Boolean(p.external), (el) =>
+              el.child(
+                h_flex()
+                  .items_center()
+                  .px(4)
+                  .py(1)
+                  .rounded(3)
+                  .bg(toColor(t.raised))
+                  .tooltip("Containers exist but are hidden from docker ps (Docker Desktop extension or filtered daemon).")
+                  .child(
+                    div()
+                      .text_size(9)
+                      .text_color(toColor(t.working))
+                      .child("external")
+                  )
               )
             )
             .when(isBusy, (el) =>
@@ -3457,8 +3564,10 @@ export default class DockerManager extends View {
                           kind,
                           id,
                           name,
-                          project: projName,
+                          project: sel.composeProject || sel.project || projName,
                           service: sel.service || sel.name,
+                          configFiles: sel.configFiles,
+                          workingDir: sel.workingDirs?.[0] || null,
                         },
                       },
                     });
@@ -3756,7 +3865,12 @@ export default class DockerManager extends View {
               );
           })
           .when(!this.inspectLoading && !this.inspectData && Boolean(sel.notCreated), (el) => {
-            const disc = this.discoveredCompose.find((d) => d.project === sel.project);
+            const selFiles = Array.isArray(sel.configFiles) ? sel.configFiles : [];
+            const disc = this.discoveredCompose.find((d) => {
+              const files = Array.isArray(d.files) && d.files.length > 0 ? d.files : [d.filePath];
+              if (selFiles.length > 0) return files.some((file) => selFiles.includes(file));
+              return d.project === (sel.composeProject || sel.project);
+            });
             const sCfg = disc?.config?.services?.[sel.name] || {};
             const image = sCfg.image || (sCfg.build ? (typeof sCfg.build === "string" ? sCfg.build : sCfg.build.context || "build from source") : "None");
             const ports = Array.isArray(sCfg.ports)
@@ -3804,7 +3918,14 @@ export default class DockerManager extends View {
                           focused: focused(),
                           shared,
                         });
-                        const upArgs = buildComposeUpArgs({ project: sel.project }, { service: sel.name });
+                        const upArgs = buildComposeUpArgs(
+                          {
+                            project: sel.composeProject || sel.project,
+                            configFiles: sel.configFiles || [],
+                            workingDir: sel.workingDirs?.[0] || null,
+                          },
+                          { service: sel.name }
+                        );
                         this.runDockerCmd(`svc:${sel.project}:${sel.name}`, `Up service ${sel.name}`, upArgs, ctx, cx);
                       })
                       .child(`Up service "${sel.name}"`)
@@ -4654,7 +4775,14 @@ export default class DockerManager extends View {
                     .hover((s) => s.bg(toColor(t.hover)))
                     .on_click((_e, cx) => {
                       const proj = this.projectByName?.get(p.inspect.project);
-                      const argv = buildComposeRebuildArgs({ project: p.inspect.project, configFiles: proj?.configFiles || [] }, p.inspect.service);
+                      const argv = buildComposeRebuildArgs(
+                        {
+                          project: p.inspect.project,
+                          configFiles: p.inspect.configFiles || proj?.configFiles || [],
+                          workingDir: p.inspect.workingDir || proj?.workingDirs?.[0] || null,
+                        },
+                        p.inspect.service
+                      );
                       this.runDockerCmd(`svc:${p.inspect.project}:${p.inspect.service}`, `Rebuilding ${p.inspect.service}`, argv, ctx, cx);
                     })
                     .child(svg("mods/docker-manager/icons/rebuild.svg").size(11).text_color(toColor(t.accent)))
@@ -6001,7 +6129,15 @@ export default class DockerManager extends View {
     this.rowByKey = new Map(rows.map((r) => [r.key, r]));
 
     const projectsGroup = tree.find((g) => g.id === "projects");
-    this.projectByName = new Map((projectsGroup?.items || []).map((proj) => [proj.name, proj]));
+    const projects = projectsGroup?.items || [];
+    this.projectByDisplay = new Map(projects.map((proj) => [proj.name, proj]));
+    this.projectByName = new Map();
+    for (const proj of projects) {
+      const existing = this.projectByName.get(proj.project);
+      if (!existing || (proj.runtime && !existing.runtime)) {
+        this.projectByName.set(proj.project, proj);
+      }
+    }
 
     return v_flex()
       .size_full()

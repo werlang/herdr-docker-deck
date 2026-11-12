@@ -52,6 +52,8 @@ import {
   resolveDockerMenuPosition,
   groupDiscoveredComposeFiles,
   parseComposeConfigJson,
+  composeProjectNameFromFolder,
+  parseComposeLsStatus,
   parseDockerfileExpose,
   getDockerfileMenuItems,
   buildDockerfileBuildArgs,
@@ -257,6 +259,136 @@ test("buildContainerTree: correctly groups projects from containers.ndjson and c
 
   assert.equal(byName.get("whatsbot")?.runningCount, 3);
   assert.equal(byName.get("whatsbot")?.totalCount, 3);
+});
+
+test("parseComposeLsStatus: parses running and exited counts", () => {
+  assert.deepEqual(parseComposeLsStatus("running(3)"), { running: 3, total: 3 });
+  assert.deepEqual(parseComposeLsStatus("exited(2), running(5)"), { running: 5, total: 7 });
+  assert.deepEqual(parseComposeLsStatus("created(1)"), { running: 0, total: 1 });
+  assert.deepEqual(parseComposeLsStatus(""), { running: 0, total: 0 });
+});
+
+test("composeProjectNameFromFolder: normalizes the folder like Compose does", () => {
+  assert.equal(composeProjectNameFromFolder("/work/mocitec"), "mocitec");
+  assert.equal(composeProjectNameFromFolder("/work/My App"), "my-app");
+  assert.equal(composeProjectNameFromFolder("/work/__Test__"), "test");
+  assert.equal(composeProjectNameFromFolder(""), "compose");
+});
+
+test("buildContainerTree: compose ls-only project keeps its counts and actions", () => {
+  const groups = buildContainerTree({
+    containers: [],
+    composeLs: [
+      {
+        Name: "prizz_deep-dive-desktop-extension",
+        Status: "running(1)",
+        ConfigFiles: "/extensions/prizz/vm/docker-compose.yaml",
+      },
+    ],
+  });
+
+  const proj = groups.find((g) => g.id === "projects")?.items[0];
+  assert.ok(proj);
+  assert.equal(proj.name, "prizz_deep-dive-desktop-extension");
+  assert.equal(proj.runningCount, 1);
+  assert.equal(proj.totalCount, 1);
+  assert.equal(proj.notCreated, false);
+  assert.equal(proj.external, true);
+
+  const menu = getProjectMenuItems(proj);
+  assert.equal(menu.find((i) => i.id === "up")?.enabled, true);
+  assert.equal(menu.find((i) => i.id === "down")?.enabled, true);
+});
+
+test("buildContainerTree: alternative compose files stay separate targets (DM-32)", () => {
+  const discoveredCompose = [
+    {
+      project: "mocitec",
+      displayName: "mocitec",
+      filePath: "/work/mocitec/compose.yaml",
+      files: ["/work/mocitec/compose.yaml"],
+      folder: "/work/mocitec",
+      config: { services: { web: { image: "mocitec-web" } } },
+    },
+    {
+      project: "mocitec",
+      displayName: "mocitec (dev)",
+      filePath: "/work/mocitec/compose.dev.yaml",
+      files: ["/work/mocitec/compose.dev.yaml"],
+      folder: "/work/mocitec",
+      config: { services: { web: { image: "mocitec-web-dev" } } },
+    },
+    {
+      project: "mocitec",
+      displayName: "mocitec (test)",
+      filePath: "/work/mocitec/compose.test.yaml",
+      files: ["/work/mocitec/compose.test.yaml"],
+      folder: "/work/mocitec",
+      config: { services: {} },
+      configError: 'service "web-test" depends on undefined service "web": invalid compose project',
+    },
+  ];
+
+  const items = buildContainerTree({
+    containers: [],
+    composeLs: [],
+    discoveredCompose,
+  }).find((g) => g.id === "projects")?.items;
+
+  assert.deepEqual(items.map((p) => p.name), ["mocitec", "mocitec (dev)", "mocitec (test)"]);
+  assert.equal(new Set(items.map((p) => p.key)).size, 3);
+
+  const dev = items.find((p) => p.name === "mocitec (dev)");
+  assert.deepEqual(dev.configFiles, ["/work/mocitec/compose.dev.yaml"]);
+
+  const testProj = items.find((p) => p.name === "mocitec (test)");
+  assert.match(testProj.configError, /undefined service/);
+});
+
+test("buildContainerTree: a running project only absorbs discovered files it actually uses", () => {
+  const containers = [
+    {
+      ID: "c1",
+      Names: "/mocitec-web-1",
+      Labels:
+        "com.docker.compose.project=mocitec,com.docker.compose.service=web,com.docker.compose.project.config_files=/work/mocitec/compose.dev.yaml,com.docker.compose.project.working_dir=/work/mocitec",
+      State: "running",
+      Status: "Up 2 minutes",
+    },
+  ];
+  const discoveredCompose = [
+    {
+      project: "mocitec",
+      displayName: "mocitec",
+      filePath: "/work/mocitec/compose.yaml",
+      files: ["/work/mocitec/compose.yaml"],
+      folder: "/work/mocitec",
+      config: { services: { web: { image: "mocitec-web" } } },
+    },
+    {
+      project: "mocitec",
+      displayName: "mocitec (dev)",
+      filePath: "/work/mocitec/compose.dev.yaml",
+      files: ["/work/mocitec/compose.dev.yaml"],
+      folder: "/work/mocitec",
+      config: { services: { web: { image: "mocitec-web-dev" } } },
+    },
+  ];
+
+  const items = buildContainerTree({
+    containers,
+    composeLs: [],
+    discoveredCompose,
+  }).find((g) => g.id === "projects")?.items;
+
+  const runtime = items.find((p) => p.name === "mocitec");
+  assert.equal(runtime.runningCount, 1);
+  assert.deepEqual(runtime.configFiles, ["/work/mocitec/compose.dev.yaml"]);
+
+  const base = items.find((p) => p.name === "mocitec (compose.yaml)");
+  assert.ok(base);
+  assert.equal(base.notCreated, true);
+  assert.deepEqual(base.configFiles, ["/work/mocitec/compose.yaml"]);
 });
 
 test("buildContainerTree: handles not-created services for discovered projects", () => {

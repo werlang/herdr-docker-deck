@@ -99,6 +99,10 @@ Key labels extracted per container:
 - `com.docker.compose.depends_on` → declared dependencies
 - `herdr.docker-manager.source` → absolute Dockerfile path for containers started by this mod (`DM-34`)
 
+#### Docker Desktop extension containers
+
+Docker Desktop hides extension containers from an unfiltered `docker container ls` but still lists their projects in `docker compose ls` (e.g. `prizz_deep-dive-desktop-extension`). `buildContainerTree` keeps those projects visible, reconciles their counts from the compose-ls `Status` string, marks them `external`, and leaves lifecycle actions enabled; otherwise the row looked "not created" and Stop/Down were disabled. Uninstalling the extension (`docker extension rm <image>`) is what removes such a project permanently.
+
 ### 4.2 Compose & Dockerfile Workspace Discovery (`DM-30..34`)
 
 When `root` changes or `watchFolder(root)` fires:
@@ -117,13 +121,15 @@ When `root` changes or `watchFolder(root)` fires:
 `buildContainerTree({ containers, composeLs, discoveredCompose, discoveredDockerfiles, spaceRoot, scope })` in `docker-logic.js`:
 
 1. **Compose Projects**:
-   - Keyed by `projectName`.
-   - Merges containers carrying `com.docker.compose.project === projectName`, rows from `docker compose ls`, and discovered Compose configs from the workspace.
+   - `runtime projects` are keyed by Compose project name and merge rows from `docker compose ls` with containers carrying `com.docker.compose.project`. `docker compose ls` status counts are authoritative when a container is hidden from `docker ps` (Docker Desktop extension containers): the row keeps its real running/total counts, gets an **external** badge, and **Stop/Down** stay enabled. `hiddenContainers` records the difference.
+   - `discovered targets` (`DM-30..32`) are separate nodes unless the running project's `config_files` label already contains that target's file set. A variant such as `compose.dev.yaml` therefore gets its own row (`mocitec (dev)`) instead of being merged into the base project and passed as an extra `-f` on every action. If several targets share a Compose project name, each row gets a distinct display name (variant label, or the file basename when the label is the same).
+   - `key` is a stable unique row id (project name for runtime projects, `disc:<folder>:<files>` for discovered-only targets); `project` is the name passed to `docker compose -p`; `name` is the display label.
    - Records `workingDirs: Set<string>` and `configFiles: Set<string>` across all containers of the project. If `workingDirs.size > 1`, sets `mixedSources: true` (`DM-25`).
    - Sets `inSpace = true` if any `workingDir` or `configFile` is equal to or inside `spaceRoot`.
    - Within each project, merges running/stopped containers by `serviceName` with declared services from `compose config`:
      - Services present in `compose config` with 0 containers get a synthetic `status: "not-created"` service node (`DM-24`).
      - Services in an inactive Compose profile without containers go under the project's `inactiveProfiles` group (`DM-33`).
+   - A target whose `compose config` failed carries `configError`; the row shows the warning icon with the Compose error as its tooltip (`DM-31`).
 2. **Dockerfile Projects**:
    - Matches containers with label `herdr.docker-manager.source` to discovered Dockerfiles (plus any running container with that label outside the workspace when `scope === "all"`).
 3. **Standalone Containers**:

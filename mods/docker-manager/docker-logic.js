@@ -588,6 +588,48 @@ export function normalizeContainerInspect(raw) {
 }
 
 /**
+ * Parses `docker compose ls` status strings such as `running(3)` or
+ * `exited(2), running(5)`. Docker Desktop hides extension containers from an
+ * unfiltered `docker ps`, but compose ls still reports their counts.
+ *
+ * @param {string} status
+ * @returns {{ running: number, total: number }}
+ */
+export function parseComposeLsStatus(status) {
+  const result = { running: 0, total: 0 };
+  if (typeof status !== "string") return result;
+
+  const re = /([a-z]+)\((\d+)\)/gi;
+  let match;
+  while ((match = re.exec(status)) !== null) {
+    const count = parseInt(match[2], 10) || 0;
+    result.total += count;
+    if (match[1].toLowerCase() === "running") result.running += count;
+  }
+  return result;
+}
+
+/**
+ * Derives the project name Compose would use for a folder when a config file
+ * cannot be resolved (Compose lowercases the folder and keeps `[a-z0-9_-]`).
+ *
+ * @param {string} folder
+ * @param {string} [fallback="compose"]
+ * @returns {string}
+ */
+export function composeProjectNameFromFolder(folder, fallback = "compose") {
+  const base = String(folder || "")
+    .split("/")
+    .filter(Boolean)
+    .pop() || fallback;
+  const normalized = base
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  return normalized || fallback;
+}
+
+/**
  * Builds the hierarchical container tree according to DM-20..27, DM-35..36.
  *
  * @param {object} params
@@ -667,43 +709,25 @@ export function buildContainerTree({
   });
 
   // Step 2: Assemble Compose Projects
-  const projectMap = new Map();
+  const runtimeProjects = new Map();
 
   // Seed projects from compose ls
   for (const item of composeLs) {
     const name = item.Name || item.name;
-    if (name && !projectMap.has(name)) {
+    if (name && !runtimeProjects.has(name)) {
       const configFiles = (item.ConfigFiles || item.configFiles || "").split(",").filter(Boolean);
-      projectMap.set(name, {
-        name,
+      const lsStatus = item.Status || item.status || "";
+      const counts = parseComposeLsStatus(lsStatus);
+      runtimeProjects.set(name, {
+        project: name,
         containers: [],
         configFiles,
         workingDirs: new Set(),
         discoveredConfig: null,
+        lsStatus,
+        lsRunning: counts.running,
+        lsTotal: counts.total,
       });
-    }
-  }
-
-  // Seed projects from discovered compose files
-  for (const disc of discoveredCompose) {
-    const name = disc.project;
-    if (name) {
-      if (!projectMap.has(name)) {
-        projectMap.set(name, {
-          name,
-          containers: [],
-          configFiles: [disc.filePath],
-          workingDirs: new Set(disc.folder ? [disc.folder] : []),
-          discoveredConfig: disc,
-        });
-      } else {
-        const p = projectMap.get(name);
-        if (!p.discoveredConfig) p.discoveredConfig = disc;
-        if (disc.filePath && !p.configFiles.includes(disc.filePath)) {
-          p.configFiles.push(disc.filePath);
-        }
-        if (disc.folder) p.workingDirs.add(disc.folder);
-      }
     }
   }
 
@@ -711,16 +735,19 @@ export function buildContainerTree({
   const nonComposeContainers = [];
   for (const c of normalizedContainers) {
     if (c.project) {
-      if (!projectMap.has(c.project)) {
-        projectMap.set(c.project, {
-          name: c.project,
+      if (!runtimeProjects.has(c.project)) {
+        runtimeProjects.set(c.project, {
+          project: c.project,
           containers: [],
           configFiles: [...c.configFiles],
           workingDirs: new Set(),
           discoveredConfig: null,
+          lsStatus: "",
+          lsRunning: 0,
+          lsTotal: 0,
         });
       }
-      const p = projectMap.get(c.project);
+      const p = runtimeProjects.get(c.project);
       p.containers.push(c);
       if (c.workingDir) p.workingDirs.add(c.workingDir);
       for (const cf of c.configFiles) {
@@ -731,9 +758,73 @@ export function buildContainerTree({
     }
   }
 
+  // Discovered compose files (DM-32). A variant such as compose.dev.yaml is a
+  // separate target unless the running project's config_files label already ties
+  // it to the project. Merging by project name alone made Up pass every variant
+  // as `-f` (compose.yaml + compose.dev.yaml) and made alternatives look like one
+  // project.
+  const discoveredTargets = [];
+  for (const disc of discoveredCompose) {
+    const projectName = disc.project || disc.name;
+    if (!projectName) continue;
+
+    const files =
+      Array.isArray(disc.files) && disc.files.length > 0
+        ? disc.files.filter(Boolean)
+        : [disc.filePath].filter(Boolean);
+    const runtime = runtimeProjects.get(projectName);
+    const tiedToRuntime =
+      Boolean(runtime) &&
+      files.length > 0 &&
+      files.every((file) => runtime.configFiles.includes(file));
+
+    if (tiedToRuntime) {
+      const current = runtime.discoveredConfig;
+      const currentFileCount = current ? (current.files || [current.filePath]).filter(Boolean).length : 0;
+      if (!current || files.length > currentFileCount) {
+        runtime.discoveredConfig = disc;
+      }
+      if (disc.folder) runtime.workingDirs.add(disc.folder);
+      continue;
+    }
+
+    discoveredTargets.push({
+      key: `disc:${disc.folder || ""}:${files.join(",") || disc.filePath || projectName}`,
+      project: projectName,
+      displayName: disc.displayName || disc.name || projectName,
+      containers: [],
+      configFiles: files,
+      workingDirs: new Set(disc.folder ? [disc.folder] : []),
+      discoveredConfig: disc,
+      lsStatus: "",
+      lsRunning: 0,
+      lsTotal: 0,
+      primaryFile: files[0] || disc.filePath || null,
+    });
+  }
+
+  const projectEntries = [
+    ...Array.from(runtimeProjects.entries()).map(([project, data]) => ({
+      key: project,
+      project,
+      data,
+      runtime: true,
+      primaryFile: data.configFiles[0] || null,
+    })),
+    ...discoveredTargets.map((data) => ({
+      key: data.key,
+      project: data.project,
+      data,
+      runtime: false,
+      primaryFile: data.primaryFile,
+    })),
+  ];
+
   // Build Compose Project Nodes
   const projectNodes = [];
-  for (const [projName, projData] of projectMap.entries()) {
+  for (const entry of projectEntries) {
+    const projName = entry.project;
+    const projData = entry.data;
     const workingDirsList = Array.from(projData.workingDirs);
     const mixedSources = workingDirsList.length > 1; // DM-25
 
@@ -852,10 +943,21 @@ export function buildContainerTree({
       return a.name.localeCompare(b.name);
     });
 
-    // Project aggregate status
+    // Project aggregate status. `docker compose ls` is authoritative for
+    // containers the listing command cannot see (Docker Desktop hides extension
+    // containers from an unfiltered `docker ps`); without this reconciliation a
+    // running project looked "not created" and Down/Stop stayed disabled.
     const allContainers = projData.containers;
-    const runningContainersCount = allContainers.filter((c) => c.running).length;
-    const totalContainersCount = allContainers.length;
+    const visibleRunningCount = allContainers.filter((c) => c.running).length;
+    const visibleTotalCount = allContainers.length;
+    const lsTotal = projData.lsTotal || 0;
+    const lsRunning = projData.lsRunning || 0;
+    const totalContainersCount = Math.max(visibleTotalCount, lsTotal);
+    const runningContainersCount = Math.max(
+      visibleRunningCount,
+      Math.min(lsRunning, totalContainersCount)
+    );
+    const hiddenContainers = Math.max(0, totalContainersCount - visibleTotalCount);
     const isProjectNotCreated = totalContainersCount === 0;
 
     let aggregateStatus = "stopped";
@@ -880,7 +982,12 @@ export function buildContainerTree({
 
     projectNodes.push({
       kind: "project",
+      key: entry.key,
       name: projName,
+      project: projName,
+      displayName: entry.displayName || projData.displayName || null,
+      primaryFile: entry.primaryFile || null,
+      runtime: entry.runtime,
       inSpace,
       mixedSources,
       workingDirs: workingDirsList,
@@ -888,12 +995,55 @@ export function buildContainerTree({
       composeBasenames,
       runningCount: runningContainersCount,
       totalCount: totalContainersCount,
+      hiddenContainers,
+      external: hiddenContainers > 0,
       notCreated: isProjectNotCreated,
       status: aggregateStatus,
       statusColor: aggregateColor,
+      configError: projData.discoveredConfig?.configError || null,
       services: serviceNodes,
       inactiveProfiles: inactiveProfilesList,
     });
+  }
+
+  // Resolve display names: a project with a single target keeps the Compose
+  // project name; alternative targets that share a name (compose.yaml,
+  // compose.dev.yaml, ...) get their variant label so each row is distinct.
+  const targetsByProject = new Map();
+  for (const node of projectNodes) {
+    if (!targetsByProject.has(node.project)) targetsByProject.set(node.project, []);
+    targetsByProject.get(node.project).push(node);
+  }
+  const usedNames = new Set();
+  for (const nodes of targetsByProject.values()) {
+    nodes.sort((a, b) => (a.runtime === b.runtime ? 0 : a.runtime ? -1 : 1));
+    for (const node of nodes) {
+      let name = node.project;
+      if (nodes.length > 1 && node.displayName && node.displayName !== node.project) {
+        name = node.displayName;
+      }
+      let candidate = name;
+      if (usedNames.has(candidate)) {
+        const basename = node.primaryFile ? node.primaryFile.split("/").pop() : "";
+        if (basename && !usedNames.has(`${node.project} (${basename})`)) {
+          candidate = `${node.project} (${basename})`;
+        } else {
+          let suffix = 2;
+          while (usedNames.has(`${name} #${suffix}`)) suffix += 1;
+          candidate = `${name} #${suffix}`;
+        }
+      }
+      node.name = candidate;
+      usedNames.add(candidate);
+      for (const service of node.services) {
+        service.project = candidate;
+        service.composeProject = node.project;
+      }
+    }
+  }
+  for (const node of projectNodes) {
+    delete node.displayName;
+    delete node.primaryFile;
   }
 
   // Sort projects: inSpace first, then alphabetical (DM-20, DM-27)
@@ -980,7 +1130,10 @@ export function buildContainerTree({
   if (normFilter) {
     filteredProjects = [];
     for (const p of projectNodes) {
-      const pMatches = p.name.toLowerCase().includes(normFilter) || p.composeBasenames.toLowerCase().includes(normFilter);
+      const pMatches =
+        p.name.toLowerCase().includes(normFilter) ||
+        (p.project || "").toLowerCase().includes(normFilter) ||
+        p.composeBasenames.toLowerCase().includes(normFilter);
       const matchingServices = [];
       for (const s of p.services) {
         const sMatches = s.name.toLowerCase().includes(normFilter) || s.portsText.toLowerCase().includes(normFilter);
