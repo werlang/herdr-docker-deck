@@ -49,6 +49,7 @@ import {
   buildConfirmationSpec,
   findExistingActionTerminal,
   clampMenuPosition,
+  resolveDockerMenuPosition,
   groupDiscoveredComposeFiles,
   parseComposeConfigJson,
   parseDockerfileExpose,
@@ -1100,6 +1101,37 @@ test("parseDockerSizeBytes: parses B, kB, MB, GB, TB, and 0B accurately", () => 
   assert.equal(parseDockerSizeBytes("1GiB"), 1073741824);
   assert.equal(parseDockerSizeBytes("1TB"), 1000000000000);
   assert.equal(parseDockerSizeBytes(12345), 12345);
+});
+
+test("resolveDockerMenuPosition: zooms and clamps inside the panel", () => {
+  const zoomed = resolveDockerMenuPosition({
+    localPosition: { x: 100, y: 100 },
+    bounds: { x: 0, y: 0, width: 600, height: 600 },
+    zoom: 2,
+    menuWidth: 100,
+    menuHeight: 100,
+  });
+  assert.equal(zoomed.x, 50);
+  assert.equal(zoomed.y, 50);
+
+  const edge = resolveDockerMenuPosition({
+    localPosition: { x: 580, y: 580 },
+    bounds: { x: 0, y: 0, width: 600, height: 600 },
+    zoom: 1,
+    menuWidth: 100,
+    menuHeight: 100,
+  });
+  assert.ok(edge.x + 100 <= 592, `x ${edge.x} overflows the panel`);
+  assert.ok(edge.y + 100 <= 592, `y ${edge.y} overflows the panel`);
+
+  const leakedWindow = resolveDockerMenuPosition({
+    event: { position: { x: 1400, y: 900 }, bounds: { x: 900, y: 100, width: 400, height: 400 } },
+    zoom: 1,
+    menuWidth: 100,
+    menuHeight: 100,
+  });
+  assert.equal(leakedWindow.x, 120);
+  assert.equal(leakedWindow.y, 120);
 });
 
 test("clampMenuPosition: clamps correctly to all four edges", () => {

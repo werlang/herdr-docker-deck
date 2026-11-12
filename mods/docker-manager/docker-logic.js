@@ -1718,6 +1718,78 @@ export function clampMenuPosition(
 }
 
 /**
+ * Resolves the panel-local position for a right-click menu from a bubbled
+ * panel-root event. The file-editor fix for the same problem: `local_position`
+ * is pane-relative while `position` is window-relative, and GPUI reports both
+ * in zoomed pixels; divide by the window zoom and clamp/flip inside the pane.
+ *
+ * @param {{
+ *   bounds?: {x:number,y:number,width:number,height:number} | null,
+ *   event?: {position?: {x:number,y:number}, bounds?: object} | null,
+ *   localPosition?: {x:number,y:number} | null,
+ *   zoom?: number,
+ *   menuWidth?: number,
+ *   menuHeight?: number,
+ *   defaultX?: number,
+ *   defaultY?: number,
+ * }} [input]
+ * @returns {{x: number, y: number}}
+ */
+export function resolveDockerMenuPosition({
+  bounds = null,
+  event = null,
+  localPosition = null,
+  zoom = 1,
+  menuWidth = 220,
+  menuHeight = 260,
+  defaultX = 120,
+  defaultY = 120,
+} = {}) {
+  const scale = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  const margin = 8;
+  const paneBounds = bounds || event?.bounds || null;
+  const paneX = Number.isFinite(paneBounds?.x) ? paneBounds.x : 0;
+  const paneY = Number.isFinite(paneBounds?.y) ? paneBounds.y : 0;
+  const paneW = Number.isFinite(paneBounds?.width) && paneBounds.width > 0 ? paneBounds.width / scale : 0;
+  const paneH = Number.isFinite(paneBounds?.height) && paneBounds.height > 0 ? paneBounds.height / scale : 0;
+
+  let x =
+    typeof localPosition?.x === "number"
+      ? localPosition.x / scale
+      : typeof event?.position?.x === "number"
+        ? (event.position.x - paneX) / scale
+        : defaultX;
+  let y =
+    typeof localPosition?.y === "number"
+      ? localPosition.y / scale
+      : typeof event?.position?.y === "number"
+        ? (event.position.y - paneY) / scale
+        : defaultY;
+
+  // Raw window coordinates leaking into the pane would clamp to the far edge;
+  // use the default near the top-left instead.
+  if (paneW && (x < -margin || x > paneW + margin)) x = defaultX;
+  if (paneH && (y < -margin || y > paneH + margin)) y = defaultY;
+
+  if (paneW) {
+    if (x + menuWidth > paneW - margin) {
+      const flipped = x - menuWidth;
+      x = flipped >= margin ? flipped : Math.max(margin, paneW - menuWidth - margin);
+    }
+    x = Math.max(margin, Math.min(x, Math.max(margin, paneW - margin - menuWidth)));
+  }
+  if (paneH) {
+    if (y + menuHeight > paneH - margin) {
+      const flipped = y - menuHeight;
+      y = flipped >= margin ? flipped : Math.max(margin, paneH - menuHeight - margin);
+    }
+    y = Math.max(margin, Math.min(y, Math.max(margin, paneH - margin - menuHeight)));
+  }
+
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+/**
  * Groups discovered Compose files by folder and pairs overrides (DM-30..32, DESIGN §4.2).
  *
  * @param {string[]} filePaths

@@ -18,6 +18,7 @@ import {
   focused,
   terminals,
   props,
+  settings,
   layout,
   theme,
   shared,
@@ -56,7 +57,7 @@ import {
   getContainerMenuItems,
   buildConfirmationSpec,
   findExistingActionTerminal,
-  clampMenuPosition,
+  resolveDockerMenuPosition,
   groupDiscoveredComposeFiles,
   parseComposeConfigJson,
   parseDockerfileExpose,
@@ -107,7 +108,6 @@ export default class DockerManager extends View {
 
     // Panel size & tracking
     this.panelSize = { width: 368, height: 600 };
-    this.panelOrigin = { x: 0, y: 0 };
 
     // Filter input (DM-12)
     this.filterQuery = "";
@@ -138,6 +138,7 @@ export default class DockerManager extends View {
 
     // Overlays: Context menu, confirmation dialog, toolbar menu (DM-10, DM-14, DM-85..86)
     this.contextMenu = null; // { row, x, y, items }
+    this.pendingContextTarget = null; // row key remembered by the row, opened by the panel root
     this.confirmDialog = null; // { title, message, confirmLabel, destructive, typedTarget, onConfirm }
     this.confirmInput = InputState.new("");
     this.confirmInputValue = "";
@@ -1391,7 +1392,10 @@ export default class DockerManager extends View {
     }
   }
 
-  handleRowSecondaryClick(key, event, cx) {
+  openRowContextMenu(event, cx) {
+    const key = this.pendingContextTarget;
+    this.pendingContextTarget = null;
+    if (!key) return;
     const row = this.rowByKey.get(key);
     if (!row) return;
 
@@ -1432,27 +1436,24 @@ export default class DockerManager extends View {
       this.selectTarget({ ...row.data, type: row.type, key: row.key }, cx);
     }
 
-    // The menu paints inside the panel overlay, but the event reports window
-    // coordinates; subtract the panel origin captured from the last mouse move.
-    const clickX =
-      typeof event?.position?.x === "number" ? event.position.x - this.panelOrigin.x : 120;
-    const clickY =
-      typeof event?.position?.y === "number" ? event.position.y - this.panelOrigin.y : 120;
+    // The panel root's bubbled press reports `local_position` relative to the
+    // panel, which is the coordinate space this overlay paints in. The helper
+    // handles zoom, edge flipping and the window-coordinate fallback.
     const menuW = 220;
-    const menuH = Math.min(320, items.length * 26 + 16);
-    const clamped = clampMenuPosition(
-      clickX,
-      clickY,
-      menuW,
-      menuH,
-      this.panelSize.width,
-      this.panelSize.height
-    );
+    const menuH = Math.min(360, items.length * 26 + 16);
+    const pos = resolveDockerMenuPosition({
+      event,
+      localPosition: event?.local_position,
+      bounds: event?.bounds,
+      zoom: Number(settings()?.zoom) || 1,
+      menuWidth: menuW,
+      menuHeight: menuH,
+    });
 
     this.contextMenu = {
       row,
-      x: clamped.x,
-      y: clamped.y,
+      x: pos.x,
+      y: pos.y,
       items,
     };
     cx.notify();
@@ -2672,7 +2673,9 @@ export default class DockerManager extends View {
       .id(row.key)
       .cursor_pointer()
       .cursor_context_menu()
-      .on_mouse_down("right", (event, cx2) => this.handleRowSecondaryClick(row.key, event, cx2))
+      .on_mouse_down("right", () => {
+        this.pendingContextTarget = row.key;
+      })
       .on_click((_event, cx2) => this.handleRowClick(row.key, cx2));
   }
 
@@ -7043,14 +7046,7 @@ export default class DockerManager extends View {
       .on_size_change((size, cx) => {
         this.panelSize = size;
       })
-      .on_mouse_move((e, _cx) => {
-        if (e.position && e.local_position) {
-          this.panelOrigin = {
-            x: e.position.x - e.local_position.x,
-            y: e.position.y - e.local_position.y,
-          };
-        }
-      })
+      .on_mouse_down("right", (event, cx) => this.openRowContextMenu(event, cx))
       .on_key_down((e, cx) => {
         if (e.key === "Escape") {
           if (this.contextMenu) {
