@@ -257,7 +257,7 @@ export default class DockerManager extends View {
     this.composeConfigCache = new Map();
     this.expandedProfiles = new Set();
     this.watchedCwd = null;
-    this.scannedCwd = null;
+    this.scannedKey = null; // "<machine>|<folder>" of the last workspace scan
     this.workspaceDirty = true;
     // Docker records the paths used at container-creation time; they can be a
     // symlinked form of the space root (e.g. /Documents/Workspaces -> /workspaces).
@@ -388,10 +388,25 @@ export default class DockerManager extends View {
     // The read is an await, so it must not run on the event context (AGENTS.md).
     this.buildDockerfileDialog(df, action, "");
     cx.notify();
+    // The scan found this file on the space's machine; read it there too, so a
+    // remote Dockerfile never falls back to a same-path file on this computer.
+    const { on } = resolveDockerContext({
+      props: props(),
+      spaces: spaces(),
+      panes: panes(),
+      terminals: terminals(),
+      focused: focused(),
+      shared,
+    });
     cx.spawn(async (cx) => {
       let content = "";
       try {
-        content = await readTextFile(df.filePath);
+        if (on === null) {
+          content = await readTextFile(df.filePath);
+        } else {
+          const res = await exec("cat", ["--", df.filePath], { on, timeout: 5000 });
+          content = (res.code ?? res.exitCode) === 0 ? res.stdout || "" : "";
+        }
       } catch {
         content = "";
       }
@@ -880,10 +895,26 @@ export default class DockerManager extends View {
 
   /** Background workspace scan for Compose files & Dockerfiles (DM-30..34) */
   async scanWorkspace(ctx) {
-    if (!ctx.cwd || ctx.on !== null) return; // local spaces scan
+    // One key per (machine, folder): the same absolute path can exist on two
+    // machines, and results from one space must never survive into another.
+    const scanKey = `${ctx.on ?? ""}|${ctx.cwd || ""}`;
+    if (this.scannedKey !== scanKey) {
+      this.discoveredCompose = [];
+      this.discoveredDockerfiles = [];
+      this.workspaceDirty = true;
+    }
+    if (!ctx.cwd) {
+      this.scannedKey = scanKey;
+      this.workspaceDirty = false;
+      return;
+    }
 
-    // Setup folder watch if cwd changed (DESIGN §4.2)
-    if (this.watchedCwd !== ctx.cwd) {
+    // watchFolder() is local-only: remote spaces rescan on folder change or a
+    // manual refresh, and switching to one stops the local watcher loop.
+    if (ctx.on !== null) {
+      this.watchedCwd = null;
+    } else if (this.watchedCwd !== ctx.cwd) {
+      // Setup folder watch if cwd changed (DESIGN §4.2)
       this.watchedCwd = ctx.cwd;
       this.workspaceDirty = true;
       const targetCwd = ctx.cwd;
@@ -908,10 +939,12 @@ export default class DockerManager extends View {
 
     // The 3s status poll must not re-run `find`/`stat` over the workspace.
     // Only a cwd change, a folder-watch event, or a manual refresh sets this.
-    if (!this.workspaceDirty && this.scannedCwd === ctx.cwd) return;
+    if (!this.workspaceDirty && this.scannedKey === scanKey) return;
     this.workspaceDirty = false;
-    this.scannedCwd = ctx.cwd;
+    this.scannedKey = scanKey;
     this.pathAliasMisses.clear();
+    // A space switch mid-scan starts a new scan; this one must not publish.
+    const stillCurrent = () => this.scannedKey === scanKey;
 
     try {
       const findRes = await exec(
@@ -958,8 +991,9 @@ export default class DockerManager extends View {
           ")",
           "-print",
         ],
-        { timeout: 5000 }
+        { on: ctx.on, timeout: ctx.on !== null ? 10000 : 5000 }
       );
+      if (!stillCurrent()) return;
 
       if ((findRes.code ?? findRes.exitCode) === 0) {
         const lines = findRes.stdout
@@ -994,15 +1028,23 @@ export default class DockerManager extends View {
 
         for (const entry of groups) {
           // Stat files to get mtimes
+          // BSD stat (macOS) takes `-f %m`; GNU stat (Linux hosts such as a
+          // remote Pi) reads `-f` as "filesystem status" and needs `-c %Y`.
           let mtimes = "";
-          try {
-            const statRes = await exec("stat", ["-f", "%m", ...entry.files], { timeout: 3000 });
-            if ((statRes.code ?? statRes.exitCode) === 0) {
-              mtimes = statRes.stdout.trim().replace(/\s+/g, ":");
-            }
-          } catch {}
+          const statForms = ctx.on !== null ? [["-c", "%Y"], ["-f", "%m"]] : [["-f", "%m"], ["-c", "%Y"]];
+          for (const form of statForms) {
+            try {
+              const statRes = await exec("stat", [...form, ...entry.files], { on: ctx.on, timeout: 3000 });
+              const out = (statRes.stdout || "").trim();
+              if ((statRes.code ?? statRes.exitCode) === 0 && /^\d+(\s+\d+)*$/.test(out)) {
+                mtimes = out.replace(/\s+/g, ":");
+                break;
+              }
+            } catch {}
+          }
+          if (!stillCurrent()) return;
 
-          const cacheKey = `${entry.folder}:${entry.files.join(",")}:${mtimes}`;
+          const cacheKey = `${ctx.on ?? ""}|${entry.folder}:${entry.files.join(",")}:${mtimes}`;
           let parsedConfig = null;
           let configErr = null;
 
@@ -1040,6 +1082,7 @@ export default class DockerManager extends View {
 
             this.composeConfigCache.set(cacheKey, { config: parsedConfig, configError: configErr });
           }
+          if (!stillCurrent()) return;
 
           const projectName = parsedConfig?.projectName || composeProjectNameFromFolder(entry.folder);
           resolvedCompose.push({
@@ -1055,6 +1098,7 @@ export default class DockerManager extends View {
           });
         }
 
+        if (!stillCurrent()) return;
         this.discoveredCompose = resolvedCompose;
         this.discoveredDockerfiles = dockerfiles;
       }
@@ -6457,11 +6501,14 @@ export default class DockerManager extends View {
   }
 
   renderContainersSection(t, ctx, cx) {
+    // Discovered files belong to the folder they were scanned in; a different
+    // folder (or the same path on another machine) waits for its own scan.
+    const scanFresh = this.scannedKey === `${ctx.on ?? ""}|${ctx.cwd || ""}`;
     const tree = buildContainerTree({
       containers: this.containersRaw,
       composeLs: this.composeLsRaw,
-      discoveredCompose: this.discoveredCompose,
-      discoveredDockerfiles: this.discoveredDockerfiles,
+      discoveredCompose: scanFresh ? this.discoveredCompose : [],
+      discoveredDockerfiles: scanFresh ? this.discoveredDockerfiles : [],
       spaceRoot: this.canonicalCwd || ctx.cwd,
       scope: this.scope,
       filter: this.filterQuery,
