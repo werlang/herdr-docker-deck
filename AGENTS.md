@@ -45,6 +45,6 @@ The script copies `mods/docker-manager` to `~/.config/herdr-app/mods/docker-mana
 - **Argv-only execution**: Always invoke `exec("docker", argv, { cwd, on: machine })` with validated identifiers; never interpolate container/volume/project names into a shell string.
 - **No local Node.js assumption**: Run unit tests inside a Docker container:
   ```sh
-  docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/
+  docker run --rm -v "$PWD":/work -w /work node:22-alpine node --test test/*.test.js
   ```
 - **Mod independence**: Never import assets from other custom mods (`tabs-ref`, `file-editor`). Keep all icons in `mods/docker-manager/icons/` or reference shipped Herdr icons.
