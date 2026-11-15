@@ -355,6 +355,9 @@ export default class DockerManager extends View {
     if (!this.isPanelVisible()) return;
 
     const p = props();
+    // Reveal / build-run requests from other mods (file-editor, tabs-ref). This
+    // mutates selection and notifies, so it runs here and never from render().
+    if (!p?.inspect) this.checkCrossModRequest(cx);
     // An inspector tab already has its target; running the full list/workspace
     // refresh there every 3s is pure load. Only the panel needs the sweep.
     if (!p?.inspect) this.refresh(cx);
@@ -7703,7 +7706,6 @@ export default class DockerManager extends View {
   render(cx) {
     // checkCrossModRequest() is intentionally NOT called here: it mutates state and notifies, and
     // notifying during render throws. poll() consumes requests off the render path.
-    this.checkCrossModRequest(cx);
     const t = theme();
     const p = props();
 
