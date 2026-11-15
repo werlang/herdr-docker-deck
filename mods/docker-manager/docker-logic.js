@@ -193,13 +193,18 @@ export function resolveDockerContext({ props, spaces = [], panes = [], terminals
       return { cwd: f.cwd, on: machine, machine };
     }
 
-    // Terminal cwd in active space
+    // Terminal cwd in active space. PaneInfo carries no `space` field, only its
+    // `tab`, so membership comes from the space's tab list; the shown tab wins.
     const paneList = typeof panes === "function" ? panes() : panes;
-    const activePanes = paneList.filter((p) => p.space === activeSpace.id);
-    for (const p of activePanes) {
-      if (p.cwd) {
-        return { cwd: p.cwd, on: machine, machine };
-      }
+    const spaceTabs = Array.isArray(activeSpace.tabs) ? activeSpace.tabs : [];
+    const tabRank = new Map(
+      spaceTabs.map((tab) => [tab.id, tab.active ? 0 : 1])
+    );
+    const activePanes = (paneList || [])
+      .filter((p) => p && p.cwd && tabRank.has(p.tab))
+      .sort((a, b) => tabRank.get(a.tab) - tabRank.get(b.tab));
+    if (activePanes.length > 0) {
+      return { cwd: activePanes[0].cwd, on: machine, machine };
     }
 
     if (activeSpace.folder) {

@@ -1581,3 +1581,31 @@ test("normalizeContainerInspect: a never-finished container reports no finish ti
   });
   assert.equal(stopped.finishedAt, "2026-11-09T16:00:00Z");
 });
+
+test("resolveDockerContext: keeps a remote space's machine and folder", () => {
+  const ctx = resolveDockerContext({
+    spaces: [
+      { id: "sp-local", active: false, machine: null, folder: "/Users/me/trocaaula", tabs: [{ id: "t-local", active: true }] },
+      { id: "rpi5/sp-bot", active: true, machine: "rpi5", folder: "/home/whatsbot", tabs: [{ id: "t-bot", active: true }] },
+    ],
+    panes: [{ pane: "p1", tab: "t-local", cwd: "/Users/me/trocaaula" }],
+    focused: { space: "rpi5/sp-bot", tab: "t-bot", pane: null, cwd: null },
+  });
+  assert.deepEqual(ctx, { cwd: "/home/whatsbot", on: "rpi5", machine: "rpi5" });
+});
+
+test("resolveDockerContext: falls back to a terminal cwd from the space's own tabs", () => {
+  const ctx = resolveDockerContext({
+    spaces: [
+      { id: "sp-a", active: true, machine: "rpi5", folder: "", tabs: [{ id: "t1", active: false }, { id: "t2", active: true }] },
+    ],
+    panes: [
+      { pane: "other", tab: "t-elsewhere", cwd: "/elsewhere" },
+      { pane: "p1", tab: "t1", cwd: "/home/bg-tab" },
+      { pane: "p2", tab: "t2", cwd: "/home/shown-tab" },
+    ],
+    focused: null,
+  });
+  assert.equal(ctx.cwd, "/home/shown-tab");
+  assert.equal(ctx.on, "rpi5");
+});
