@@ -276,6 +276,36 @@ export default class DockerManager extends View {
     this.refresh(cx);
   }
 
+  /**
+   * Drops every row that came from one Docker engine, along with the selection
+   * and overlays that point into them. Called when the active space moves to a
+   * different machine, so a local project can never be shown (or acted on) as
+   * if it lived on the remote host, and vice versa.
+   */
+  resetEngineData() {
+    this.containersRaw = [];
+    this.composeLsRaw = [];
+    this.discoveredCompose = [];
+    this.discoveredDockerfiles = [];
+    this.imagesRaw = [];
+    this.volumesRaw = [];
+    this.networksRaw = [];
+    this.networkInspectMap = {};
+    this.systemDfParsed = null;
+    this.systemDfVerbose = null;
+    this.volumeSizes = {};
+    this.engineInfoRaw = null;
+    this.engineStatus = "probing";
+    this.engineVersion = "";
+    this.selectedTarget = null;
+    this.inspectData = null;
+    this.drawerOpen = false;
+    this.contextMenu = null;
+    this.pendingContextTarget = null;
+    this.workspaceDirty = true;
+    this.scannedKey = null;
+  }
+
   loadDockerfileRuns() {
     try {
       const raw = typeof localStorage !== "undefined" ? localStorage.getItem("docker-manager.dockerfileRuns") : null;
@@ -1195,6 +1225,14 @@ export default class DockerManager extends View {
     // first alias pass finishes (and avoid leaking a local alias into a remote
     // space that happens to use the same absolute path).
     this.canonicalCwd = ctx.on === null ? this.pathAliases.get(ctx.cwd) || ctx.cwd : ctx.cwd;
+
+    // Every list below belongs to one Docker engine. Switching to a space on
+    // another machine drops the previous engine's rows so they are never shown
+    // (or acted on) under the new space while the first query is in flight.
+    if (this.dataMachine !== ctx.on) {
+      if (this.dataMachine !== undefined) this.resetEngineData();
+      this.dataMachine = ctx.on; // the machine every engine list belongs to
+    }
 
     cx.spawn(async (cx) => {
       // 1. Probe Engine
@@ -7692,8 +7730,24 @@ export default class DockerManager extends View {
       shared,
     });
 
+    // The 3s poll refreshes after a space switch; until then the cached lists
+    // belong to the previous machine and must not be drawn under this space.
+    const staleEngine = this.dataMachine !== undefined && this.dataMachine !== ctx.on;
+
     let mainList;
-    if (this.activeSection === "images") {
+    if (staleEngine) {
+      mainList = v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .p(20)
+        .child(
+          div()
+            .text_size(12)
+            .text_color(toColor(t.dim))
+            .child(`Loading ${ctx.on ? `Docker on ${ctx.on}` : "local Docker"}…`)
+        );
+    } else if (this.activeSection === "images") {
       mainList = this.renderImagesSection(t, ctx, cx);
     } else if (this.activeSection === "volumes") {
       mainList = this.renderVolumesSection(t, ctx, cx);
