@@ -33,6 +33,8 @@ import {
 import {
   resolveDockerContext,
   parseContainerLabels,
+  canonicalPath,
+  isPathInside,
   buildContainerTree,
   normalizeContainerInspect,
   isSecretEnvKey,
@@ -1410,8 +1412,12 @@ export default class DockerManager extends View {
           const labels = typeof c.Labels === "string" ? parseContainerLabels(c.Labels) : c.Labels || {};
           const pName = labels["com.docker.compose.project"];
           if (pName && !this.userCollapsedProjects.has(pName)) {
-            const wDir = labels["com.docker.compose.project.working_dir"] || "";
-            if (ctx.cwd && wDir && (wDir === ctx.cwd || wDir.startsWith(ctx.cwd + "/"))) {
+            // Compare in the same canonical form the tree uses, so a project
+            // created through a symlinked path still auto-expands.
+            const aliases = ctx.on === null ? this.pathAliases : null;
+            const wDir = canonicalPath(labels["com.docker.compose.project.working_dir"] || "", aliases);
+            const root = this.canonicalCwd || ctx.cwd;
+            if (root && wDir && isPathInside(root, wDir)) {
               this.expandedProjects.add(pName);
             }
           }
