@@ -217,6 +217,27 @@ export function resolveDockerContext({ props, spaces = [], panes = [], terminals
 }
 
 /**
+ * Builds `file-editor` tab props for a file that lives on the space's machine.
+ *
+ * Herdr stores mod props as given, so the machine has to travel with the path:
+ * `file-editor` reads `props().on` to run its reads and writes there. Without
+ * it, a compose file discovered on an SSH host is looked up on this computer,
+ * which is why "Open Compose File" opened an empty/error tab in remote spaces.
+ *
+ * @param {string} filePath Absolute path on `on`'s machine.
+ * @param {{ folder?: string | null, on?: string | null }} [options]
+ * @returns {Record<string, string>} Props for `run("tab.new", { mod: "file-editor", props })`.
+ */
+export function buildFileEditorTabProps(filePath, { folder = null, on = null } = {}) {
+  const tabProps = { file: filePath };
+  // `file-editor` treats `folder` as the root and rewrites a file outside it into
+  // a relative path, so only send a folder that actually contains the file.
+  if (folder && isPathInside(folder, filePath)) tabProps.folder = folder;
+  if (on) tabProps.on = on;
+  return tabProps;
+}
+
+/**
  * Builds standard Compose argv array for a target project (DESIGN §4.5).
  *
  * @param {{ project: string, workingDir?: string | null, configFiles?: string[] }} target

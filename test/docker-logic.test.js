@@ -11,6 +11,7 @@ import {
   parseContainerLabels,
   isPathInside,
   resolveDockerContext,
+  buildFileEditorTabProps,
   buildComposeArgs,
   buildComposeUpArgs,
   buildComposeDownArgs,
@@ -1608,4 +1609,37 @@ test("resolveDockerContext: falls back to a terminal cwd from the space's own ta
   });
   assert.equal(ctx.cwd, "/home/shown-tab");
   assert.equal(ctx.on, "rpi5");
+});
+
+test("buildFileEditorTabProps: carries the SSH machine with the file path", () => {
+  assert.deepEqual(
+    buildFileEditorTabProps("/home/whatsbot/compose.yaml", {
+      folder: "/home/whatsbot",
+      on: "rpi5",
+    }),
+    { file: "/home/whatsbot/compose.yaml", folder: "/home/whatsbot", on: "rpi5" }
+  );
+});
+
+test("buildFileEditorTabProps: keeps local tabs free of machine props", () => {
+  assert.deepEqual(
+    buildFileEditorTabProps("/Users/me/app/compose.yaml", { folder: "/Users/me/app", on: null }),
+    { file: "/Users/me/app/compose.yaml", folder: "/Users/me/app" }
+  );
+});
+
+test("buildFileEditorTabProps: keeps the machine when the folder is unknown", () => {
+  assert.deepEqual(
+    buildFileEditorTabProps("/srv/app/Dockerfile", { on: "rpi5" }),
+    { file: "/srv/app/Dockerfile", on: "rpi5" }
+  );
+});
+
+test("buildFileEditorTabProps: drops a folder that does not contain the file", () => {
+  // file-editor treats `folder` as the root and would rewrite /srv/other/compose.yaml
+  // into srv/other/compose.yaml under /srv/app, so the outside folder must not be sent.
+  assert.deepEqual(
+    buildFileEditorTabProps("/srv/other/compose.yaml", { folder: "/srv/app", on: "rpi5" }),
+    { file: "/srv/other/compose.yaml", on: "rpi5" }
+  );
 });

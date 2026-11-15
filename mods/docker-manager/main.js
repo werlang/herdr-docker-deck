@@ -32,6 +32,7 @@ import {
 } from "herdr";
 import {
   resolveDockerContext,
+  buildFileEditorTabProps,
   parseContainerLabels,
   canonicalPath,
   isPathInside,
@@ -1777,7 +1778,14 @@ export default class DockerManager extends View {
       } else if (actionId === "open-compose") {
         if (rowData.configFiles?.[0]) {
           try {
-            run("tab.new", { name: rowData.configFiles[0].split("/").pop(), mod: "file-editor", props: { file: rowData.configFiles[0] } });
+            run("tab.new", {
+              name: rowData.configFiles[0].split("/").pop(),
+              mod: "file-editor",
+              props: buildFileEditorTabProps(rowData.configFiles[0], {
+                folder: rowData.workingDirs?.[0] || null,
+                on: ctx.on,
+              }),
+            });
           } catch {
             this.copyValue(rowData.configFiles[0], "Compose File Path", cx);
           }
@@ -2050,7 +2058,10 @@ export default class DockerManager extends View {
         run("tab.new", {
           name: rowData.fileBasename || "Dockerfile",
           mod: "file-editor",
-          props: { file: rowData.filePath },
+          props: buildFileEditorTabProps(rowData.filePath, {
+            folder: rowData.folder || null,
+            on: ctx.on,
+          }),
         });
       } else if (actionId === "copy-path") {
         this.copyValue(rowData.filePath, "Dockerfile Path", cx);

@@ -64,6 +64,7 @@ Following `file-editor` (`file-logic.js`) and `git-graph` (`git-logic.js`), keep
    - Otherwise, if `focused()?.space === space.id && focused()?.cwd`: use `focused().cwd`.
    - Otherwise, a terminal in the active tab of the active space (`panes()` → `terminals()`), falling back to `space.folder`.
 3. Every `exec("docker", argv, { cwd, on: machine, timeout })` passes `on: machine` so remote SSH spaces transparently manage the remote machine's Docker daemon (`DM-83`).
+4. Files opened in `file-editor` from the panel (a compose file or a Dockerfile) carry `on` in their tab props (`buildFileEditorTabProps` in `docker-logic.js`), because `file-editor` reads `props().on` to run its reads and writes; the folder is sent only when it actually contains the file.
 
 ---
 

@@ -123,3 +123,17 @@ test("mod-safety: menu icon names carry the .svg extension the renderer expects"
     .filter((name) => !name.endsWith(".svg"));
   assert.deepEqual(bare, [], `menu items whose icon lacks .svg (renders a blank icon): ${bare.join(", ")}`);
 });
+
+test("mod-safety: every file-editor tab carries the space's machine", () => {
+  // Reported bug: "Open Compose File" on an SSH space passed the remote path
+  // without props().on, so file-editor read that path on this computer.
+  const main = fs.readFileSync(mainPath, "utf8");
+  const editorTabs = [...main.matchAll(/mod:\s*["']file-editor["']/g)].length;
+  const helperProps = [...main.matchAll(/props:\s*buildFileEditorTabProps\(/g)].length;
+  assert.ok(editorTabs > 0, "the panel must still open compose files and Dockerfiles in file-editor");
+  assert.equal(
+    helperProps,
+    editorTabs,
+    "every file-editor tab must build its props with buildFileEditorTabProps(filePath, { on }); a raw { file } drops the SSH machine"
+  );
+});
