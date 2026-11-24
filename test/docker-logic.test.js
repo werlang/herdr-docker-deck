@@ -53,6 +53,7 @@ import {
   clampMenuPosition,
   resolveDockerMenuPosition,
   groupDiscoveredComposeFiles,
+  parseComposeFileFromEnv,
   parseComposeConfigJson,
   composeProjectNameFromFolder,
   parseComposeLsStatus,
@@ -1566,6 +1567,59 @@ test("groupDiscoveredComposeFiles: groups primary and override files", () => {
   assert.ok(app2);
   assert.equal(app2.isOverride, false);
   assert.equal(app2.files.length, 1);
+});
+
+test("parseComposeFileFromEnv: parses COMPOSE_FILE and COMPOSE_PATH_SEPARATOR", () => {
+  const env = [
+    "# comment",
+    "NODE_ENV=development",
+    "COMPOSE_FILE=compose.yaml:compose.dev.yaml",
+  ].join("\n");
+  assert.deepEqual(parseComposeFileFromEnv(env, "/workspaces/gladcode2"), [
+    "/workspaces/gladcode2/compose.yaml",
+    "/workspaces/gladcode2/compose.dev.yaml",
+  ]);
+
+  const customSep = [
+    "COMPOSE_PATH_SEPARATOR=;",
+    'export COMPOSE_FILE="./compose.yaml;compose.dev.yaml"',
+  ].join("\n");
+  assert.deepEqual(parseComposeFileFromEnv(customSep, "/app"), [
+    "/app/compose.yaml",
+    "/app/compose.dev.yaml",
+  ]);
+
+  assert.deepEqual(parseComposeFileFromEnv("NODE_ENV=production\n", "/app"), []);
+});
+
+test("groupDiscoveredComposeFiles: respects COMPOSE_FILE from .env and keeps unlisted variants", () => {
+  const files = [
+    "/workspaces/gladcode2/compose.yaml",
+    "/workspaces/gladcode2/compose.dev.yaml",
+    "/workspaces/gladcode2/compose.test.yaml",
+  ];
+  const envMap = new Map([
+    [
+      "/workspaces/gladcode2",
+      ["/workspaces/gladcode2/compose.yaml", "/workspaces/gladcode2/compose.dev.yaml"],
+    ],
+  ]);
+  const groups = groupDiscoveredComposeFiles(files, envMap);
+  assert.equal(groups.length, 2);
+
+  const mainGroup = groups.find((g) => !g.isVariant);
+  assert.ok(mainGroup);
+  assert.equal(mainGroup.name, "gladcode2");
+  assert.equal(mainGroup.isOverride, true);
+  assert.deepEqual(mainGroup.files, [
+    "/workspaces/gladcode2/compose.yaml",
+    "/workspaces/gladcode2/compose.dev.yaml",
+  ]);
+
+  const testVariant = groups.find((g) => g.isVariant);
+  assert.ok(testVariant);
+  assert.equal(testVariant.name, "gladcode2 (test)");
+  assert.deepEqual(testVariant.files, ["/workspaces/gladcode2/compose.test.yaml"]);
 });
 
 test("normalizeContainerInspect: a never-finished container reports no finish time", async () => {

@@ -2161,12 +2161,73 @@ export function resolveDockerMenuPosition({
 }
 
 /**
+ * Parses `COMPOSE_FILE` (and optional `COMPOSE_PATH_SEPARATOR`) from a `.env` file's contents.
+ * Returns resolved file paths relative to `folder`, or an empty array if `COMPOSE_FILE` is not set.
+ * Last definition wins, matching Docker Compose's `.env` semantics.
+ *
+ * @param {string} envContent
+ * @param {string} folder
+ * @returns {string[]}
+ */
+export function parseComposeFileFromEnv(envContent, folder = ".") {
+  if (!envContent || typeof envContent !== "string") return [];
+
+  let composeFileRaw = "";
+  let separator = ":";
+
+  for (const rawLine of envContent.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const cleaned = line.startsWith("export ") ? line.slice(7).trim() : line;
+    const eqIdx = cleaned.indexOf("=");
+    if (eqIdx <= 0) continue;
+
+    const key = cleaned.slice(0, eqIdx).trim();
+    if (key !== "COMPOSE_FILE" && key !== "COMPOSE_PATH_SEPARATOR") continue;
+
+    let val = cleaned.slice(eqIdx + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
+      (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
+    ) {
+      val = val.slice(1, -1);
+    } else {
+      const commentIdx = val.indexOf(" #");
+      if (commentIdx >= 0) val = val.slice(0, commentIdx).trim();
+    }
+
+    if (key === "COMPOSE_FILE") {
+      composeFileRaw = val;
+    } else if (key === "COMPOSE_PATH_SEPARATOR" && val.length > 0) {
+      separator = val;
+    }
+  }
+
+  if (!composeFileRaw) return [];
+
+  const baseFolder = String(folder || ".").replace(/\/+$/, "");
+  return composeFileRaw
+    .split(separator)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      if (entry.startsWith("/")) return entry;
+      const rel = entry.replace(/^\.\//, "");
+      return baseFolder === "/" ? `/${rel}` : `${baseFolder}/${rel}`;
+    });
+}
+
+/**
  * Groups discovered Compose files by folder and pairs overrides (DM-30..32, DESIGN §4.2).
+ * When a folder's `.env` defines `COMPOSE_FILE`, those files are grouped together as the
+ * folder's primary target instead of treating overlay files as standalone variants.
  *
  * @param {string[]} filePaths
+ * @param {Map<string, string[]> | Record<string, string[]> | null} [envComposeFilesByFolder]
  * @returns {Array<{ folder: string, files: string[], primaryFile: string, overrideFile: string | null, isOverride: boolean, isVariant: boolean, name: string }>}
  */
-export function groupDiscoveredComposeFiles(filePaths = []) {
+export function groupDiscoveredComposeFiles(filePaths = [], envComposeFilesByFolder = null) {
   if (!Array.isArray(filePaths)) return [];
 
   const byFolder = new Map();
@@ -2185,65 +2246,86 @@ export function groupDiscoveredComposeFiles(filePaths = []) {
   const PRIMARY_NAMES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
   const OVERRIDE_NAMES = ["compose.override.yaml", "compose.override.yml", "docker-compose.override.yaml", "docker-compose.override.yml"];
 
+  const getEnvFiles = (folder) => {
+    if (!envComposeFilesByFolder) return null;
+    const val = typeof envComposeFilesByFolder.get === "function"
+      ? envComposeFilesByFolder.get(folder)
+      : envComposeFilesByFolder[folder];
+    return Array.isArray(val) && val.length > 0 ? val : null;
+  };
+
   const results = [];
 
   for (const [folder, files] of byFolder.entries()) {
     const folderBase = folder.split("/").pop() || "project";
-
-    let primary = null;
-    for (const pName of PRIMARY_NAMES) {
-      const match = files.find((f) => f.split("/").pop() === pName);
-      if (match) {
-        primary = match;
-        break;
-      }
-    }
-
-    let override = null;
-    for (const oName of OVERRIDE_NAMES) {
-      const match = files.find((f) => f.split("/").pop() === oName);
-      if (match) {
-        override = match;
-        break;
-      }
-    }
-
     const handled = new Set();
 
-    if (primary && override) {
-      handled.add(primary);
-      handled.add(override);
+    const envFiles = getEnvFiles(folder);
+    if (envFiles) {
+      for (const ef of envFiles) handled.add(ef);
       results.push({
         folder,
-        files: [primary, override],
-        primaryFile: primary,
-        overrideFile: override,
-        isOverride: true,
+        files: envFiles,
+        primaryFile: envFiles[0],
+        overrideFile: envFiles.length > 1 ? envFiles[envFiles.length - 1] : null,
+        isOverride: envFiles.length > 1,
         isVariant: false,
         name: folderBase,
       });
-    } else if (primary) {
-      handled.add(primary);
-      results.push({
-        folder,
-        files: [primary],
-        primaryFile: primary,
-        overrideFile: null,
-        isOverride: false,
-        isVariant: false,
-        name: folderBase,
-      });
-    } else if (override) {
-      handled.add(override);
-      results.push({
-        folder,
-        files: [override],
-        primaryFile: override,
-        overrideFile: null,
-        isOverride: true,
-        isVariant: false,
-        name: folderBase,
-      });
+    } else {
+      let primary = null;
+      for (const pName of PRIMARY_NAMES) {
+        const match = files.find((f) => f.split("/").pop() === pName);
+        if (match) {
+          primary = match;
+          break;
+        }
+      }
+
+      let override = null;
+      for (const oName of OVERRIDE_NAMES) {
+        const match = files.find((f) => f.split("/").pop() === oName);
+        if (match) {
+          override = match;
+          break;
+        }
+      }
+
+      if (primary && override) {
+        handled.add(primary);
+        handled.add(override);
+        results.push({
+          folder,
+          files: [primary, override],
+          primaryFile: primary,
+          overrideFile: override,
+          isOverride: true,
+          isVariant: false,
+          name: folderBase,
+        });
+      } else if (primary) {
+        handled.add(primary);
+        results.push({
+          folder,
+          files: [primary],
+          primaryFile: primary,
+          overrideFile: null,
+          isOverride: false,
+          isVariant: false,
+          name: folderBase,
+        });
+      } else if (override) {
+        handled.add(override);
+        results.push({
+          folder,
+          files: [override],
+          primaryFile: override,
+          overrideFile: null,
+          isOverride: true,
+          isVariant: false,
+          name: folderBase,
+        });
+      }
     }
 
     // Process remaining files (variants like compose.dev.yaml, or other compose files)

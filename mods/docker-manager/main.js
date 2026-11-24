@@ -65,6 +65,7 @@ import {
   findExistingActionTerminal,
   resolveDockerMenuPosition,
   groupDiscoveredComposeFiles,
+  parseComposeFileFromEnv,
   parseComposeConfigJson,
   composeProjectNameFromFolder,
   buildHiddenTerminalArgs,
@@ -1058,8 +1059,33 @@ export default class DockerManager extends View {
           }
         }
 
+        // Read COMPOSE_FILE from each folder's .env so overlay stacks (e.g. compose.yaml:compose.dev.yaml)
+        // are grouped together instead of treating overlay files as standalone variants.
+        const composeFolders = new Set(
+          composePaths.map((fp) => {
+            const idx = fp.lastIndexOf("/");
+            return idx > 0 ? fp.slice(0, idx) : idx === 0 ? "/" : ".";
+          })
+        );
+        const envComposeFilesByFolder = new Map();
+        await Promise.all(
+          [...composeFolders].map(async (folder) => {
+            try {
+              const envPath = folder === "/" ? "/.env" : `${folder}/.env`;
+              const envRes = await exec("cat", [envPath], { on: ctx.on, timeout: 2000 });
+              if ((envRes.code ?? envRes.exitCode) === 0 && envRes.stdout) {
+                const parsed = parseComposeFileFromEnv(envRes.stdout, folder);
+                if (parsed.length > 0) {
+                  envComposeFilesByFolder.set(folder, parsed);
+                }
+              }
+            } catch {}
+          })
+        );
+        if (!stillCurrent()) return;
+
         // Group compose files with override pairing (DM-30..32, DESIGN §4.2)
-        const groups = groupDiscoveredComposeFiles(composePaths);
+        const groups = groupDiscoveredComposeFiles(composePaths, envComposeFilesByFolder);
         const resolvedCompose = [];
 
         for (const entry of groups) {
